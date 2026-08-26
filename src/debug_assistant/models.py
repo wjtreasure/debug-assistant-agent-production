@@ -3,12 +3,25 @@ from dataclasses import dataclass, field, asdict
 from enum import Enum
 from pathlib import Path
 from typing import Any
-import time, json
+import time, json, uuid
 
 class ActionKind(str, Enum):
     TOOL = "tool"
     REFLECT = "reflect"
     FINISH = "finish"
+
+class RuntimeStage(str, Enum):
+    SETUP = "setup"
+    INDEX_BUILD = "index_build"
+    PLANNER = "planner"
+    ACTION_VALIDATION = "action_validation"
+    ROUTE_VALIDATION = "route_validation"
+    TOOL_EXECUTION = "tool_execution"
+    MEMORY_INGESTION = "memory_ingestion"
+    REFLECTION = "reflection"
+    REPORTER = "reporter"
+    SERIALIZATION = "serialization"
+    FINALIZATION = "finalization"
 
 @dataclass(slots=True)
 class TaskSpec:
@@ -28,6 +41,8 @@ class ActionProposal:
     tool: str | None = None
     arguments: dict[str, Any] = field(default_factory=dict)
     expected_evidence: str = ""
+    information_need: str = ""
+    retain_context_ids: list[str] = field(default_factory=list)
 
     def fingerprint(self) -> str:
         stable = json.dumps(self.arguments, sort_keys=True, ensure_ascii=False)
@@ -41,6 +56,7 @@ class ToolObservation:
     metadata: dict[str, Any] = field(default_factory=dict)
     error_type: str | None = None
     latency_ms: float = 0.0
+    observation_id: str = field(default_factory=lambda: f"obs-{uuid.uuid4().hex[:12]}")
 
 @dataclass(slots=True)
 class Evidence:
@@ -50,8 +66,16 @@ class Evidence:
     summary: str
     excerpt: str = ""
     file: str | None = None
+    # Backward-compatible source coverage fields used by reporter/older callers.
     line_start: int | None = None
     line_end: int | None = None
+    # V1.2-A.1 truth-preserving provenance/coverage.
+    raw_observation_id: str | None = None
+    source_start_line: int | None = None
+    source_end_line: int | None = None
+    excerpt_start_line: int | None = None
+    excerpt_end_line: int | None = None
+    excerpt_truncated: bool = False
     confidence: float = 0.5
     tags: list[str] = field(default_factory=list)
 
@@ -78,6 +102,20 @@ class DiagnosisReport:
     next_checks: list[str]
     confidence: float
     policy_note: str = "Read-only diagnosis: no code changes were made."
+    report_source: str = "llm"
+    evidence_ids: list[str] = field(default_factory=list)
+
+@dataclass(slots=True)
+class RuntimeFailure:
+    stage: str
+    error_type: str
+    exception_type: str
+    message: str
+    retryable: bool | None = None
+    step: int = 0
+    tool_calls: int = 0
+    evidence_count: int = 0
+    last_action: dict[str, Any] | None = None
 
 @dataclass
 class AgentState:
@@ -96,6 +134,12 @@ class AgentState:
     repeated_actions: int = 0
     reflection_count: int = 0
     started_at: float = field(default_factory=time.time)
+    failure: RuntimeFailure | None = None
+    report_source: str = ""
+    current_hypothesis: dict[str, Any] = field(default_factory=dict)
+    termination_advisory: str = ""
+    observation_reuse_count: int = 0
+    no_progress_count: int = 0
 
     def to_summary(self) -> dict[str, Any]:
         return {
@@ -105,4 +149,7 @@ class AgentState:
             "invalid_routes": self.invalid_routes, "recovered_routes": self.recovered_routes,
             "repeated_actions": self.repeated_actions, "reflection_count": self.reflection_count,
             "errors": self.errors[-5:],
+            "failure": asdict(self.failure) if self.failure else None,
+            "report_source": self.report_source, "observation_reuse_count": self.observation_reuse_count,
+            "no_progress_count": self.no_progress_count, "current_hypothesis": self.current_hypothesis,
         }

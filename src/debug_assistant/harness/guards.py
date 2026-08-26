@@ -1,6 +1,7 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections import Counter
+from typing import Any
 from debug_assistant.models import ActionKind, ActionProposal, AgentState
 from debug_assistant.skills.catalog import SKILLS
 
@@ -9,24 +10,40 @@ class GuardDecision:
     ok: bool
     reason: str = ""
     force_reflection: bool = False
+    canonical_arguments: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+    advisory: str = ""
 
 class RouterGuard:
+    """Validate capability + action/tool contracts. Skill/tool affinity is advisory, not a security permission."""
     def __init__(self, tool_registry): self.tools=tool_registry
+
     def validate(self, action: ActionProposal, state: AgentState) -> GuardDecision:
-        if action.skill not in SKILLS: return GuardDecision(False,f"unknown skill: {action.skill}")
+        if action.skill not in SKILLS:
+            return GuardDecision(False,f"unknown skill: {action.skill}",error={"error_type":"unknown_skill","retryable":True})
         skill=SKILLS[action.skill]
+
         if action.kind == ActionKind.TOOL:
-            if not action.tool: return GuardDecision(False,'tool action missing tool name')
+            if not action.tool:
+                return GuardDecision(False,'tool action missing tool name',error={"error_type":"schema_validation","retryable":True})
             tool=self.tools.get(action.tool)
-            if not tool: return GuardDecision(False,f"unknown tool: {action.tool}")
-            if action.tool not in skill.allowed_tools: return GuardDecision(False,f"tool {action.tool} not allowed by skill {action.skill}")
-            for arg in tool.spec.required_args:
-                if arg not in action.arguments or action.arguments[arg] in ('',None): return GuardDecision(False,f"missing required tool arg: {arg}")
-        # High confidence never bypasses guardrails. Suspicious early finish is escalated to reflection.
+            if not tool:
+                return GuardDecision(False,f"unknown tool: {action.tool}",error={"error_type":"unknown_tool","retryable":True})
+            # Read-only Debug Assistant capability boundary. New mutable tools must be explicitly reviewed here.
+            if tool.spec.side_effect != 'none':
+                return GuardDecision(False,f"capability denied: tool {action.tool} side_effect={tool.spec.side_effect}",error={"error_type":"capability_denied","retryable":False})
+            canonical,error=self.tools.validate_arguments(action.tool,action.arguments)
+            if error:
+                return GuardDecision(False,error['message'],error=error)
+            advisory=''
+            if action.tool not in skill.suggested_tools:
+                advisory=f"tool {action.tool} is unusual for skill {action.skill}, but allowed by read-only capability policy"
+            return GuardDecision(True,canonical_arguments=canonical,advisory=advisory)
+
         if action.kind == ActionKind.FINISH and len(state.evidence)<2:
-            return GuardDecision(False,'finish rejected: insufficient grounded evidence',True)
+            return GuardDecision(False,'finish rejected: insufficient grounded evidence',True,error={"error_type":"premature_finish","retryable":True})
         if skill.prerequisites and 'evidence' in skill.prerequisites and not state.evidence:
-            return GuardDecision(False,f"skill {action.skill} requires evidence")
+            return GuardDecision(False,f"skill {action.skill} requires evidence",error={"error_type":"missing_prerequisite","retryable":True})
         return GuardDecision(True)
 
 class LoopGuard:

@@ -1,0 +1,11 @@
+{
+  "context": {
+    "max_item_chars": 12000,
+    "safety_margin_chars": 4000,
+    "fallback_recent_count": 2,
+    "fallback_recent_chars": 16000
+  },
+  "features": {
+    "model_context_selection": true
+  }
+}
