@@ -1,0 +1,13 @@
+{
+  "files": [
+    "src/marshmallow/schema.py"
+  ],
+  "symbols": [
+    {
+      "file": "src/marshmallow/schema.py",
+      "symbol": "_invoke_field_validators",
+      "start_line": 863,
+      "end_line": 905
+    }
+  ]
+}

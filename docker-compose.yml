@@ -1,0 +1,8 @@
+services:
+  debug-assistant:
+    build: .
+    env_file: [.env]
+    volumes:
+      - ./:/app
+      - ${HOME}/.cache/debug-assistant:/root/.cache/debug-assistant
+    working_dir: /app

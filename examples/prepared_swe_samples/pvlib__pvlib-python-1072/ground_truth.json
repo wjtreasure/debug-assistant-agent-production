@@ -1,0 +1,13 @@
+{
+  "files": [
+    "pvlib/temperature.py"
+  ],
+  "symbols": [
+    {
+      "file": "pvlib/temperature.py",
+      "symbol": "fuentes",
+      "start_line": 477,
+      "end_line": 659
+    }
+  ]
+}

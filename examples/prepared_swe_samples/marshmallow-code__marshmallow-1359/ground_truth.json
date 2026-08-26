@@ -1,0 +1,13 @@
+{
+  "files": [
+    "src/marshmallow/fields.py"
+  ],
+  "symbols": [
+    {
+      "file": "src/marshmallow/fields.py",
+      "symbol": "_bind_to_schema",
+      "start_line": 1113,
+      "end_line": 1119
+    }
+  ]
+}
