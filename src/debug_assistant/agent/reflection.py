@@ -1,6 +1,6 @@
 from __future__ import annotations
 from pydantic import ValidationError
-from debug_assistant.contracts import ReflectionContract, compact_validation_error, render_contract
+from debug_assistant.contracts import ReflectionContract, compact_validation_error, render_contract, render_contract_compact
 
 SYSTEM="""You are a critical reviewer for a read-only debugging agent. Detect goal drift, premature certainty, unsupported claims and direct falsifying evidence. Do not invent evidence. Explicitly state the strongest current diagnosis and whether repository evidence is sufficient to support a specific causal mechanism and location. Evidence IDs must come from the context.
 
@@ -11,10 +11,10 @@ Also emit a compact structured root-cause identity. root_cause_target should be 
 contradicting_evidence_ids contains only evidence that directly falsifies the proposed causal explanation. A buggy test expectation, an alternative implementation detail, incomplete information, missing validation, or a failing test consistent with the bug is NOT a contradiction unless it directly disproves the diagnosis. Keep the state concise."""
 
 class Reflector:
-    def __init__(self,llm,model=''):
-        self.llm=llm; self.model=model; self.last_prompt_breakdown={}
+    def __init__(self,llm,model='',compact_prompt=False):
+        self.llm=llm; self.model=model; self.compact_prompt=compact_prompt; self.last_prompt_breakdown={}
     def review(self,context:str):
-        contract=render_contract(ReflectionContract,"REFLECTION_SCHEMA")
+        contract=(render_contract_compact(ReflectionContract,"REFLECTION_SCHEMA") if self.compact_prompt else render_contract(ReflectionContract,"REFLECTION_SCHEMA"))
         extra="Choose finish when repository evidence already supports a specific mechanism and location and no required causal gap remains. hypothesis_changed is telemetry only; the Harness independently fingerprints diagnostic state. root_cause_target/root_cause_location are the primary stability identity, while current_diagnosis may remain natural language. Return at most the most important required/optional items allowed by the schema."
         user=f"{context}\n\n{contract}\n{extra}"
         self.last_prompt_breakdown={'system_chars':len(SYSTEM),'context_chars':len(context),'contract_chars':len(contract),'instruction_chars':len(extra)}

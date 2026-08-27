@@ -33,7 +33,38 @@ class ToolRegistry:
                 "retryable":True,
             }
 
-    def render(self):
+
+    def repair_arguments(self,name:str,args:dict[str,Any],error:dict[str,Any] | None=None):
+        """Apply only deterministic, semantics-preserving mechanical repairs.
+
+        V1.3.2.2 intentionally keeps this tiny. For read_file, an inclusive range
+        wider than 200 lines is clamped to the first 200 requested lines. Ambiguous
+        path/name/type errors are never guessed or repaired here.
+        """
+        if name != 'read_file' or not isinstance(args,dict):
+            return None,None
+        if (error or {}).get('error_type') != 'schema_validation':
+            return None,None
+        try:
+            start=int(args.get('start_line',1))
+            end=int(args.get('end_line',200))
+        except (TypeError,ValueError):
+            return None,None
+        if start < 1 or end < start or (end-start+1) <= 200:
+            return None,None
+        repaired=dict(args)
+        repaired['start_line']=start
+        repaired['end_line']=start+199
+        return repaired,{
+            'tool':'read_file',
+            'reason':'inclusive_range_exceeds_200_lines',
+            'original_arguments':dict(args),
+            'repaired_arguments':dict(repaired),
+            'requested_line_count':end-start+1,
+            'repaired_line_count':200,
+        }
+
+    def render(self, compact: bool=False):
         blocks=[]
         for s in self.specs():
             schema=s.json_schema()
@@ -47,9 +78,12 @@ class ToolRegistry:
                 for k in ('minimum','maximum','minLength','maxLength'):
                     if k in meta: constraints.append(f"{k}={meta[k]}")
                 fields.append(f"{name}:{typ}{default}"+(f" ({', '.join(constraints)})" if constraints else ''))
-            blocks.append(
-                f"- {s.name}: {s.description}\n"
-                f"  args: {{{'; '.join(fields)}}}\n"
-                f"  capability={s.capability}; cost={s.cost_class}; side_effect={s.side_effect}; output_limit={s.output_limit}"
-            )
+            if compact:
+                blocks.append(f"- {s.name}({'; '.join(fields)}) — {s.description[:120]}")
+            else:
+                blocks.append(
+                    f"- {s.name}: {s.description}\n"
+                    f"  args: {{{'; '.join(fields)}}}\n"
+                    f"  capability={s.capability}; cost={s.cost_class}; side_effect={s.side_effect}; output_limit={s.output_limit}"
+                )
         return '\n'.join(blocks)

@@ -12,6 +12,7 @@ class OpenAICompatibleClient(LLMClient):
         self.timeout=timeout
         self.temperature=temperature
         self.calls=[]
+        self.last_raw_content=None
 
     def complete_json(self, system: str, user: str, *, model: str | None=None) -> dict[str, Any]:
         if not self.api_key:
@@ -38,6 +39,7 @@ class OpenAICompatibleClient(LLMClient):
                     continue
                 r.raise_for_status(); data=r.json(); usage=data.get("usage") or {}
                 content=data["choices"][0]["message"]["content"]
+                self.last_raw_content=content
                 prompt_details=usage.get("prompt_tokens_details") or {}
                 completion_details=usage.get("completion_tokens_details") or {}
                 prompt_tokens=usage.get("prompt_tokens",0) or 0

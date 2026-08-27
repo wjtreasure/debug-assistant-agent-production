@@ -11,9 +11,14 @@ class FeatureFlags:
     termination_advisory: bool = True
     fallback_reporter: bool = True
     convergence_control: bool = True
+    context_lifecycle_v2: bool = True
+    context_projection_v2: bool = True
+    compact_prompt_rendering: bool = True
 
     def validate(self) -> None:
         if self.model_context_selection and not self.context_catalog:
             raise ValueError("model_context_selection requires context_catalog")
         if self.fallback_reporter and not self.hypothesis_state:
             raise ValueError("fallback_reporter requires hypothesis_state")
+        if self.context_projection_v2 and not self.context_lifecycle_v2:
+            raise ValueError("context_projection_v2 requires context_lifecycle_v2")

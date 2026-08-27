@@ -40,6 +40,13 @@ def summarize_trace(path):
         'context_build_count':len(ctx),'avg_context_chars':(sum(int(x.get('used_chars',0)) for x in ctx)/len(ctx) if ctx else 0),
         'max_context_chars':max([int(x.get('used_chars',0)) for x in ctx] or [0]),
         'avg_working_set_size':(sum(int(x.get('working_set_size',0)) for x in ctx)/len(ctx) if ctx else 0),
+        'avg_active_item_count':(sum(int(x.get('active_item_count',0)) for x in ctx)/len(ctx) if ctx else 0),
+        'max_active_item_count':max([int(x.get('active_item_count',0)) for x in ctx] or [0]),
+        'avg_cold_item_count':(sum(int(x.get('cold_item_count',0)) for x in ctx)/len(ctx) if ctx else 0),
+        'eviction_count':sum(int(x.get('eviction_count',0)) for x in ctx),
+        'projection_count':sum(int(x.get('projection_count',0)) for x in ctx),
+        'avg_known_context_chars':(sum(int(x.get('known_context_chars',0)) for x in ctx)/len(ctx) if ctx else 0),
+        'rehydration_rate':(counts.get('OBSERVATION_REHYDRATED',0)/max(1,counts.get('TOOL_OBSERVATION',0)+counts.get('OBSERVATION_REHYDRATED',0)+counts.get('REDUNDANT_CONTEXT_REQUEST',0))),
         'invalid_context_requests':sum(len(x.get('invalid_requested_ids') or []) for x in ctx),
         'prompt_breakdown_events':len(prompt_breakdowns),
         'prompt_breakdown_chars':{

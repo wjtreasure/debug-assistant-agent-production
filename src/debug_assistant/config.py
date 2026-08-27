@@ -24,6 +24,9 @@ class ContextConfig:
     safety_margin_chars: int = 4_000
     fallback_recent_count: int = 2
     fallback_recent_chars: int = 16_000
+    known_index_max_chars: int = 3_500
+    target_active_items: int = 8
+    hard_active_items: int = 12
 
 @dataclass(slots=True)
 class HarnessConfig:
@@ -85,7 +88,7 @@ class AppConfig:
         if not path: return self
         data=json.loads(Path(path).read_text(encoding='utf-8'))
         c=data.get('context') or {}
-        for key in ('max_item_chars','safety_margin_chars','fallback_recent_count','fallback_recent_chars'):
+        for key in ('max_item_chars','safety_margin_chars','fallback_recent_count','fallback_recent_chars','known_index_max_chars','target_active_items','hard_active_items'):
             if key in c: setattr(self.harness.context,key,int(c[key]))
         f=data.get('features') or {}
         for key,val in f.items():

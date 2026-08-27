@@ -4,7 +4,7 @@ from .base import LLMClient
 
 class MockLLMClient(LLMClient):
     """Deterministic smoke-test provider. Production diagnosis must use a real model."""
-    def __init__(self): self.n=0; self.calls=[]
+    def __init__(self): self.n=0; self.calls=[]; self.last_raw_content=None
     def complete_json(self, system: str, user: str, *, model: str | None=None) -> dict[str, Any]:
         self.n+=1
         self.calls.append({

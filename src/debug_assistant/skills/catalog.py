@@ -18,7 +18,9 @@ SKILLS = {
  "report_synthesis": SkillSpec("report_synthesis", "Produce an evidence-backed development decision report.", (), ("evidence",), "Root cause, locations, evidence, uncertainty and next checks are explicit."),
 }
 
-def render_skill_catalog() -> str:
+def render_skill_catalog(compact: bool=False) -> str:
+    if compact:
+        return "\n".join(f"- {s.name}: {s.objective}" for s in SKILLS.values())
     return "\n".join(
         f"- {s.name}: {s.objective} Suggested tools={','.join(s.suggested_tools) or 'none'} (guidance only, not a hard permission). Completion={s.completion}"
         for s in SKILLS.values()

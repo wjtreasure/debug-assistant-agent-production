@@ -61,7 +61,7 @@ class ConvergenceController:
     def note_nonredundant_action(self) -> None:
         self.state.redundant_request_streak=0
 
-    def assess_reflection(self, hyp: dict[str,Any], *, usage_totals: dict[str,Any] | None=None) -> ProgressAssessment:
+    def assess_reflection(self, hyp: dict[str,Any], *, usage_totals: dict[str,Any] | None=None, allow_budget_recovery: bool=True) -> ProgressAssessment:
         prev=self._previous_hypothesis
         if not prev:
             assessment=ProgressAssessment(ProgressKind.PROGRESS,['reflection_baseline'])
@@ -93,7 +93,7 @@ class ConvergenceController:
 
         if assessment.kind is ProgressKind.PROGRESS:
             self.state.no_progress_streak=0
-            if self.state.mode is ConvergenceMode.BUDGET_CRITICAL:
+            if self.state.mode is ConvergenceMode.BUDGET_CRITICAL and allow_budget_recovery:
                 self.state.critical_attempt_used=False
                 self.state.mode=(ConvergenceMode.CONVERGENCE_REQUIRED
                                  if self._should_converge(hyp) else ConvergenceMode.NORMAL)

@@ -101,7 +101,7 @@ class GrepTool(Tool):
 
 
 class ReadFileTool(Tool):
-    spec=ToolSpec('read_file','Read at most 200 source lines with stable line numbers.',ReadFileArgs,'repository_read','light','none',16000)
+    spec=ToolSpec('read_file','Read source lines with stable line numbers. start_line/end_line are inclusive and end_line - start_line + 1 must be <= 200 (e.g. 200-399 is valid; 200-400 is 201 lines).',ReadFileArgs,'repository_read','light','none',16000)
     def __init__(self, root): self.root=Path(root)
     def execute(self,path,start_line=1,end_line=200):
         t=time.time()

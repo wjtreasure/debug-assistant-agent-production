@@ -83,6 +83,57 @@ def render_contract(model: Type[BaseModel], title: str) -> str:
     return f"{title}: Return exactly one JSON object valid under this JSON Schema. Do not add fields not present in the schema.\n{json.dumps(schema,ensure_ascii=False,separators=(',',':'))}"
 
 
+
+def render_contract_compact(model: Type[BaseModel], title: str) -> str:
+    """Compact prompt rendering derived from the same Pydantic SSOT.
+
+    Runtime parsing/validation still uses the Pydantic model directly; this only removes
+    JSON-Schema boilerplate from the model-facing prompt.
+    """
+    schema=model.model_json_schema()
+    props=schema.get("properties",{})
+    required=set(schema.get("required",[]))
+    rows=[]
+    for name,meta in props.items():
+        enum=meta.get("enum")
+        anyof=meta.get("anyOf") or []
+        typ=meta.get("type")
+        if enum:
+            type_text="|".join(map(str,enum))
+        elif anyof:
+            vals=[]
+            for part in anyof:
+                if part.get("enum"): vals.extend(map(str,part["enum"]))
+                elif part.get("type"): vals.append(part["type"])
+                elif part.get("$ref"): vals.append(part["$ref"].split("/")[-1])
+            type_text="|".join(dict.fromkeys(vals)) or "value"
+        elif meta.get("$ref"):
+            type_text=meta["$ref"].split("/")[-1]
+        elif typ=="array":
+            item=meta.get("items",{})
+            inner=item.get("$ref","").split("/")[-1] or item.get("type","value")
+            type_text=f"list[{inner}]"
+        else:
+            type_text=typ or "value"
+        bounds=[]
+        for k,label in (("minItems","min"),("maxItems","max")):
+            if k in meta: bounds.append(f"{label}={meta[k]}")
+        opt="" if name in required else "?"
+        rows.append(f"  {name}{opt}: {type_text}" + (f" ({', '.join(bounds)})" if bounds else ""))
+    defs=schema.get("$defs",{})
+    def_rows=[]
+    for dname,dmeta in defs.items():
+        dprops=dmeta.get("properties",{})
+        if not dprops: continue
+        dreq=set(dmeta.get("required",[]))
+        fields=[]
+        for fname,fmeta in dprops.items():
+            ftyp=fmeta.get("type") or (fmeta.get("$ref","").split("/")[-1] if fmeta.get("$ref") else "value")
+            fields.append(f"{fname}{'' if fname in dreq else '?'}:{ftyp}")
+        def_rows.append(f"  {dname} = {{{', '.join(fields)}}}")
+    tail=("\n"+"\n".join(def_rows)) if def_rows else ""
+    return f"{title}: Return exactly one JSON object with only these fields. Required fields omit '?'.\n{{\n"+"\n".join(rows)+"\n}"+tail
+
 def compact_validation_error(exc: ValidationError) -> list[dict[str, Any]]:
     out=[]
     for err in exc.errors(include_url=False):

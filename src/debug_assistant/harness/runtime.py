@@ -14,14 +14,14 @@ from debug_assistant.memory.hypothesis import HypothesisManager, normalize_targe
 from debug_assistant.context.manager import ContextManager
 from debug_assistant.agent.planner import Planner
 from debug_assistant.agent.reflection import Reflector
-from debug_assistant.agent.reporter import Reporter
+from debug_assistant.agent.reporter import Reporter, ReporterContractViolation, build_finalization_context
 from debug_assistant.reporting.fallback import FallbackReportBuilder
 from .guards import RouterGuard, LoopGuard
 from .trace import TraceRecorder
 from .tool_executor import execute_with_retry
 from .convergence import ConvergenceController, ConvergenceMode, ProgressKind
 
-RUNTIME_VERSION="1.3.1.1"
+RUNTIME_VERSION="1.3.2.2"
 
 
 def _classify_error(exc: Exception, stage: RuntimeStage) -> tuple[str, bool | None]:
@@ -32,6 +32,8 @@ def _classify_error(exc: Exception, stage: RuntimeStage) -> tuple[str, bool | No
         if 'json' in msg or 'parse' in msg: return 'llm_parse_error', True
         if 'http' in msg or 'request' in msg or 'network' in msg: return 'llm_http_error', True
         return 'llm_error', True
+    if isinstance(exc, ReporterContractViolation):
+        return 'reporter_contract_violation', False
     if 'validation' in msg or 'schema' in msg:
         return ('report_validation' if stage == RuntimeStage.REPORTER else 'schema_validation'), False if stage == RuntimeStage.REPORTER else True
     if stage == RuntimeStage.MEMORY_INGESTION: return 'memory_error', False
@@ -105,10 +107,11 @@ class AgentHarness:
         current_stage=RuntimeStage.SETUP
         llm=None; index=None; index_path=None
         memory=EvidenceMemory(); observations=ObservationStore(); coverage=ReadCoverageIndex(); hypothesis=None
-        ctxmgr=ContextManager(h.context,enable_catalog=flags.context_catalog,enable_model_selection=flags.model_context_selection,enable_budget_packing=flags.context_budget_packing)
+        ctxmgr=ContextManager(h.context,enable_catalog=flags.context_catalog,enable_model_selection=flags.model_context_selection,enable_budget_packing=flags.context_budget_packing,enable_lifecycle=flags.context_lifecycle_v2,enable_projection=flags.context_projection_v2)
         fallback=FallbackReportBuilder()
         tools=planner=reflector=reporter=router=loop=None
         pending_route_recovery=False; force_reflect=False; consecutive_planner_errors=0; consecutive_reflection_failures=0; usage_cursor=0
+        rejected_since_last_evidence=False
         requested_context_ids=[]; last_information_need=""; same_information_need=0
         controller=ConvergenceController(no_progress_limit=2) if flags.convergence_control else None
         last_redundant_key=None
@@ -120,6 +123,9 @@ class AgentHarness:
                 'stage':stage.value,'budget_chars':result.budget_chars,'used_chars':result.used_chars,'catalog_size':result.catalog_size,
                 'working_set_size':result.working_set_size,'selected':result.selected,'dropped':result.dropped,
                 'invalid_requested_ids':result.invalid_requested_ids,'breakdown':result.breakdown,
+                'known_context_chars':result.known_context_chars,'active_item_count':result.active_item_count,
+                'cold_item_count':result.cold_item_count,'eviction_count':result.eviction_count,
+                'projection_count':result.projection_count,'display_coverage':result.display_coverage,
             })
             if result.invalid_requested_ids: trace.record('CONTEXT_REQUEST_INVALID',{'ids':result.invalid_requested_ids,'stage':stage.value})
             requested_context_ids=[]
@@ -135,6 +141,7 @@ class AgentHarness:
                 trace.record('PROMPT_BREAKDOWN',payload)
 
         def update_hypothesis(review: dict):
+            nonlocal rejected_since_last_evidence
             valid_support=_validate_evidence_ids(review.get('supporting_evidence_ids') or [],state.evidence)
             valid_contra=_validate_evidence_ids(review.get('contradicting_evidence_ids') or [],state.evidence)
             if len(valid_support) != len(review.get('supporting_evidence_ids') or []):
@@ -146,7 +153,11 @@ class AgentHarness:
             trace.record('HYPOTHESIS_UPDATED',state.current_hypothesis)
             if controller is not None:
                 old_mode=controller.state.mode
-                assessment=controller.assess_reflection(state.current_hypothesis,usage_totals=(_usage_snapshot(llm).get('totals') or {}))
+                assessment=controller.assess_reflection(
+                    state.current_hypothesis,
+                    usage_totals=(_usage_snapshot(llm).get('totals') or {}),
+                    allow_budget_recovery=not rejected_since_last_evidence,
+                )
                 state.no_progress_count += int(assessment.kind is ProgressKind.NO_PROGRESS)
                 state.convergence_mode=controller.state.mode.value
                 state.forced_finalization=controller.state.forced_finalization
@@ -188,14 +199,25 @@ class AgentHarness:
             else: state.termination_advisory=""
             return review
 
-        def build_report(context: str):
+        def build_report():
             nonlocal usage_cursor,current_stage
             current_stage=RuntimeStage.REPORTER; before=len(getattr(llm,'calls',[]))
+            final_context,final_ctx_meta=build_finalization_context(
+                task_id=task.task_id,issue=task.issue,state_summary=state.to_summary(),
+                hypothesis=(hypothesis.state if hypothesis is not None else state.current_hypothesis),
+                evidence=state.evidence,observation_store=observations,
+            )
+            trace.record('REPORTER_CONTEXT_BUILT',final_ctx_meta)
             try:
-                report=reporter.build(task.task_id,context,state.evidence); _record_prompt_breakdown(current_stage,reporter); state.report_source='llm'; return report
+                report=reporter.build(task.task_id,final_context,state.evidence); _record_prompt_breakdown(current_stage,reporter); state.report_source='llm'; return report
             except Exception as exc:
                 failure=_failure_from_exception(state,current_stage,exc)
+                violation=getattr(reporter,'last_contract_violation',None)
+                if violation:
+                    trace.record('REPORTER_CONTRACT_VIOLATION',{**violation,'step':state.step})
                 trace.record('REPORTER_FAILED',asdict(failure))
+                # required_missing_evidence affects report content, not whether a valid LLM report counts as LLM success.
+                # Fallback remains conservative: it is only used when enough structured evidence exists to reconstruct safely.
                 if flags.fallback_reporter and hypothesis is not None and hypothesis.state.status in ('supported','confirmed') and hypothesis.state.description and hypothesis.state.supporting_evidence_ids and not hypothesis.state.contradicting_evidence_ids and not hypothesis.state.required_missing_evidence:
                     report=fallback.build(task.task_id,hypothesis.state,state.evidence); state.report_source='fallback'
                     trace.record('FALLBACK_REPORT_BUILT',{'evidence_ids':report.evidence_ids,'confidence':report.confidence,'primary_report_failure':asdict(failure)})
@@ -215,8 +237,11 @@ class AgentHarness:
                 index=RepositoryIndex(repo,index_path); stats=index.build(); trace.record('INDEX_BUILT',stats)
             current_stage=RuntimeStage.SETUP
             tools=ToolRegistry(repo,index=index); planner=Planner(llm,tools,cfg.model.planner_model)
+            if hasattr(planner,"compact_prompt"): planner.compact_prompt=flags.compact_prompt_rendering
             critic_model=cfg.model.critic_model or cfg.model.planner_model
             reflector=Reflector(llm,critic_model); reporter=Reporter(llm,critic_model)
+            if hasattr(reflector,"compact_prompt"): reflector.compact_prompt=flags.compact_prompt_rendering
+            if hasattr(reporter,"compact_prompt"): reporter.compact_prompt=flags.compact_prompt_rendering
             router=RouterGuard(tools); loop=LoopGuard(h.max_repeat_action,h.max_no_progress_steps)
             trace.record('RUN_START',{
                 'task':asdict(task),'policy':'read_only','runtime_version':RUNTIME_VERSION,
@@ -273,7 +298,7 @@ class AgentHarness:
                                 trace.record('FORCE_FINALIZATION',{'step':state.step,'reason':'reflection_failure_limit',
                                                                    'hypothesis_status':(state.current_hypothesis or {}).get('status'),
                                                                    'supporting_evidence_ids':(state.current_hypothesis or {}).get('supporting_evidence_ids',[])})
-                                state.report=build_report(build_ctx(RuntimeStage.REPORTER))
+                                state.report=build_report()
                                 state.status='partial_success' if state.report_source=='fallback' else 'success'
                                 break
                             if controller is not None:
@@ -306,9 +331,9 @@ class AgentHarness:
                         trace.record('REFLECTION',review); force_reflect=False
                         if state.status=='budget_exhausted': break
                         if controller is not None and controller.state.mode is ConvergenceMode.FORCE_FINALIZATION:
-                            state.report=build_report(build_ctx(RuntimeStage.REPORTER)); state.status='partial_success' if state.report_source=='fallback' else 'success'; break
+                            state.report=build_report(); state.status='partial_success' if state.report_source=='fallback' else 'success'; break
                         if review.get('decision')=='finish' and review.get('evidence_sufficient') and len(state.evidence)>=2 and (controller is None or controller.can_finalize(state.current_hypothesis or {})):
-                            state.report=build_report(build_ctx(RuntimeStage.REPORTER)); state.status='partial_success' if state.report_source=='fallback' else 'success'; break
+                            state.report=build_report(); state.status='partial_success' if state.report_source=='fallback' else 'success'; break
 
                 current_stage=RuntimeStage.PLANNER; context=build_ctx(current_stage); before=len(getattr(llm,'calls',[]))
                 try: action=planner.propose(state,context)
@@ -330,9 +355,32 @@ class AgentHarness:
 
                 current_stage=RuntimeStage.ROUTE_VALIDATION; gd=router.validate(action,state)
                 if not gd.ok:
-                    state.invalid_routes+=1; pending_route_recovery=True; err=gd.error or {'error_type':'action_rejected','message':gd.reason,'retryable':True}
-                    state.errors.append(f"{err.get('error_type')}: {gd.reason}"); trace.record('ACTION_REJECTED',{'reason':gd.reason,'error':err,'action':asdict(action)})
-                    force_reflect=gd.force_reflection or action.confidence>=0.8; continue
+                    state.invalid_routes+=1; pending_route_recovery=True; rejected_since_last_evidence=True
+                    err=gd.error or {'error_type':'action_rejected','message':gd.reason,'retryable':True}
+                    state.errors.append(f"{err.get('error_type')}: {gd.reason}")
+                    reject_count=1; reject_exceeded=False; reject_sig=None
+                    # V1.3.2.2 rejection-loop accounting is intentionally scoped to TOOL
+                    # actions. Premature FINISH is already governed by convergence/no-progress
+                    # logic and must not pre-empt safe force-finalization.
+                    if action.kind is ActionKind.TOOL:
+                        reject_count,reject_exceeded,reject_sig=loop.observe_rejected_action(action,state,err.get('error_type','action_rejected'))
+                    trace.record('ACTION_REJECTED',{'reason':gd.reason,'error':err,'action':asdict(action),'rejected_count':reject_count,'rejected_signature':reject_sig})
+                    if action.kind is ActionKind.TOOL and reject_count>1:
+                        trace.record('REPEATED_REJECTED_ACTION',{'count':reject_count,'limit':loop.max_repeat,'signature':reject_sig,'action':asdict(action),'error_type':err.get('error_type')})
+                    # A rejected TOOL action is never diagnostic progress and must not reset BUDGET_CRITICAL.
+                    if action.kind is ActionKind.TOOL and controller is not None and reject_exceeded:
+                        old_mode=controller.state.mode
+                        controller.state.mode=ConvergenceMode.BUDGET_CRITICAL
+                        controller.state.budget_critical_entered=True
+                        controller.state.critical_attempt_used=False
+                        state.convergence_mode=controller.state.mode.value; state.budget_critical_entered=True
+                        if old_mode is not controller.state.mode:
+                            trace.record('CONVERGENCE_MODE_CHANGED',{'from':old_mode.value,'to':controller.state.mode.value,'step':state.step,'reason':'repeated_rejected_action'})
+                        trace.record('BUDGET_CRITICAL',{'step':state.step,'reason':'repeated_rejected_action','rejected_signature':reject_sig})
+                    force_reflect=gd.force_reflection or action.confidence>=0.8 or (action.kind is ActionKind.TOOL and reject_count>1)
+                    continue
+                if gd.repair:
+                    trace.record('ACTION_ARGUMENT_REPAIRED',{**gd.repair,'step':state.step,'skill':action.skill,'information_need':action.information_need})
                 if gd.advisory: trace.record('ROUTE_ADVISORY',{'message':gd.advisory,'skill':action.skill,'tool':action.tool})
                 if gd.canonical_arguments is not None: action.arguments=gd.canonical_arguments
 
@@ -340,7 +388,7 @@ class AgentHarness:
                 if action.kind==ActionKind.FINISH:
                     # The quality precondition constrains Harness-forced finalization, not a normal
                     # model finish that already passed RouterGuard's grounded-evidence requirement.
-                    state.report=build_report(build_ctx(RuntimeStage.REPORTER)); state.status='partial_success' if state.report_source=='fallback' else 'success'; break
+                    state.report=build_report(); state.status='partial_success' if state.report_source=='fallback' else 'success'; break
 
                 # Coverage/reuse precedes exact-repeat blocking for read_file. V1.3.1 distinguishes
                 # already-visible redundant requests from cold observations that must be rehydrated.
@@ -354,7 +402,7 @@ class AgentHarness:
                             if obs is not None:
                                 need=normalize_target(action.information_need or action.expected_evidence or action.reason)
                                 req_key=(normalize_location(p,repo),sline,eline,need)
-                                visible=ctxmgr.is_visible(obs.observation_id)
+                                visible=ctxmgr.is_visible_range(hit.path,sline,eline)
                                 same_need=(req_key==last_redundant_key)
                                 if visible and same_need:
                                     state.redundant_request_count+=1; reused=True
@@ -365,7 +413,7 @@ class AgentHarness:
                                     })
                                     if streak>=2: force_reflect=True
                                 else:
-                                    ctxmgr.rehydrate(obs.observation_id); state.observation_reuse_count+=1; state.rehydration_count+=1; reused=True
+                                    ctxmgr.rehydrate(obs.observation_id,path=hit.path,start_line=sline,end_line=eline,information_need=need); state.observation_reuse_count+=1; state.rehydration_count+=1; reused=True
                                     if controller is not None: controller.note_nonredundant_action()
                                     payload={
                                         'requested':{'path':p,'start_line':sline,'end_line':eline},'reused_observation_id':obs.observation_id,
@@ -404,7 +452,7 @@ class AgentHarness:
 
                 current_stage=RuntimeStage.MEMORY_INGESTION; ev=memory.add_observation(obs)
                 if ev:
-                    state.evidence.append(ev); trace.record('EVIDENCE_ADDED',asdict(ev))
+                    state.evidence.append(ev); rejected_since_last_evidence=False; trace.record('EVIDENCE_ADDED',asdict(ev))
                     if pending_route_recovery: state.recovered_routes+=1; pending_route_recovery=False; trace.record('ROUTE_RECOVERED',{'step':state.step,'tool':action.tool})
                 loop.observe_progress(state)
                 if controller is not None and controller.state.mode in {ConvergenceMode.CONVERGENCE_REQUIRED,ConvergenceMode.BUDGET_CRITICAL}:
@@ -415,7 +463,7 @@ class AgentHarness:
 
             if state.report is None and state.evidence and state.status not in ('failed','partial_success'):
                 try:
-                    state.report=build_report(build_ctx(RuntimeStage.REPORTER))
+                    state.report=build_report()
                     if state.report_source=='fallback': state.status='partial_success'
                 except Exception:
                     if state.status=='budget_exhausted': raise

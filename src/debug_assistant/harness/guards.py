@@ -13,6 +13,7 @@ class GuardDecision:
     canonical_arguments: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
     advisory: str = ""
+    repair: dict[str, Any] | None = None
 
 class RouterGuard:
     """Validate capability + action/tool contracts. Skill/tool affinity is advisory, not a security permission."""
@@ -33,12 +34,19 @@ class RouterGuard:
             if tool.spec.side_effect != 'none':
                 return GuardDecision(False,f"capability denied: tool {action.tool} side_effect={tool.spec.side_effect}",error={"error_type":"capability_denied","retryable":False})
             canonical,error=self.tools.validate_arguments(action.tool,action.arguments)
+            repair=None
             if error:
-                return GuardDecision(False,error['message'],error=error)
+                repaired,repair_meta=self.tools.repair_arguments(action.tool,action.arguments,error)
+                if repaired is not None:
+                    canonical,error=self.tools.validate_arguments(action.tool,repaired)
+                    if error is None:
+                        repair=repair_meta
+                if error:
+                    return GuardDecision(False,error['message'],error=error)
             advisory=''
             if action.tool not in skill.suggested_tools:
                 advisory=f"tool {action.tool} is unusual for skill {action.skill}, but allowed by read-only capability policy"
-            return GuardDecision(True,canonical_arguments=canonical,advisory=advisory)
+            return GuardDecision(True,canonical_arguments=canonical,advisory=advisory,repair=repair)
 
         if action.kind == ActionKind.FINISH and len(state.evidence)<2:
             return GuardDecision(False,'finish rejected: insufficient grounded evidence',True,error={"error_type":"premature_finish","retryable":True})
@@ -48,12 +56,21 @@ class RouterGuard:
 
 class LoopGuard:
     def __init__(self,max_repeat=2,max_no_progress=4):
-        self.max_repeat=max_repeat; self.max_no_progress=max_no_progress; self.counts=Counter(); self.last_evidence=0; self.no_progress=0
+        self.max_repeat=max_repeat; self.max_no_progress=max_no_progress; self.counts=Counter(); self.rejected_counts=Counter(); self.last_evidence=0; self.no_progress=0
     def observe_action(self,action,state):
         fp=action.fingerprint(); self.counts[fp]+=1
         if self.counts[fp]>self.max_repeat:
             state.repeated_actions+=1; return False,f"repeated action exceeded limit: {fp}"
         return True,''
+    def observe_rejected_action(self,action,state,error_type="action_rejected"):
+        sig=f"{action.fingerprint()}|{error_type}"
+        self.rejected_counts[sig]+=1
+        count=self.rejected_counts[sig]
+        repeated=count>1
+        if repeated:
+            state.repeated_actions+=1
+        return count, count>self.max_repeat, sig
+
     def observe_progress(self,state):
         now=len(state.evidence)
         if now<=self.last_evidence: self.no_progress+=1
