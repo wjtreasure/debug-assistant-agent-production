@@ -7,10 +7,13 @@ from debug_assistant.skills.catalog import render_skill_catalog
 SYSTEM="""You are the planner inside a read-only software debugging agent. Diagnose the issue; never propose edits, patches, write commands, package installation, network side effects, or repository mutation. Every conclusion must be grounded in repository evidence. Choose one next action, not a workflow plan. Prefer falsification over confirmation. Do not repeat equivalent calls. High confidence does not grant permission. Tool argument names and constraints are strict: use only fields shown in the tool catalog. Context IDs are optional hints: only reference IDs that appear in CONTEXT_CATALOG."""
 
 class Planner:
-    def __init__(self,llm,tools,model=''): self.llm=llm; self.tools=tools; self.model=model
+    def __init__(self,llm,tools,model=''): self.llm=llm; self.tools=tools; self.model=model; self.last_prompt_breakdown={}
     def propose(self,state:AgentState,context:str) -> ActionProposal:
         contract=render_contract(AgentActionContract,"AGENT_ACTION_SCHEMA")
-        user=f"""{context}\n\nSKILLS:\n{render_skill_catalog()}\n\nTOOLS (strict schemas; suggested skill/tool affinity is guidance, not permission):\n{self.tools.render()}\n\n{contract}\nretain_context_ids is optional. If present, use only IDs from CONTEXT_CATALOG. information_need should state the precise unresolved fact that justifies another tool call."""
+        skills=render_skill_catalog(); tools_text=self.tools.render()
+        instruction="retain_context_ids is optional. If present, use only IDs from CONTEXT_CATALOG. information_need should state the precise unresolved fact that justifies another tool call."
+        user=f"{context}\n\nSKILLS:\n{skills}\n\nTOOLS (strict schemas; suggested skill/tool affinity is guidance, not permission):\n{tools_text}\n\n{contract}\n{instruction}"
+        self.last_prompt_breakdown={'system_chars':len(SYSTEM),'context_chars':len(context),'skill_catalog_chars':len(skills),'tool_catalog_chars':len(tools_text),'contract_chars':len(contract),'instruction_chars':len(instruction)}
         data=self.llm.complete_json(SYSTEM,user,model=self.model or None)
         try:
             c=AgentActionContract.model_validate(data)

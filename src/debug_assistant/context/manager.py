@@ -24,9 +24,13 @@ class ContextManager:
         self.enable_model_selection=enable_model_selection
         self.enable_budget_packing=enable_budget_packing
         self._rehydrated: set[str]=set()
+        self._last_selected_ids: set[str]=set()
 
     def rehydrate(self, observation_id: str) -> None:
         self._rehydrated.add(observation_id)
+
+    def is_visible(self, context_id: str) -> bool:
+        return context_id in self._last_selected_ids
 
     def _obs_item(self, obs, step: int, reason: str, priority: int) -> ContextItem:
         full=obs.content
@@ -141,5 +145,16 @@ class ContextManager:
         text=f"{fixed}{catalog_section}\nWORKING_CONTEXT:\n{working}"
         if len(text)>max_context_chars:
             text=text[:max_context_chars]  # defensive only; packing should normally prevent this.
+        self._last_selected_ids={x["id"] for x in selected_meta}
+        breakdown={
+            "issue_chars":len(issue),
+            "recent_actions_chars":len(recent_actions),
+            "hypothesis_chars":len(str(hyp if hyp else '(none)')),
+            "advisory_chars":len(advisory),
+            "state_chars":len(str(state.to_summary())),
+            "catalog_chars":len(catalog_section),
+            "observation_chars":sum(m["chars"] for m in selected_meta if m.get("kind")=="observation"),
+            "evidence_chars":sum(m["chars"] for m in selected_meta if m.get("kind")=="evidence"),
+        }
         self._rehydrated.clear()
-        return ContextBuildResult(text,max_context_chars,len(text),len(items),len(selected_meta),selected_meta,dropped,invalid)
+        return ContextBuildResult(text,max_context_chars,len(text),len(items),len(selected_meta),selected_meta,dropped,invalid,breakdown)

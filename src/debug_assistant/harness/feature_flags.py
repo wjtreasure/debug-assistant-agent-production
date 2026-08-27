@@ -10,6 +10,7 @@ class FeatureFlags:
     hypothesis_state: bool = True
     termination_advisory: bool = True
     fallback_reporter: bool = True
+    convergence_control: bool = True
 
     def validate(self) -> None:
         if self.model_context_selection and not self.context_catalog:

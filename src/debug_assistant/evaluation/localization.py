@@ -17,20 +17,45 @@ def _aggregate(rows):
     return {'n':len(rows),'file_hit@1':sum(r['file_hit1'] for r in rows)/n,'file_hit@3':sum(r['file_hit3'] for r in rows)/n,
             'file_mrr':sum(r['file_mrr'] for r in rows)/n,'symbol_hit':sum(r['symbol_hit'] for r in rows)/n}
 
+def _trace_gold_support(trace_path: str | None, gold_files: list[str]):
+    if not trace_path or not Path(trace_path).exists(): return {}
+    events=[json.loads(x) for x in Path(trace_path).read_text(encoding='utf-8').splitlines() if x.strip()]
+    evidence_file={}
+    cumulative_tokens=0
+    first_step=None; tokens_at=None
+    gold=set(gold_files)
+    for e in events:
+        if e['type']=='LLM_CALL_USAGE': cumulative_tokens += int(e['payload'].get('total_tokens',0) or 0)
+        elif e['type']=='EVIDENCE_ADDED':
+            payload=e['payload']; f=_norm(payload.get('file') or '') if payload.get('file') else None
+            evidence_file[payload.get('evidence_id')]=f
+        elif e['type']=='HYPOTHESIS_UPDATED' and first_step is None:
+            payload=e['payload']; support=payload.get('supporting_evidence_ids') or []
+            if any(evidence_file.get(i) in gold for i in support):
+                first_step=payload.get('updated_step'); tokens_at=cumulative_tokens
+    total=sum(int(e['payload'].get('total_tokens',0) or 0) for e in events if e['type']=='LLM_CALL_USAGE')
+    post=max(0,total-int(tokens_at)) if tokens_at is not None else None
+    return {'first_gold_support_step':first_step,'tokens_at_first_gold_support':tokens_at,
+            'post_gold_support_tokens':post,'post_gold_support_ratio':(post/total if post is not None and total else None)}
+
 def evaluate_dataset(gold_root,predictions_path):
     preds={}; meta={}; p=Path(predictions_path)
     if p.suffix=='.jsonl':
         for line in p.read_text(encoding='utf-8').splitlines():
             if line.strip():
-                r=json.loads(line); preds[r['task_id']]=r.get('report') or {}; meta[r['task_id']]={'status':r.get('status'),'report_source':r.get('report_source') or (r.get('report') or {}).get('report_source')}
+                r=json.loads(line); preds[r['task_id']]=r.get('report') or {}; meta[r['task_id']]={'status':r.get('status'),'report_source':r.get('report_source') or (r.get('report') or {}).get('report_source'),'state':r.get('state') or {},'trace':r.get('trace') or {}}
     else:
         data=json.loads(p.read_text(encoding='utf-8')); rr=data if isinstance(data,list) else data.get('predictions',[])
-        for r in rr: preds[r['task_id']]=r.get('report') or {}; meta[r['task_id']]={'status':r.get('status'),'report_source':r.get('report_source')}
+        for r in rr: preds[r['task_id']]=r.get('report') or {}; meta[r['task_id']]={'status':r.get('status'),'report_source':r.get('report_source'),'state':r.get('state') or {},'trace':r.get('trace') or {}}
     rows=[]
     for d in Path(gold_root).iterdir():
         gt=d/'ground_truth.json'
         if not gt.exists() or d.name not in preds: continue
-        m=evaluate_one(json.loads(gt.read_text()),preds[d.name]); m['task_id']=d.name; m.update(meta.get(d.name,{})); rows.append(m)
-    llm=[r for r in rows if r.get('report_source')=='llm']; fallback=[r for r in rows if r.get('report_source')=='fallback']
+        gold=json.loads(gt.read_text()); m=evaluate_one(gold,preds[d.name]); md=meta.get(d.name,{})
+        m['task_id']=d.name; m['status']=md.get('status'); m['report_source']=md.get('report_source'); m['forced_finalization']=bool((md.get('state') or {}).get('forced_finalization'))
+        m.update(_trace_gold_support((md.get('trace') or {}).get('trace_path'),m['gold_files']))
+        rows.append(m)
+    llm=[r for r in rows if r.get('report_source')=='llm']; fallback=[r for r in rows if r.get('report_source')=='fallback']; forced=[r for r in rows if r.get('forced_finalization')]
     return {'aggregate':_aggregate(rows),'by_report_source':{'llm':_aggregate(llm),'fallback':_aggregate(fallback)},
-            'runtime':{'fallback_count':len(fallback),'fallback_rate':len(fallback)/(len(rows) or 1),'partial_success_count':sum(r.get('status')=='partial_success' for r in rows)},'cases':rows}
+            'forced_finalization':_aggregate(forced),
+            'runtime':{'fallback_count':len(fallback),'fallback_rate':len(fallback)/(len(rows) or 1),'partial_success_count':sum(r.get('status')=='partial_success' for r in rows),'forced_finalization_count':len(forced)},'cases':rows}

@@ -25,15 +25,36 @@ class AgentActionContract(StrictModel):
             raise ValueError("tool must be null unless kind='tool'")
         return self
 
+class MissingEvidenceItem(StrictModel):
+    target: str = Field(min_length=1)
+    location: str | None = None
+    reason: str = Field(min_length=1)
+
 class ReflectionContract(StrictModel):
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy_reflection_fields(cls, data):
+        if isinstance(data, dict):
+            data=dict(data)
+            if "required_missing_evidence" not in data and "missing" in data:
+                data["required_missing_evidence"]=[{"target":str(x),"location":None,"reason":"legacy reflection field"} for x in (data.pop("missing") or [])]
+            else:
+                data.pop("missing",None)
+            # `contradictions` was legacy free text; it never represented evidence IDs.
+            data.pop("contradictions",None)
+        return data
+
     decision: Literal["continue", "finish"]
     reason: str = Field(min_length=1)
     current_diagnosis: str = ""
+    root_cause_target: str = ""
+    root_cause_location: str | None = None
+    root_cause_mechanism: str = ""
     evidence_sufficient: bool = False
     supporting_evidence_ids: list[str] = Field(default_factory=list)
     contradicting_evidence_ids: list[str] = Field(default_factory=list)
-    missing: list[str] = Field(default_factory=list)
-    contradictions: list[str] = Field(default_factory=list)
+    required_missing_evidence: list[MissingEvidenceItem] = Field(default_factory=list, max_length=3)
+    optional_validation: list[MissingEvidenceItem] = Field(default_factory=list, max_length=2)
     recommended_next_goal: str = ""
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     hypothesis_changed: bool | None = None

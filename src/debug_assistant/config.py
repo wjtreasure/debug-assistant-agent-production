@@ -33,6 +33,7 @@ class HarnessConfig:
     max_repeat_action: int = 2
     max_no_progress_steps: int = 4
     reflect_every: int = 5
+    max_consecutive_reflection_failures: int = 2
     max_tool_output_chars: int = 14_000
     recent_observation_count: int = 2   # backward-compatible fallback setting
     recent_observation_chars: int = 16_000
@@ -67,6 +68,7 @@ class AppConfig:
                 max_repeat_action=int(get("DEBUG_AGENT_MAX_REPEAT_ACTION", "2")),
                 max_no_progress_steps=int(get("DEBUG_AGENT_MAX_NO_PROGRESS_STEPS", "4")),
                 reflect_every=int(get("DEBUG_AGENT_REFLECT_EVERY", "5")),
+                max_consecutive_reflection_failures=int(get("DEBUG_AGENT_MAX_CONSECUTIVE_REFLECTION_FAILURES", "2")),
                 max_tool_output_chars=int(get("DEBUG_AGENT_MAX_TOOL_OUTPUT_CHARS", "14000")),
                 recent_observation_count=int(get("DEBUG_AGENT_RECENT_OBSERVATION_COUNT", "2")),
                 recent_observation_chars=int(get("DEBUG_AGENT_RECENT_OBSERVATION_CHARS", "16000")),

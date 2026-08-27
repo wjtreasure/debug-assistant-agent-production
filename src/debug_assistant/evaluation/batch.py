@@ -5,7 +5,7 @@ import json,time,random
 from debug_assistant.models import TaskSpec
 from debug_assistant.evaluation.trace_metrics import summarize_trace
 
-RUNTIME_VERSION='1.3'
+RUNTIME_VERSION='1.3.1'
 
 def _safe_experiment_config(harness, task_ids, *, sample=0, seed=42, limit=0):
     cfg=harness.config

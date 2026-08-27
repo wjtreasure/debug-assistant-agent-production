@@ -10,7 +10,7 @@ from debug_assistant.repository.index import RepositoryIndex
 from debug_assistant.memory.evidence_memory import EvidenceMemory
 from debug_assistant.memory.observation_store import ObservationStore
 from debug_assistant.memory.coverage import ReadCoverageIndex
-from debug_assistant.memory.hypothesis import HypothesisManager
+from debug_assistant.memory.hypothesis import HypothesisManager, normalize_target, normalize_location
 from debug_assistant.context.manager import ContextManager
 from debug_assistant.agent.planner import Planner
 from debug_assistant.agent.reflection import Reflector
@@ -19,8 +19,9 @@ from debug_assistant.reporting.fallback import FallbackReportBuilder
 from .guards import RouterGuard, LoopGuard
 from .trace import TraceRecorder
 from .tool_executor import execute_with_retry
+from .convergence import ConvergenceController, ConvergenceMode, ProgressKind
 
-RUNTIME_VERSION="1.3"
+RUNTIME_VERSION="1.3.1.1"
 
 
 def _classify_error(exc: Exception, stage: RuntimeStage) -> tuple[str, bool | None]:
@@ -103,12 +104,14 @@ class AgentHarness:
         trace=TraceRecorder(h.trace_dir,task.task_id); state=AgentState(task=task)
         current_stage=RuntimeStage.SETUP
         llm=None; index=None; index_path=None
-        memory=EvidenceMemory(); observations=ObservationStore(); coverage=ReadCoverageIndex(); hypothesis=HypothesisManager()
+        memory=EvidenceMemory(); observations=ObservationStore(); coverage=ReadCoverageIndex(); hypothesis=None
         ctxmgr=ContextManager(h.context,enable_catalog=flags.context_catalog,enable_model_selection=flags.model_context_selection,enable_budget_packing=flags.context_budget_packing)
         fallback=FallbackReportBuilder()
         tools=planner=reflector=reporter=router=loop=None
-        pending_route_recovery=False; force_reflect=False; consecutive_planner_errors=0; usage_cursor=0
+        pending_route_recovery=False; force_reflect=False; consecutive_planner_errors=0; consecutive_reflection_failures=0; usage_cursor=0
         requested_context_ids=[]; last_information_need=""; same_information_need=0
+        controller=ConvergenceController(no_progress_limit=2) if flags.convergence_control else None
+        last_redundant_key=None
 
         def build_ctx(stage: RuntimeStage):
             nonlocal requested_context_ids
@@ -116,24 +119,72 @@ class AgentHarness:
             trace.record('CONTEXT_BUILT',{
                 'stage':stage.value,'budget_chars':result.budget_chars,'used_chars':result.used_chars,'catalog_size':result.catalog_size,
                 'working_set_size':result.working_set_size,'selected':result.selected,'dropped':result.dropped,
-                'invalid_requested_ids':result.invalid_requested_ids,
+                'invalid_requested_ids':result.invalid_requested_ids,'breakdown':result.breakdown,
             })
             if result.invalid_requested_ids: trace.record('CONTEXT_REQUEST_INVALID',{'ids':result.invalid_requested_ids,'stage':stage.value})
             requested_context_ids=[]
             return result.text
+
+        def _current_total_tokens() -> int:
+            return int((_usage_snapshot(llm).get('totals') or {}).get('tokens',0) or 0)
+
+        def _record_prompt_breakdown(stage: RuntimeStage, actor) -> None:
+            payload=dict(getattr(actor,'last_prompt_breakdown',{}) or {})
+            if payload:
+                payload.update({'stage':stage.value,'step':state.step})
+                trace.record('PROMPT_BREAKDOWN',payload)
 
         def update_hypothesis(review: dict):
             valid_support=_validate_evidence_ids(review.get('supporting_evidence_ids') or [],state.evidence)
             valid_contra=_validate_evidence_ids(review.get('contradicting_evidence_ids') or [],state.evidence)
             if len(valid_support) != len(review.get('supporting_evidence_ids') or []):
                 trace.record('REFLECTION_EVIDENCE_ID_INVALID',{'kind':'support','requested':review.get('supporting_evidence_ids'),'accepted':valid_support})
+            if len(valid_contra) != len(review.get('contradicting_evidence_ids') or []):
+                trace.record('REFLECTION_EVIDENCE_ID_INVALID',{'kind':'contradiction','requested':review.get('contradicting_evidence_ids'),'accepted':valid_contra})
             review=dict(review); review['supporting_evidence_ids']=valid_support; review['contradicting_evidence_ids']=valid_contra
             hs=hypothesis.update(review,state.step); state.current_hypothesis=asdict(hs)
             trace.record('HYPOTHESIS_UPDATED',state.current_hypothesis)
-            if flags.termination_advisory and review.get('evidence_sufficient') and not hs.contradicting_evidence_ids and hs.status in ('supported','confirmed'):
-                state.termination_advisory=("Current diagnosis is sufficiently supported and no unresolved contradiction is recorded. "
-                                            "Prefer finish unless a specific unresolved information_need requires another tool call.")
-                trace.record('TERMINATION_ADVISORY',{'step':state.step,'hypothesis_status':hs.status,'stable_reflections':hs.stable_reflections})
+            if controller is not None:
+                old_mode=controller.state.mode
+                assessment=controller.assess_reflection(state.current_hypothesis,usage_totals=(_usage_snapshot(llm).get('totals') or {}))
+                state.no_progress_count += int(assessment.kind is ProgressKind.NO_PROGRESS)
+                state.convergence_mode=controller.state.mode.value
+                state.forced_finalization=controller.state.forced_finalization
+                state.budget_critical_entered=controller.state.budget_critical_entered
+                state.first_supported_hypothesis_step=controller.state.first_supported_hypothesis_step
+                state.first_stable_diagnosis_step=controller.state.first_stable_diagnosis_step
+                state.prompt_tokens_at_first_stable_diagnosis=controller.state.prompt_tokens_at_first_stable_diagnosis
+                state.completion_tokens_at_first_stable_diagnosis=controller.state.completion_tokens_at_first_stable_diagnosis
+                state.tokens_at_first_stable_diagnosis=controller.state.tokens_at_first_stable_diagnosis
+                trace.record('PROGRESS' if assessment.kind is ProgressKind.PROGRESS else 'NO_PROGRESS',{
+                    'step':state.step,'reasons':assessment.reasons,'no_progress_streak':controller.state.no_progress_streak,
+                    'diagnosis_changed':assessment.diagnosis_changed,'required_gap_changed':assessment.required_gap_changed,
+                    'contradiction_changed':assessment.contradiction_changed,'support_changed':assessment.support_changed,
+                })
+                if old_mode != controller.state.mode:
+                    trace.record('CONVERGENCE_MODE_CHANGED',{'from':old_mode.value,'to':controller.state.mode.value,'step':state.step})
+                if controller.state.mode is ConvergenceMode.BUDGET_CRITICAL:
+                    trace.record('BUDGET_CRITICAL',{'step':state.step,'required_missing_evidence':hs.required_missing_evidence,'no_progress_streak':controller.state.no_progress_streak})
+                if controller.state.mode is ConvergenceMode.FORCE_FINALIZATION:
+                    trace.record('FORCE_FINALIZATION',{'step':state.step,'hypothesis_status':hs.status,'supporting_evidence_ids':hs.supporting_evidence_ids})
+                if controller.critical_failed_after_reflection(assessment):
+                    state.status='budget_exhausted'
+                    state.errors.append('budget critical final required-information attempt produced no diagnostic progress')
+                    trace.record('BUDGET_EXHAUSTED',{'step':state.step,'reason':'budget_critical_no_progress'})
+            if flags.termination_advisory and hs.status in ('supported','confirmed') and not hs.contradicting_evidence_ids:
+                if controller is not None and controller.state.mode is ConvergenceMode.CONVERGENCE_REQUIRED:
+                    state.termination_advisory=("CONVERGENCE_REQUIRED: the causal diagnosis is stable, no required evidence gap remains, and no direct contradiction is recorded. "
+                                                "Prefer finish. Continue only for a specific causal uncertainty; optional validation alone must not block finalization.")
+                elif controller is not None and controller.state.mode is ConvergenceMode.BUDGET_CRITICAL:
+                    state.termination_advisory=("BUDGET_CRITICAL: one final tool attempt is allowed only to resolve a required_missing_evidence item. "
+                                                "Do not perform optional validation.")
+                elif review.get('evidence_sufficient'):
+                    state.termination_advisory=("Current diagnosis is sufficiently supported and no unresolved contradiction is recorded. "
+                                                "Prefer finish unless a specific unresolved information_need requires another tool call.")
+                else:
+                    state.termination_advisory=""
+                if state.termination_advisory:
+                    trace.record('TERMINATION_ADVISORY',{'step':state.step,'hypothesis_status':hs.status,'stable_diagnosis_transitions':hs.stable_diagnosis_transitions,'mode':state.convergence_mode})
             else: state.termination_advisory=""
             return review
 
@@ -141,11 +192,11 @@ class AgentHarness:
             nonlocal usage_cursor,current_stage
             current_stage=RuntimeStage.REPORTER; before=len(getattr(llm,'calls',[]))
             try:
-                report=reporter.build(task.task_id,context,state.evidence); state.report_source='llm'; return report
+                report=reporter.build(task.task_id,context,state.evidence); _record_prompt_breakdown(current_stage,reporter); state.report_source='llm'; return report
             except Exception as exc:
                 failure=_failure_from_exception(state,current_stage,exc)
                 trace.record('REPORTER_FAILED',asdict(failure))
-                if flags.fallback_reporter and hypothesis.state.description and hypothesis.state.supporting_evidence_ids:
+                if flags.fallback_reporter and hypothesis is not None and hypothesis.state.status in ('supported','confirmed') and hypothesis.state.description and hypothesis.state.supporting_evidence_ids and not hypothesis.state.contradicting_evidence_ids and not hypothesis.state.required_missing_evidence:
                     report=fallback.build(task.task_id,hypothesis.state,state.evidence); state.report_source='fallback'
                     trace.record('FALLBACK_REPORT_BUILT',{'evidence_ids':report.evidence_ids,'confidence':report.confidence,'primary_report_failure':asdict(failure)})
                     return report
@@ -156,6 +207,7 @@ class AgentHarness:
         try:
             repo=Path(task.repo_path).resolve()
             if not repo.exists(): raise FileNotFoundError(repo)
+            hypothesis=HypothesisManager(repo)
             llm=build_llm(cfg.model)
             current_stage=RuntimeStage.INDEX_BUILD
             if h.build_task_index:
@@ -170,6 +222,7 @@ class AgentHarness:
                 'task':asdict(task),'policy':'read_only','runtime_version':RUNTIME_VERSION,
                 'model':{'provider':cfg.model.provider,'planner':cfg.model.planner_model,'critic':critic_model,'temperature':cfg.model.temperature},
                 'harness':{'max_steps':h.max_steps,'max_tool_calls':h.max_tool_calls,'max_context_chars':h.max_context_chars,
+                           'max_consecutive_reflection_failures':h.max_consecutive_reflection_failures,
                            'context':asdict(h.context),'features':asdict(flags)},
             })
 
@@ -181,15 +234,81 @@ class AgentHarness:
                 near_budget=(h.max_steps-state.step <= 2)
                 if force_reflect or periodic or near_budget:
                     current_stage=RuntimeStage.REFLECTION; rctx=build_ctx(current_stage); before=len(getattr(llm,'calls',[]))
-                    try: review=reflector.review(rctx)
-                    except Exception:
-                        usage_cursor=_record_new_llm_usage(trace,llm,before,current_stage); raise
-                    usage_cursor=_record_new_llm_usage(trace,llm,before,current_stage)
-                    state.reflection_count+=1
-                    if flags.hypothesis_state: review=update_hypothesis(review)
-                    trace.record('REFLECTION',review); force_reflect=False
-                    if review.get('decision')=='finish' and review.get('evidence_sufficient') and len(state.evidence)>=2:
-                        state.report=build_report(build_ctx(RuntimeStage.REPORTER)); state.status='partial_success' if state.report_source=='fallback' else 'success'; break
+                    review=None
+                    try:
+                        review=reflector.review(rctx)
+                    except Exception as exc:
+                        usage_cursor=_record_new_llm_usage(trace,llm,before,current_stage)
+                        failure=_failure_from_exception(state,current_stage,exc)
+                        state.reflection_failure_count += 1
+                        consecutive_reflection_failures += 1
+                        state.max_consecutive_reflection_failures_observed=max(
+                            state.max_consecutive_reflection_failures_observed,consecutive_reflection_failures
+                        )
+                        trace.record('REFLECTION_FAILED',{**asdict(failure),'consecutive_failures':consecutive_reflection_failures,
+                                                          'max_tolerated':h.max_consecutive_reflection_failures})
+                        # Only retryable transport/model failures are recoverable. Schema/programming
+                        # errors must remain visible rather than being silently masked.
+                        if not failure.retryable:
+                            raise
+                        state.errors.append(f"recoverable reflection failure: {failure.error_type}: {failure.message}")
+                        if consecutive_reflection_failures < max(1,h.max_consecutive_reflection_failures):
+                            # Preserve the last valid Hypothesis and allow one normal planner cycle.
+                            # A later successful reflection resets this streak.
+                            force_reflect=False
+                            trace.record('REFLECTION_FAILURE_RECOVERED',{
+                                'step':state.step,'consecutive_failures':consecutive_reflection_failures,
+                                'preserved_hypothesis':bool(state.current_hypothesis),
+                            })
+                        else:
+                            # Reflection has failed repeatedly. If the previous structured state is
+                            # already safe to finalize, stop exploration and report from that state.
+                            if controller is not None and controller.can_finalize(state.current_hypothesis or {}):
+                                old_mode=controller.state.mode
+                                controller.state.mode=ConvergenceMode.FORCE_FINALIZATION
+                                controller.state.forced_finalization=True
+                                state.convergence_mode=controller.state.mode.value; state.forced_finalization=True
+                                if old_mode is not controller.state.mode:
+                                    trace.record('CONVERGENCE_MODE_CHANGED',{'from':old_mode.value,'to':controller.state.mode.value,'step':state.step,'reason':'reflection_failure_limit'})
+                                trace.record('FORCE_FINALIZATION',{'step':state.step,'reason':'reflection_failure_limit',
+                                                                   'hypothesis_status':(state.current_hypothesis or {}).get('status'),
+                                                                   'supporting_evidence_ids':(state.current_hypothesis or {}).get('supporting_evidence_ids',[])})
+                                state.report=build_report(build_ctx(RuntimeStage.REPORTER))
+                                state.status='partial_success' if state.report_source=='fallback' else 'success'
+                                break
+                            if controller is not None:
+                                old_mode=controller.state.mode
+                                if controller.state.mode is ConvergenceMode.BUDGET_CRITICAL and controller.state.critical_attempt_used:
+                                    state.status='budget_exhausted'
+                                    state.errors.append('reflection failure limit exceeded after budget-critical attempt')
+                                    trace.record('BUDGET_EXHAUSTED',{'step':state.step,'reason':'reflection_failure_limit_after_critical_attempt'})
+                                    break
+                                controller.state.mode=ConvergenceMode.BUDGET_CRITICAL
+                                controller.state.budget_critical_entered=True
+                                controller.state.critical_attempt_used=False
+                                state.convergence_mode=controller.state.mode.value; state.budget_critical_entered=True
+                                if old_mode is not controller.state.mode:
+                                    trace.record('CONVERGENCE_MODE_CHANGED',{'from':old_mode.value,'to':controller.state.mode.value,'step':state.step,'reason':'reflection_failure_limit'})
+                                trace.record('BUDGET_CRITICAL',{'step':state.step,'reason':'reflection_failure_limit',
+                                                                 'required_missing_evidence':(state.current_hypothesis or {}).get('required_missing_evidence',[])})
+                                force_reflect=False
+                            else:
+                                state.status='budget_exhausted'
+                                state.errors.append('reflection failure tolerance exhausted')
+                                trace.record('BUDGET_EXHAUSTED',{'step':state.step,'reason':'reflection_failure_limit'})
+                                break
+                    if review is not None:
+                        usage_cursor=_record_new_llm_usage(trace,llm,before,current_stage)
+                        _record_prompt_breakdown(current_stage,reflector)
+                        consecutive_reflection_failures=0
+                        state.reflection_count+=1
+                        if flags.hypothesis_state: review=update_hypothesis(review)
+                        trace.record('REFLECTION',review); force_reflect=False
+                        if state.status=='budget_exhausted': break
+                        if controller is not None and controller.state.mode is ConvergenceMode.FORCE_FINALIZATION:
+                            state.report=build_report(build_ctx(RuntimeStage.REPORTER)); state.status='partial_success' if state.report_source=='fallback' else 'success'; break
+                        if review.get('decision')=='finish' and review.get('evidence_sufficient') and len(state.evidence)>=2 and (controller is None or controller.can_finalize(state.current_hypothesis or {})):
+                            state.report=build_report(build_ctx(RuntimeStage.REPORTER)); state.status='partial_success' if state.report_source=='fallback' else 'success'; break
 
                 current_stage=RuntimeStage.PLANNER; context=build_ctx(current_stage); before=len(getattr(llm,'calls',[]))
                 try: action=planner.propose(state,context)
@@ -199,7 +318,7 @@ class AgentHarness:
                     consecutive_planner_errors+=1
                     if consecutive_planner_errors>=3: state.failure=_failure_from_exception(state,current_stage,exc); state.status='failed'; break
                     continue
-                usage_cursor=_record_new_llm_usage(trace,llm,before,current_stage); consecutive_planner_errors=0
+                usage_cursor=_record_new_llm_usage(trace,llm,before,current_stage); _record_prompt_breakdown(current_stage,planner); consecutive_planner_errors=0
                 state.actions.append(action); trace.record('ACTION_PROPOSED',asdict(action))
                 if flags.model_context_selection: requested_context_ids=list(action.retain_context_ids or [])
 
@@ -219,26 +338,59 @@ class AgentHarness:
 
                 if action.kind==ActionKind.REFLECT: force_reflect=True; continue
                 if action.kind==ActionKind.FINISH:
+                    # The quality precondition constrains Harness-forced finalization, not a normal
+                    # model finish that already passed RouterGuard's grounded-evidence requirement.
                     state.report=build_report(build_ctx(RuntimeStage.REPORTER)); state.status='partial_success' if state.report_source=='fallback' else 'success'; break
 
-                # Coverage/reuse precedes exact-repeat blocking for read_file. Re-reading known facts should rehydrate context, not become a blocked loop.
+                # Coverage/reuse precedes exact-repeat blocking for read_file. V1.3.1 distinguishes
+                # already-visible redundant requests from cold observations that must be rehydrated.
                 reused=False
                 if flags.observation_reuse and action.tool=='read_file':
-                    p=action.arguments.get('path'); s=action.arguments.get('start_line'); e=action.arguments.get('end_line')
-                    if p and isinstance(s,int) and isinstance(e,int):
-                        hit=coverage.find_covering(path=p,start_line=s,end_line=e)
+                    p=action.arguments.get('path'); sline=action.arguments.get('start_line'); eline=action.arguments.get('end_line')
+                    if p and isinstance(sline,int) and isinstance(eline,int):
+                        hit=coverage.find_covering(path=p,start_line=sline,end_line=eline)
                         if hit:
                             obs=observations.get(hit.observation_id)
                             if obs is not None:
-                                ctxmgr.rehydrate(obs.observation_id); state.observation_reuse_count+=1; reused=True
-                                trace.record('OBSERVATION_REUSED',{'requested':{'path':p,'start_line':s,'end_line':e},'reused_observation_id':obs.observation_id,
-                                                                  'original_coverage':{'start_line':hit.start_line,'end_line':hit.end_line}})
-                                force_reflect = same_information_need >= 1 or loop.no_progress >= max(1,h.max_no_progress_steps-2)
-                                if force_reflect: state.no_progress_count+=1; trace.record('NO_PROGRESS',{'reason':'reused_observation_same_need','same_information_need':same_information_need})
+                                need=normalize_target(action.information_need or action.expected_evidence or action.reason)
+                                req_key=(normalize_location(p,repo),sline,eline,need)
+                                visible=ctxmgr.is_visible(obs.observation_id)
+                                same_need=(req_key==last_redundant_key)
+                                if visible and same_need:
+                                    state.redundant_request_count+=1; reused=True
+                                    streak=controller.note_redundant() if controller is not None else 1
+                                    trace.record('REDUNDANT_CONTEXT_REQUEST',{
+                                        'requested':{'path':p,'start_line':sline,'end_line':eline},'covered_by':obs.observation_id,
+                                        'information_need':need,'redundant_request_streak':streak,'message':'requested source is already fully visible; reason from current context',
+                                    })
+                                    if streak>=2: force_reflect=True
+                                else:
+                                    ctxmgr.rehydrate(obs.observation_id); state.observation_reuse_count+=1; state.rehydration_count+=1; reused=True
+                                    if controller is not None: controller.note_nonredundant_action()
+                                    payload={
+                                        'requested':{'path':p,'start_line':sline,'end_line':eline},'reused_observation_id':obs.observation_id,
+                                        'original_coverage':{'start_line':hit.start_line,'end_line':hit.end_line},
+                                        'information_need':need,'information_need_satisfied':True,'was_visible':visible,
+                                    }
+                                    trace.record('OBSERVATION_REHYDRATED',payload)
+                                    trace.record('OBSERVATION_REUSED',payload)  # backward-compatible aggregate event
+                                    force_reflect = True
+                                last_redundant_key=req_key
                 if reused: continue
 
+                if controller is not None:
+                    controller.note_nonredundant_action(); last_redundant_key=None
+                    if controller.state.mode is ConvergenceMode.BUDGET_CRITICAL and action.kind==ActionKind.TOOL:
+                        if not controller.allow_critical_tool_attempt(action.information_need,state.current_hypothesis or {}):
+                            trace.record('ACTION_REJECTED',{'reason':'budget critical permits only one final required-information tool attempt','action':asdict(action)})
+                            state.status='budget_exhausted'; state.errors.append('budget critical exploration exhausted');
+                            trace.record('BUDGET_EXHAUSTED',{'step':state.step,'reason':'budget_critical_invalid_or_extra_attempt'}); break
+
                 ok,reason=loop.observe_action(action,state)
-                if not ok: trace.record('LOOP_BLOCKED',{'reason':reason}); force_reflect=True; state.no_progress_count+=1; continue
+                if not ok:
+                    trace.record('LOOP_BLOCKED',{'reason':reason}); force_reflect=True
+                    if not flags.convergence_control: state.no_progress_count+=1
+                    continue
 
                 current_stage=RuntimeStage.TOOL_EXECUTION; tool=tools.get(action.tool); state.tool_calls+=1
                 obs=execute_with_retry(tool,action.arguments,attempts=2,on_retry=lambda n,o: trace.record('TOOL_RETRY',{'attempt':n,'tool':action.tool,'error':o.content[:500]}))
@@ -254,8 +406,12 @@ class AgentHarness:
                 if ev:
                     state.evidence.append(ev); trace.record('EVIDENCE_ADDED',asdict(ev))
                     if pending_route_recovery: state.recovered_routes+=1; pending_route_recovery=False; trace.record('ROUTE_RECOVERED',{'step':state.step,'tool':action.tool})
-                if not loop.observe_progress(state):
-                    force_reflect=True; state.no_progress_count+=1; trace.record('NO_PROGRESS',{'steps':loop.no_progress,'reason':'no_new_evidence'})
+                loop.observe_progress(state)
+                if controller is not None and controller.state.mode in {ConvergenceMode.CONVERGENCE_REQUIRED,ConvergenceMode.BUDGET_CRITICAL}:
+                    # Once convergence begins, assess each exploration cycle rather than waiting for the periodic reflector.
+                    force_reflect=True
+                if not flags.convergence_control and loop.no_progress >= h.max_no_progress_steps:
+                    force_reflect=True; state.no_progress_count+=1; trace.record('NO_PROGRESS',{'steps':loop.no_progress,'reason':'legacy_no_new_evidence'})
 
             if state.report is None and state.evidence and state.status not in ('failed','partial_success'):
                 try:

@@ -5,11 +5,13 @@ from debug_assistant.contracts import DiagnosisReportContract, compact_validatio
 SYSTEM="""You are a senior software debugging assistant. Produce a development decision report from the supplied evidence. Do not claim code was changed. Do not invent file names, symbols, line numbers or causal facts absent from evidence. Separate uncertainty from conclusions. evidence_ids must contain only IDs explicitly available in the supplied context."""
 
 class Reporter:
-    def __init__(self,llm,model=''): self.llm=llm; self.model=model
+    def __init__(self,llm,model=''): self.llm=llm; self.model=model; self.last_prompt_breakdown={}
     def build(self,task_id,context,evidence):
         available={e.evidence_id for e in evidence}
         contract=render_contract(DiagnosisReportContract,"FINAL_REPORT_SCHEMA")
-        user=f"""{context}\n\nAVAILABLE_EVIDENCE_IDS: {sorted(available)}\n\n{contract}"""
+        available_text=f"AVAILABLE_EVIDENCE_IDS: {sorted(available)}"
+        user=f"{context}\n\n{available_text}\n\n{contract}"
+        self.last_prompt_breakdown={'system_chars':len(SYSTEM),'context_chars':len(context),'evidence_id_chars':len(available_text),'contract_chars':len(contract)}
         raw=self.llm.complete_json(SYSTEM,user,model=self.model or None)
         try:
             d=DiagnosisReportContract.model_validate(raw)

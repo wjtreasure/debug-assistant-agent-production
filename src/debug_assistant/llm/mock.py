@@ -20,8 +20,9 @@ class MockLLMClient(LLMClient):
                     "uncertainties":["Mock provider does not perform semantic reasoning"], "next_checks":["Review boundary tests"], "confidence":0.62}
         if 'reflection_schema' in low:
             return {"decision":"continue","reason":"collect one more targeted source excerpt","current_diagnosis":"fixture parser boundary validation",
-                    "evidence_sufficient":False,"supporting_evidence_ids":[],"missing":["target implementation"],"contradictions":[],
-                    "recommended_next_goal":"inspect target implementation"}
+                    "evidence_sufficient":False,"supporting_evidence_ids":[],"contradicting_evidence_ids":[],
+                    "required_missing_evidence":[{"target":"target implementation","location":"src/parser.py","reason":"source is required to ground the mechanism"}],
+                    "optional_validation":[],"recommended_next_goal":"inspect target implementation","confidence":0.6,"hypothesis_changed":None}
         if self.n == 1:
             return {"kind":"tool","skill":"repository_exploration","reason":"find issue keywords","confidence":0.8,
                     "tool":"grep","arguments":{"query":"parse_value|boundary|invalid","glob":"*.py","max_results":20},"expected_evidence":"candidate implementation"}

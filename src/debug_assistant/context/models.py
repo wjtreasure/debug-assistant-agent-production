@@ -25,3 +25,4 @@ class ContextBuildResult:
     selected: list[dict[str, Any]] = field(default_factory=list)
     dropped: list[dict[str, Any]] = field(default_factory=list)
     invalid_requested_ids: list[str] = field(default_factory=list)
+    breakdown: dict[str, int] = field(default_factory=dict)

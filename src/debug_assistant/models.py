@@ -133,6 +133,8 @@ class AgentState:
     recovered_routes: int = 0
     repeated_actions: int = 0
     reflection_count: int = 0
+    reflection_failure_count: int = 0
+    max_consecutive_reflection_failures_observed: int = 0
     started_at: float = field(default_factory=time.time)
     failure: RuntimeFailure | None = None
     report_source: str = ""
@@ -140,6 +142,16 @@ class AgentState:
     termination_advisory: str = ""
     observation_reuse_count: int = 0
     no_progress_count: int = 0
+    redundant_request_count: int = 0
+    rehydration_count: int = 0
+    convergence_mode: str = "normal"
+    forced_finalization: bool = False
+    budget_critical_entered: bool = False
+    first_supported_hypothesis_step: int | None = None
+    first_stable_diagnosis_step: int | None = None
+    prompt_tokens_at_first_stable_diagnosis: int | None = None
+    completion_tokens_at_first_stable_diagnosis: int | None = None
+    tokens_at_first_stable_diagnosis: int | None = None
 
     def to_summary(self) -> dict[str, Any]:
         return {
@@ -148,8 +160,18 @@ class AgentState:
             "evidence": len(self.evidence), "hypotheses": len(self.hypotheses),
             "invalid_routes": self.invalid_routes, "recovered_routes": self.recovered_routes,
             "repeated_actions": self.repeated_actions, "reflection_count": self.reflection_count,
+            "reflection_failure_count": self.reflection_failure_count,
+            "max_consecutive_reflection_failures_observed": self.max_consecutive_reflection_failures_observed,
             "errors": self.errors[-5:],
             "failure": asdict(self.failure) if self.failure else None,
             "report_source": self.report_source, "observation_reuse_count": self.observation_reuse_count,
             "no_progress_count": self.no_progress_count, "current_hypothesis": self.current_hypothesis,
+            "redundant_request_count": self.redundant_request_count, "rehydration_count": self.rehydration_count,
+            "convergence_mode": self.convergence_mode, "forced_finalization": self.forced_finalization,
+            "budget_critical_entered": self.budget_critical_entered,
+            "first_supported_hypothesis_step": self.first_supported_hypothesis_step,
+            "first_stable_diagnosis_step": self.first_stable_diagnosis_step,
+            "prompt_tokens_at_first_stable_diagnosis": self.prompt_tokens_at_first_stable_diagnosis,
+            "completion_tokens_at_first_stable_diagnosis": self.completion_tokens_at_first_stable_diagnosis,
+            "tokens_at_first_stable_diagnosis": self.tokens_at_first_stable_diagnosis,
         }
