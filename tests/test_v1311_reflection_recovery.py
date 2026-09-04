@@ -77,5 +77,12 @@ def test_repeated_reflection_timeouts_do_not_loop_forever(monkeypatch,tmp_path):
     monkeypatch.setattr('debug_assistant.harness.runtime.Reflector',AlwaysFailReflector)
     r=AgentHarness(cfg).run(TaskSpec('fail-limit','boundary bug',str(repo)))
     assert r['state']['reflection_failure_count'] >= 2
-    assert r['state']['budget_critical_entered'] is True or r['state']['status'] in {'budget_exhausted','failed'}
+    # V1.4.6 separates critic degradation from true budget exhaustion.  Repeated
+    # Reflection failures must terminate conservatively without mislabelling the
+    # run as BUDGET_CRITICAL.
+    assert r['state']['budget_critical_entered'] is False
+    assert r['state']['status'] in {'partial_success','budget_exhausted','failed'}
+    trace_path=next((tmp_path/'traces').glob('*.jsonl'))
+    events=[__import__('json').loads(line) for line in trace_path.read_text().splitlines()]
+    assert any(e['type']=='CRITIC_DEGRADED' for e in events)
     assert r['state']['step'] <= cfg.harness.max_steps

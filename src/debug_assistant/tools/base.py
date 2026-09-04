@@ -18,9 +18,18 @@ class ToolSpec:
     cost_class: str = "light"
     side_effect: str = "none"
     output_limit: int | None = None
+    parallel_safe: bool = False
 
     def json_schema(self) -> dict[str, Any]:
         return self.args_model.model_json_schema()
+
+    def function_schema(self) -> dict[str, Any]:
+        """Return the provider-neutral function schema derived from ``args_model``."""
+        return {"type": "function", "function": {
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.json_schema(),
+        }}
 
 
 class Tool:

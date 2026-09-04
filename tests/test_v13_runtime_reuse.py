@@ -20,7 +20,7 @@ class ReuseLLM:
         if self.planner_n==2:
             return {'kind':'tool','skill':'hypothesis_validation','reason':'read full','tool':'read_file','arguments':{'path':'a.py','start_line':1,'end_line':20},'expected_evidence':'source','information_need':'inspect source','confidence':.9}
         if self.planner_n==3:
-            return {'kind':'tool','skill':'hypothesis_validation','reason':'recheck subset','tool':'read_file','arguments':{'path':'a.py','start_line':5,'end_line':10},'expected_evidence':'subset','information_need':'inspect source','confidence':.9}
+            return {'kind':'tool','skill':'hypothesis_validation','reason':'recheck subset','tool':'read_file','arguments':{'path':'./a.py','start_line':5,'end_line':10},'expected_evidence':'subset','information_need':'inspect source','confidence':.9}
         return {'kind':'finish','skill':'report_synthesis','reason':'done','tool':None,'arguments':{},'confidence':.9}
 
 
@@ -34,4 +34,6 @@ def test_runtime_reuses_covered_read_and_rehydrates_context(monkeypatch,tmp_path
     assert r['state']['observation_reuse_count']==1
     events=[json.loads(x) for x in Path(r['trace']['trace_path']).read_text().splitlines()]
     assert any(e['type']=='OBSERVATION_REUSED' for e in events)
+    assert any(e['type']=='OBSERVATION_SUBRANGE_REHYDRATED' for e in events)
+    assert any(e['type']=='PATH_RESOLVED' and e['payload'].get('strategy')=='normalized_relative' for e in events)
     assert any(e['type']=='CONTEXT_BUILT' and any(x.get('reason')=='observation_reused' for x in e['payload'].get('selected',[])) for e in events)

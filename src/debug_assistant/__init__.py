@@ -1,2 +1,2 @@
 """Debug-Assistant Agent."""
-__version__ = "1.3.2.2"
+__version__ = "1.5.2"

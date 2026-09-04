@@ -4,6 +4,7 @@ from collections import Counter
 from typing import Any
 from debug_assistant.models import ActionKind, ActionProposal, AgentState
 from debug_assistant.skills.catalog import SKILLS
+from debug_assistant.tools.registry import PARALLEL_ALLOWED_TOOLS
 
 @dataclass(slots=True)
 class GuardDecision:
@@ -14,6 +15,7 @@ class GuardDecision:
     error: dict[str, Any] | None = None
     advisory: str = ""
     repair: dict[str, Any] | None = None
+    canonical_actions: list[dict[str,Any]] | None = None
 
 class RouterGuard:
     """Validate capability + action/tool contracts. Skill/tool affinity is advisory, not a security permission."""
@@ -23,6 +25,34 @@ class RouterGuard:
         if action.skill not in SKILLS:
             return GuardDecision(False,f"unknown skill: {action.skill}",error={"error_type":"unknown_skill","retryable":True})
         skill=SKILLS[action.skill]
+
+        if action.kind == ActionKind.PARALLEL:
+            if not (2 <= len(action.actions) <= 4):
+                return GuardDecision(False,'parallel action must contain 2-4 children',error={"error_type":"schema_validation","retryable":True})
+            canonical_actions=[]
+            import json,re
+            for idx,child in enumerate(action.actions):
+                tool_name=str(child.get('tool') or '')
+                if tool_name not in PARALLEL_ALLOWED_TOOLS:
+                    return GuardDecision(False,f'parallel tool is not in bounded local allowlist: {tool_name}',error={'error_type':'parallel_tool_not_allowed','retryable':True,'action_index':idx})
+                args=dict(child.get('arguments') or {})
+                # Parallel workers are deliberately local/bounded. Semantic/hybrid
+                # code_search can invoke an external embedding provider and therefore
+                # must remain serial under the normal provider deadline/circuit breaker.
+                if tool_name=='code_search' and str(args.get('mode','lexical')).lower()!='lexical':
+                    return GuardDecision(False,'parallel code_search must use lexical mode',error={'error_type':'parallel_tool_not_bounded_local','retryable':True,'action_index':idx})
+                blob=json.dumps(args,ensure_ascii=False)
+                if re.search(r'\{\{\s*(?:result_of_)?action[_-]?\d+|\{\{[^}]*action_id',blob,re.I):
+                    return GuardDecision(False,'parallel child arguments depend on sibling results',error={"error_type":"parallel_dependency","retryable":True,"action_index":idx})
+                tool=self.tools.get(tool_name)
+                if not tool:
+                    return GuardDecision(False,f'unknown tool: {tool_name}',error={"error_type":"unknown_tool","retryable":True})
+                if tool.spec.side_effect!='none':
+                    return GuardDecision(False,f'capability denied: tool {tool_name} side_effect={tool.spec.side_effect}',error={"error_type":"capability_denied","retryable":False})
+                canonical,error=self.tools.validate_arguments(tool_name,args)
+                if error:return GuardDecision(False,error['message'],error={**error,'action_index':idx})
+                canonical_actions.append({**child,'action_id':child.get('action_id') or f'a{idx}','arguments':canonical})
+            return GuardDecision(True,canonical_actions=canonical_actions)
 
         if action.kind == ActionKind.TOOL:
             if not action.tool:

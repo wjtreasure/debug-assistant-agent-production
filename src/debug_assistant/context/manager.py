@@ -186,6 +186,20 @@ class ContextManager:
     def build(self, state, memory, observation_store, *, max_context_chars: int, max_steps=None,
               max_tool_calls=None, requested_ids=None) -> ContextBuildResult:
         requested_ids=list(requested_ids or []) if self.enable_model_selection else []
+        # Evidence-aware projection: compact Evidence excerpts may truthfully represent only
+        # the beginning of a larger read_file observation. If a truncated read is currently
+        # hypothesis support, re-project its immutable raw source range instead of letting the
+        # model infer that unseen tail lines were never read. This is still bounded by the
+        # normal context packer and never performs repository I/O.
+        hyp0=state.current_hypothesis or {}
+        support0=set(hyp0.get('supporting_evidence_ids') or [])
+        if self.enable_projection and support0:
+            for ev in memory.pinned:
+                if (ev.evidence_id in support0 and ev.source == 'read_file' and ev.excerpt_truncated
+                        and ev.raw_observation_id and ev.file
+                        and isinstance(ev.source_start_line,int) and isinstance(ev.source_end_line,int)):
+                    self.rehydrate(ev.raw_observation_id,path=ev.file,start_line=ev.source_start_line,
+                                   end_line=ev.source_end_line,information_need='hypothesis_support_projection')
         items=self.catalog(state,memory,observation_store)
         by_id={x.context_id:x for x in items}
         invalid=[x for x in requested_ids if x not in by_id]

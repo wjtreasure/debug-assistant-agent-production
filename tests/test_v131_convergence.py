@@ -23,17 +23,18 @@ def test_two_true_no_progress_cycles_force_finalization_only_when_safe():
     assert c.state.mode is ConvergenceMode.FORCE_FINALIZATION
     assert c.state.forced_finalization
 
-def test_unsafe_stagnation_enters_budget_critical_then_exhausts():
+def test_unsafe_stagnation_stays_convergence_required_not_budget_critical():
     c=ConvergenceController(no_progress_limit=2)
     gap=[{'target':'need caller','location':'a.py','reason':'required'}]
     c.assess_reflection(hyp(1,status='supported',gaps=gap,stable=0,gfp='x'),usage_totals={})
     c.assess_reflection(hyp(2,status='supported',gaps=gap,stable=1,gfp='x'),usage_totals={})
     c.assess_reflection(hyp(3,status='supported',gaps=gap,stable=2,gfp='x'),usage_totals={})
-    assert c.state.mode is ConvergenceMode.BUDGET_CRITICAL
+    assert c.state.mode is ConvergenceMode.CONVERGENCE_REQUIRED
+    assert c.state.budget_critical_entered is False
     assert c.allow_critical_tool_attempt('resolve caller',hyp(3,status='supported',gaps=gap))
     a=c.assess_reflection(hyp(4,status='supported',gaps=gap,stable=3,gfp='x'),usage_totals={})
     assert a.kind is ProgressKind.NO_PROGRESS
-    assert c.critical_failed_after_reflection(a)
+    assert c.state.mode is ConvergenceMode.CONVERGENCE_REQUIRED
 
 def test_redundant_request_does_not_increment_no_progress():
     c=ConvergenceController()

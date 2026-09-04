@@ -59,11 +59,12 @@ def test_reporter_failure_keeps_trace_and_prior_usage(monkeypatch,tmp_path):
     fake=ReporterFailLLM()
     monkeypatch.setattr('debug_assistant.harness.runtime.build_llm',lambda cfg: fake)
     r=AgentHarness(_cfg(tmp_path)).run(TaskSpec('reporter-fail','issue',str(repo)))
-    assert r['state']['status']=='failed'
-    assert r['failure']['stage']=='reporter'
+    assert r['state']['status']=='partial_success'
+    assert r['failure'] is None
+    assert r['report_source']=='fallback'
     evs=_events(r['trace']['trace_path'])
-    run_failed=[e for e in evs if e['type']=='RUN_FAILED'][-1]
-    assert run_failed['payload']['stage']=='reporter'
+    assert any(e['type']=='REPORTER_FAILED' and e['payload']['stage']=='reporter' for e in evs)
+    assert any(e['type']=='FALLBACK_REPORT_BUILT' for e in evs)
     usage=[e for e in evs if e['type']=='LLM_USAGE'][-1]['payload']
     assert usage['totals']['calls'] >= 3
     assert usage['totals']['prompt_tokens'] >= 30

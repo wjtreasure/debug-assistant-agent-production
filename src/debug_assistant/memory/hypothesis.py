@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 import hashlib, os, re
 from typing import Iterable
+from debug_assistant.repository.safe_fs import SafeRepositoryFS
+from debug_assistant.repository.paths import RepositoryPathResolver, ResolutionMode, RepositoryPathError
 
 @dataclass(slots=True)
 class MissingEvidenceState:
@@ -114,25 +116,13 @@ def normalize_location(location: str | None, repo_root: str | Path | None = None
     while normalized.startswith("./"):
         normalized=normalized[2:]
 
-    # If the model emitted only a basename or shortened suffix (e.g. tools.py),
-    # canonicalize to the unique repository-relative path. Never guess when ambiguous.
+    # If the model emitted only a basename or shortened suffix, use the same
+    # repository-safe resolver as Tool addressing. Never guess when ambiguous.
     if root and normalized and root.exists():
         try:
-            suffix=PurePosixPath(normalized).parts
-            matches=[]
-            basename=suffix[-1]
-            for candidate in root.rglob(basename):
-                if not candidate.is_file():
-                    continue
-                rel=candidate.relative_to(root).as_posix()
-                rel_parts=PurePosixPath(rel).parts
-                if len(rel_parts) >= len(suffix) and tuple(rel_parts[-len(suffix):]) == tuple(suffix):
-                    matches.append(rel)
-                    if len(matches) > 1:
-                        break
-            if len(matches) == 1:
-                normalized=matches[0]
-        except Exception:
+            resolver=RepositoryPathResolver(SafeRepositoryFS(root))
+            normalized=resolver.resolve_file(normalized,mode=ResolutionMode.READ_TOLERANT).relative_path
+        except RepositoryPathError:
             pass
     return normalized
 
@@ -195,17 +185,18 @@ class HypothesisManager:
             legacy=review.get("missing") or review.get("missing_evidence") or []
             required=[{"target":str(x),"location":None,"reason":"legacy reflection state"} for x in legacy]
         sufficient=bool(review.get("evidence_sufficient"))
-        # Status ownership lives here. A reflection that says the evidence is
-        # sufficient, has support, no direct falsifier, and no required gap is at
-        # least supported even if the model emits no status field.
+        # Harness owns hypothesis status deterministically. Supporting evidence alone
+        # is not enough to call a diagnosis supported: the causal target and mechanism
+        # must both be explicit. CONFIRMED additionally requires sufficient evidence and
+        # no remaining critical gap.
         if contradict:
             status="contradicted"
-        elif sufficient and support and not required:
+        elif sufficient and support and root_target and root_mechanism and not required:
             status="confirmed"
-        elif support:
+        elif support and root_target and root_mechanism:
             status="supported"
-        elif desc:
-            status="active"
+        elif desc or root_target or root_location or root_mechanism or support:
+            status="partial"
         else:
             status="none"
 

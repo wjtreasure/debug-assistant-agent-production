@@ -22,6 +22,7 @@ def main(argv=None):
     p=sub.add_parser('run-swe'); p.add_argument('--tasks',required=True); p.add_argument('--output',required=True); p.add_argument('--limit',type=int,default=0); p.add_argument('--sample',type=int,default=0); p.add_argument('--seed',type=int,default=42); p.add_argument('--no-resume',action='store_true'); p.add_argument('--config',default='')
     p=sub.add_parser('eval-localization'); p.add_argument('--gold',required=True); p.add_argument('--predictions',required=True); p.add_argument('--output',required=True)
     p=sub.add_parser('trace-metrics'); p.add_argument('--trace',required=True)
+    p=sub.add_parser('eval-retrieval'); p.add_argument('--tasks',required=True); p.add_argument('--output',required=True); p.add_argument('--top-k',type=int,default=10); p.add_argument('--config',default='')
     a=ap.parse_args(argv)
     if a.cmd=='prepare-swe':
         from debug_assistant.datasets.swe_prepare import prepare_parquet
@@ -35,6 +36,9 @@ def main(argv=None):
     if a.cmd=='trace-metrics':
         from debug_assistant.evaluation.trace_metrics import summarize_trace
         print(json.dumps(summarize_trace(a.trace),indent=2)); return
+    if a.cmd=='eval-retrieval':
+        from debug_assistant.evaluation.retrieval import evaluate_retrieval
+        cfg=AppConfig.from_env().apply_experiment_file(a.config or None); r=evaluate_retrieval(a.tasks,cfg,top_k=a.top_k); Path(a.output).parent.mkdir(parents=True,exist_ok=True); Path(a.output).write_text(json.dumps(r,ensure_ascii=False,indent=2),encoding='utf-8'); print(json.dumps(r['aggregate'],indent=2)); return
     cfg=AppConfig.from_env(); harness=AgentHarness(cfg)
     if a.cmd=='diagnose':
         issue=Path(a.issue).read_text(encoding='utf-8'); task=TaskSpec(a.task_id,issue,str(Path(a.repo).resolve()))

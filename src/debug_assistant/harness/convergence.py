@@ -110,9 +110,11 @@ class ConvergenceController:
                 self.state.mode=ConvergenceMode.FORCE_FINALIZATION
                 self.state.forced_finalization=True
             else:
-                self.state.mode=ConvergenceMode.BUDGET_CRITICAL
-                self.state.budget_critical_entered=True
-                self.state.critical_attempt_used=False
+                # V1.4.6: semantic stagnation is not budget exhaustion. Keep the
+                # investigation in convergence mode; Runtime's semantic_no_progress
+                # policy decides whether to conservatively finalize. BUDGET_CRITICAL
+                # is reserved for actual cost/wall-time pressure from apply_budget().
+                self.state.mode=ConvergenceMode.CONVERGENCE_REQUIRED
         elif self.state.mode is ConvergenceMode.BUDGET_CRITICAL and self.state.critical_attempt_used:
             if assessment.kind is ProgressKind.NO_PROGRESS:
                 # Caller converts this terminal condition to BUDGET_EXHAUSTED.
@@ -129,17 +131,24 @@ class ConvergenceController:
             and hyp.get('status') in {'supported','confirmed'}
         )
 
+
+    def apply_budget(self, *, remaining_ratio: float, hyp: dict[str,Any]) -> ConvergenceMode:
+        """Cost-aware mode pressure. Budget never decides diagnosis; it only narrows exploration."""
+        r=max(0.0,min(1.0,float(remaining_ratio)))
+        if r <= 0.10:
+            if self.can_finalize(hyp):
+                self.state.mode=ConvergenceMode.FORCE_FINALIZATION; self.state.forced_finalization=True
+            else:
+                self.state.mode=ConvergenceMode.BUDGET_CRITICAL; self.state.budget_critical_entered=True
+        elif r <= 0.50 and self.state.mode is ConvergenceMode.NORMAL:
+            # The 20%-10% band is governed by VERIFY_ONLY ActionPolicy. Do not
+            # prematurely turn it into BUDGET_CRITICAL and skip the final exact check.
+            self.state.mode=ConvergenceMode.CONVERGENCE_REQUIRED
+        return self.state.mode
     def allow_critical_tool_attempt(self, information_need: str, hyp: dict[str,Any]) -> bool:
-        if self.state.mode is not ConvergenceMode.BUDGET_CRITICAL:
-            return True
-        if self.state.critical_attempt_used:
-            return False
-        if not (information_need or '').strip():
-            return False
-        if not hyp.get('required_missing_evidence'):
-            return False
-        self.state.critical_attempt_used=True
-        return True
+        # V1.4.1 compatibility shim: once BUDGET_CRITICAL is entered the Runtime
+        # finalizes at the next state boundary and never starts a new tool.
+        return self.state.mode is not ConvergenceMode.BUDGET_CRITICAL
 
     def critical_failed_after_reflection(self, assessment: ProgressAssessment) -> bool:
         return bool(self.state.mode is ConvergenceMode.BUDGET_CRITICAL

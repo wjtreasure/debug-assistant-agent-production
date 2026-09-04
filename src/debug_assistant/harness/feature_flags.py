@@ -14,6 +14,14 @@ class FeatureFlags:
     context_lifecycle_v2: bool = True
     context_projection_v2: bool = True
     compact_prompt_rendering: bool = True
+    semantic_code_search: bool = True
+    lightweight_skills: bool = True
+    information_need_tracking: bool = True
+    evidence_obligations: bool = True
+    cost_aware_convergence: bool = True
+    trace_v2: bool = True
+    native_tool_calling: bool = True
+    structured_reflection: bool = True
 
     def validate(self) -> None:
         if self.model_context_selection and not self.context_catalog:

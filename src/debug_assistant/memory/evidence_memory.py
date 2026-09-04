@@ -49,6 +49,10 @@ class EvidenceMemory:
         self.recent.append(obs)
         if not obs.ok or not obs.content.strip():
             return None
+        # Retrieval results are candidate locations, not causal evidence. They must be
+        # verified by a source-reading observation before entering the evidence ledger.
+        if (obs.metadata or {}).get('information_source') == 'candidate_retrieval':
+            return None
         key=sha1((obs.tool+'|'+obs.content).encode('utf-8','ignore')).hexdigest()[:12]
         if key in self._seen:
             return None

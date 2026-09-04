@@ -13,6 +13,7 @@ class ConvergenceLLM:
             ids=re.findall(r'\[(ev-[^\]]+)\]',user)
             support=[ids[-1]] if ids else []
             return {'decision':'continue','reason':'causal mechanism already grounded','current_diagnosis':'a.py boundary condition causes the failure',
+                    'root_cause_target':'a.py boundary condition','root_cause_location':'a.py','root_cause_mechanism':'boundary condition causes the failure',
                     'evidence_sufficient':True,'supporting_evidence_ids':support,'contradicting_evidence_ids':[],
                     'required_missing_evidence':[],'optional_validation':[{'target':'optional caller confirmation','location':'a.py','reason':'additional confidence only'}],
                     'recommended_next_goal':'finish unless required evidence appears','confidence':.92,'hypothesis_changed':False}

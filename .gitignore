@@ -12,6 +12,8 @@ data/swe_lite_*/
 data/dev-00000-of-00001.parquet
 docs/
 *.egg-info/
+build/
+dist/
 .idea/
 *.key
 *.pem

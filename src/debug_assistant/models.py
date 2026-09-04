@@ -9,6 +9,7 @@ class ActionKind(str, Enum):
     TOOL = "tool"
     REFLECT = "reflect"
     FINISH = "finish"
+    PARALLEL = "parallel"
 
 class RuntimeStage(str, Enum):
     SETUP = "setup"
@@ -42,10 +43,13 @@ class ActionProposal:
     arguments: dict[str, Any] = field(default_factory=dict)
     expected_evidence: str = ""
     information_need: str = ""
+    information_need_structured: dict[str, Any] | None = None
     retain_context_ids: list[str] = field(default_factory=list)
+    actions: list[dict[str, Any]] = field(default_factory=list)
 
     def fingerprint(self) -> str:
-        stable = json.dumps(self.arguments, sort_keys=True, ensure_ascii=False)
+        payload={"arguments":self.arguments,"actions":self.actions}
+        stable = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return f"{self.kind.value}|{self.skill}|{self.tool}|{stable}"
 
 @dataclass(slots=True)
@@ -104,6 +108,9 @@ class DiagnosisReport:
     policy_note: str = "Read-only diagnosis: no code changes were made."
     report_source: str = "llm"
     evidence_ids: list[str] = field(default_factory=list)
+    likely_file_source: str = "llm"
+    claims: list[dict[str,Any]] = field(default_factory=list)
+    acquired_unreviewed: list[dict[str,Any]] = field(default_factory=list)
 
 @dataclass(slots=True)
 class RuntimeFailure:
@@ -144,6 +151,8 @@ class AgentState:
     no_progress_count: int = 0
     redundant_request_count: int = 0
     rehydration_count: int = 0
+    rehydration_saved_tool_calls: int = 0
+    rehydration_saved_chars: int = 0
     convergence_mode: str = "normal"
     forced_finalization: bool = False
     budget_critical_entered: bool = False
@@ -152,12 +161,13 @@ class AgentState:
     prompt_tokens_at_first_stable_diagnosis: int | None = None
     completion_tokens_at_first_stable_diagnosis: int | None = None
     tokens_at_first_stable_diagnosis: int | None = None
+    planner_contract_failure_count: int = 0
 
     def to_summary(self) -> dict[str, Any]:
         return {
             "task_id": self.task.task_id,
             "step": self.step, "tool_calls": self.tool_calls, "status": self.status,
-            "evidence": len(self.evidence), "hypotheses": len(self.hypotheses),
+            "evidence": len(self.evidence), "hypotheses": max(len(self.hypotheses), int(bool(self.current_hypothesis and self.current_hypothesis.get("status") not in (None,"","none")))),
             "invalid_routes": self.invalid_routes, "recovered_routes": self.recovered_routes,
             "repeated_actions": self.repeated_actions, "reflection_count": self.reflection_count,
             "reflection_failure_count": self.reflection_failure_count,
@@ -167,6 +177,7 @@ class AgentState:
             "report_source": self.report_source, "observation_reuse_count": self.observation_reuse_count,
             "no_progress_count": self.no_progress_count, "current_hypothesis": self.current_hypothesis,
             "redundant_request_count": self.redundant_request_count, "rehydration_count": self.rehydration_count,
+            "rehydration_saved_tool_calls": self.rehydration_saved_tool_calls, "rehydration_saved_chars": self.rehydration_saved_chars,
             "convergence_mode": self.convergence_mode, "forced_finalization": self.forced_finalization,
             "budget_critical_entered": self.budget_critical_entered,
             "first_supported_hypothesis_step": self.first_supported_hypothesis_step,
@@ -174,4 +185,5 @@ class AgentState:
             "prompt_tokens_at_first_stable_diagnosis": self.prompt_tokens_at_first_stable_diagnosis,
             "completion_tokens_at_first_stable_diagnosis": self.completion_tokens_at_first_stable_diagnosis,
             "tokens_at_first_stable_diagnosis": self.tokens_at_first_stable_diagnosis,
+            "planner_contract_failure_count": self.planner_contract_failure_count,
         }

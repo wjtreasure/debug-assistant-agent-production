@@ -4,17 +4,39 @@ from typing import Any
 from pydantic import ValidationError
 from debug_assistant.contracts import compact_validation_error
 from .repository import RepoTreeTool,GrepTool,ReadFileTool,SymbolSearchTool,GitLogTool,GitShowTool,DiscoverTestsTool
-from .indexed import CodeSearchTool,IndexedSymbolSearchTool
+from .indexed import CodeSearchTool,IndexedSymbolSearchTool,InspectSymbolContextTool
+from debug_assistant.repository.safe_fs import SafeRepositoryFS
+from debug_assistant.repository.paths import RepositoryPathResolver, RepositoryPathMatcher
+
+# The bounded parallel policy is shared by the runtime guard and Planner prompt.
+# Keep this next to the registered tool definitions so the two surfaces cannot drift.
+PARALLEL_ALLOWED_TOOLS = frozenset({
+    'read_file', 'grep', 'symbol_search', 'code_search', 'inspect_symbol_context',
+})
 
 class ToolRegistry:
-    def __init__(self, repo_root, index=None):
-        symbol=IndexedSymbolSearchTool(index) if index is not None else SymbolSearchTool(repo_root)
-        tools=[RepoTreeTool(repo_root),GrepTool(repo_root),ReadFileTool(repo_root),symbol,GitLogTool(repo_root),GitShowTool(repo_root),DiscoverTestsTool(repo_root)]
-        if index is not None: tools.insert(2,CodeSearchTool(index))
+    def __init__(self, repo_root, index=None, fs=None):
+        self.fs=fs or SafeRepositoryFS(repo_root)
+        self.path_resolver=RepositoryPathResolver(self.fs)
+        self.path_matcher=RepositoryPathMatcher()
+        kw={'fs':self.fs,'resolver':self.path_resolver,'matcher':self.path_matcher}
+        symbol=IndexedSymbolSearchTool(index) if index is not None else SymbolSearchTool(repo_root,**kw)
+        tools=[RepoTreeTool(repo_root,**kw),GrepTool(repo_root,**kw),ReadFileTool(repo_root,**kw),symbol,GitLogTool(repo_root,**kw),GitShowTool(repo_root,**kw),DiscoverTestsTool(repo_root,**kw)]
+        if index is not None:
+            tools.insert(2,CodeSearchTool(index))
+            tools.insert(3,InspectSymbolContextTool(index))
         self._tools={t.spec.name:t for t in tools}
 
     def get(self,name): return self._tools.get(name)
     def specs(self): return [t.spec for t in self._tools.values()]
+
+    def function_schemas(self):
+        """Provider function-calling schemas; Pydantic remains the validation SSOT."""
+        return [spec.function_schema() for spec in self.specs()]
+
+    def is_parallel_safe(self, name: str) -> bool:
+        spec = next((x for x in self.specs() if x.name == name), None)
+        return bool(spec and (spec.parallel_safe or name in PARALLEL_ALLOWED_TOOLS))
 
     def validate_arguments(self,name:str,args:dict[str,Any]):
         tool=self.get(name)
