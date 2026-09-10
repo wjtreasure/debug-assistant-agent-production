@@ -56,7 +56,7 @@ class SemanticReducer:
             raw["diagnosis"] = raw.get("current_diagnosis", "")
         return ReflectionDecision.model_validate(raw), invalid
 
-    def reduce(self, decision, *, reflection_id: str = "", presented_evidence_ids: set[str] | None = None) -> CandidateSemanticState:
+    def reduce(self, decision, *, reflection_id: str = "", presented_evidence_ids: set[str] | None = None, step: int = 0) -> CandidateSemanticState:
         typed, invalid_rows = self._decision(decision)
         available = {str(x.evidence_id) for x in self.evidence}
         support = tuple(x for x in typed.supporting_evidence_ids if x in available)
@@ -94,6 +94,7 @@ class SemanticReducer:
             else:
                 status = "none"
             root_location = typed.root_cause_location or ""
+            diagnosis_fp = diagnosis_fingerprint(typed.diagnosis, status, list(contra), root_cause_target=typed.root_cause_target or "", root_cause_location=root_location)
             hyp = HypothesisState(
                 description=typed.diagnosis,
                 root_cause_target=typed.root_cause_target or "",
@@ -105,9 +106,11 @@ class SemanticReducer:
                 contradicting_evidence_ids=list(contra),
                 required_missing_evidence=gaps,
                 optional_validation=self.obligations.optional_items(),
-                updated_step=0,
-                stable_diagnosis_transitions=0,
-                diagnosis_fingerprint=diagnosis_fingerprint(typed.diagnosis, status, list(contra), root_cause_target=typed.root_cause_target or "", root_cause_location=root_location),
+                updated_step=int(step),
+                stable_diagnosis_transitions=(old_hypothesis.stable_diagnosis_transitions + 1
+                                              if diagnosis_fp and diagnosis_fp == old_hypothesis.diagnosis_fingerprint
+                                              else 0),
+                diagnosis_fingerprint=diagnosis_fp,
                 evidence_fingerprint=evidence_fingerprint(list(support), list(contra)),
                 required_gap_fingerprint=required_gap_fingerprint(gaps, self.hypothesis_manager.repo_root),
                 model_claimed_changed=None,
@@ -136,7 +139,7 @@ class SemanticReducer:
         self.revision = candidate.revision
         return candidate.hypothesis
 
-    def reduce_and_commit(self, decision, *, reflection_id: str = "", presented_evidence_ids: set[str] | None = None) -> CandidateSemanticState:
-        candidate = self.reduce(decision, reflection_id=reflection_id, presented_evidence_ids=presented_evidence_ids)
+    def reduce_and_commit(self, decision, *, reflection_id: str = "", presented_evidence_ids: set[str] | None = None, step: int = 0) -> CandidateSemanticState:
+        candidate = self.reduce(decision, reflection_id=reflection_id, presented_evidence_ids=presented_evidence_ids, step=step)
         self.commit(candidate)
         return candidate

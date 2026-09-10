@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from collections import Counter
 from typing import Any
+import json
 from debug_assistant.models import ActionKind, ActionProposal, AgentState
 from debug_assistant.skills.catalog import SKILLS
 from debug_assistant.tools.registry import PARALLEL_ALLOWED_TOOLS
@@ -39,7 +40,7 @@ class RouterGuard:
                 # Parallel workers are deliberately local/bounded. Semantic/hybrid
                 # code_search can invoke an external embedding provider and therefore
                 # must remain serial under the normal provider deadline/circuit breaker.
-                if tool_name=='code_search' and str(args.get('mode','lexical')).lower()!='lexical':
+                if tool_name=='code_search' and str(args.get('mode','lexical')).lower() not in {'lexical'}:
                     return GuardDecision(False,'parallel code_search must use lexical mode',error={'error_type':'parallel_tool_not_bounded_local','retryable':True,'action_index':idx})
                 blob=json.dumps(args,ensure_ascii=False)
                 if re.search(r'\{\{\s*(?:result_of_)?action[_-]?\d+|\{\{[^}]*action_id',blob,re.I):
@@ -87,6 +88,8 @@ class RouterGuard:
 class LoopGuard:
     def __init__(self,max_repeat=2,max_no_progress=4):
         self.max_repeat=max_repeat; self.max_no_progress=max_no_progress; self.counts=Counter(); self.rejected_counts=Counter(); self.last_evidence=0; self.no_progress=0
+        self._semantic_signature = None
+        self.semantic_progress_count = 0
     def observe_action(self,action,state):
         fp=action.fingerprint(); self.counts[fp]+=1
         if self.counts[fp]>self.max_repeat:
@@ -105,4 +108,68 @@ class LoopGuard:
         now=len(state.evidence)
         if now<=self.last_evidence: self.no_progress+=1
         else: self.no_progress=0; self.last_evidence=now
+        return self.no_progress < self.max_no_progress
+
+    @staticmethod
+    def semantic_signature(*, evidence_ids=(), hypothesis=None, obligations=(),
+                           contradictions=(), review_feedback="") -> str:
+        """Stable, compact signature for meaningful diagnosis progress.
+
+        Supporting Evidence is intentionally part of the signature, but the
+        caller separately treats newly-added canonical Evidence as progress. A
+        duplicate observation that does not add a new canonical ID therefore
+        cannot reset the guard.
+        """
+        if hypothesis is None:
+            hypothesis_payload = None
+        elif hasattr(hypothesis, "model_dump"):
+            data = hypothesis.model_dump()
+            data.pop("stable_rounds", None)
+            hypothesis_payload = data
+        else:
+            hypothesis_payload = dict(hypothesis)
+            hypothesis_payload.pop("stable_rounds", None)
+        obligation_payload = [
+            item.model_dump() if hasattr(item, "model_dump") else dict(item)
+            for item in obligations
+        ]
+        contradiction_payload = [
+            item.model_dump() if hasattr(item, "model_dump") else dict(item)
+            for item in contradictions
+        ]
+        payload = {
+            "evidence_ids": sorted(set(str(x) for x in evidence_ids)),
+            "hypothesis": hypothesis_payload,
+            "obligations": obligation_payload,
+            "contradictions": contradiction_payload,
+            "review_feedback": str(review_feedback or ""),
+        }
+        return json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+
+    def observe_semantic_progress(self, state, *, evidence_ids=(), hypothesis=None,
+                                  obligations=(), contradictions=(), review_feedback="") -> bool:
+        """Observe meaningful state progress without reviving heavy convergence."""
+        signature = self.semantic_signature(
+            evidence_ids=evidence_ids, hypothesis=hypothesis,
+            obligations=obligations, contradictions=contradictions,
+            review_feedback=review_feedback,
+        )
+        evidence_set = set(str(x) for x in evidence_ids)
+        old_evidence = set()
+        if self._semantic_signature:
+            try:
+                old_evidence = set(json.loads(self._semantic_signature).get("evidence_ids", []))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                old_evidence = set()
+        progressed = self._semantic_signature is None or signature != self._semantic_signature
+        # A new canonical ID is explicitly meaningful, while the same ID with a
+        # changed display projection is not a second fact.
+        progressed = progressed or bool(evidence_set - old_evidence)
+        self._semantic_signature = signature
+        if progressed:
+            self.no_progress = 0
+            self.semantic_progress_count += 1
+        else:
+            self.no_progress += 1
+        state.no_progress_count = self.no_progress
         return self.no_progress < self.max_no_progress

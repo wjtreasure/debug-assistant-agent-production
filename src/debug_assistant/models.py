@@ -68,6 +68,7 @@ class Evidence:
     kind: str
     source: str
     summary: str
+    target: str | None = None
     excerpt: str = ""
     file: str | None = None
     # Backward-compatible source coverage fields used by reporter/older callers.

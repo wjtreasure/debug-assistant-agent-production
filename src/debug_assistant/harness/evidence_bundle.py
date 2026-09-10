@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from debug_assistant.context.indexes import extract_numbered_range
+from debug_assistant.context.packing import line_safe_truncate
 
 _GOAL_RANK={'contradiction':0,'causality':1,'behavior':2,'caller':3,'location':4,'test':5,'history':6,'evidence':7}
 
@@ -64,7 +65,7 @@ def build_evidence_bundle(tracker,state_evidence,observation_store,*,bundle_id,m
         header=f'=== OBLIGATION {obj.obligation_id} [{obj.goal_type}] {obj.target} ===\nSOURCE {path}:{a}-{b}\n'
         remaining=max(0,int(max_chars)-used-len(header))
         if remaining<=0:break
-        clipped=content[:remaining]
+        clipped,_=line_safe_truncate(content,remaining)
         block=header+clipped
         sections.append(block);used+=len(block)
         items.append(BundleItem(obj.obligation_id,ev.evidence_id,raw.observation_id,path,a,b,clipped,fp))

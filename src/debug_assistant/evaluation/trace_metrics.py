@@ -31,7 +31,12 @@ def summarize_trace(path):
     # REFLECTION_FAILED. Count the failed reflection once, using the provider
     # event only when the stage failure event is absent.
     reflection_timeout_count=max(reflection_timeout_failures, deadline_timeout_events)
+    review_stages=[e for e in events if e['type']=='REVIEW_STAGE']
     planner_steps=counts.get('ACTION_PROPOSED',0)+counts.get('NATIVE_PLANNER_RESULT',0)
+    # Incident traces use explicit planner lifecycle events. Keep the legacy
+    # names above for SWE traces and prefer the non-duplicating completion count.
+    if counts.get('PLANNER_CALL_COMPLETED', 0):
+        planner_steps = counts['PLANNER_CALL_COMPLETED']
     tool_failures=sum(1 for e in tool_events if not bool((e.get('payload') or {}).get('ok',True)))
     tool_failures += counts.get('TOOL_EXECUTION_FAILED',0)
     status=str(state.get('status') or '')
@@ -51,7 +56,36 @@ def summarize_trace(path):
         'route_rejections':counts.get('ACTION_REJECTED',0)+counts.get('OBLIGATION_ACTION_REJECTED',0),
         'obligation_scope_rejections':counts.get('OBLIGATION_ACTION_REJECTED',0),
         'loop_blocks':counts.get('LOOP_BLOCKED',0),
-        'reflections':counts.get('REFLECTION',0),'evidence_added':counts.get('EVIDENCE_ADDED',0),
+        'reflections':counts.get('REFLECTION',0) + counts.get('REFLECTION_RESULT',0),
+        'reflection_calls':counts.get('REFLECTION_START',0),
+        # New incident traces expose every Review provider attempt, including
+        # a schema-repair attempt that times out before FINAL_REVIEW exists.
+        # Keep the old FINAL_REVIEW fallback for legacy SWE/incident traces.
+        'review_calls':len(review_stages) if review_stages else counts.get('FINAL_REVIEW',0),
+        'evidence_added':counts.get('EVIDENCE_ADDED',0),
+        'duplicate_calls':counts.get('PROGRESS_GUARD_REJECTED',0) + counts.get('ACTION_REJECTED',0),
+        'circuit_open_count':counts.get('TOOL_CIRCUIT_OPEN',0),
+        'blocked_tool_call_count':counts.get('TOOL_CALL_BLOCKED_BY_CIRCUIT',0),
+        'schema_repair_count':(
+            counts.get('PLANNER_REPAIR_SUCCEEDED',0)
+            + counts.get('REFLECTION_SCHEMA_REPAIRED',0)
+            + (
+                sum(1 for e in review_stages if bool((e.get('payload') or {}).get('schema_repair')))
+                if review_stages else sum(
+                    1 for e in events if e['type'] == 'FINAL_REVIEW'
+                    and bool((e.get('payload') or {}).get('schema_repaired'))
+                )
+            )
+        ),
+        'obligation_created_count':counts.get('OBLIGATION_CREATED',0),
+        'obligation_blocked_count':sum(
+            1 for e in events if e['type'] == 'OBLIGATION_TRANSITION'
+            and (e.get('payload') or {}).get('to') == 'BLOCKED_BY_CAPABILITY'
+        ),
+        'blocking_contradiction_count':sum(
+            1 for e in events if e['type'] == 'CONTRADICTION_CREATED'
+            and (e.get('payload') or {}).get('severity') == 'BLOCKING'
+        ),
         'no_progress_count':counts.get('NO_PROGRESS',0),'progress_count':counts.get('PROGRESS',0),'hypothesis_updates':counts.get('HYPOTHESIS_UPDATED',0),
         'termination_advisories':counts.get('TERMINATION_ADVISORY',0),'fallback_reports':counts.get('FALLBACK_REPORT_BUILT',0),
         'forced_finalization':bool(state.get('forced_finalization') or counts.get('FORCE_FINALIZATION',0)),
@@ -77,6 +111,16 @@ def summarize_trace(path):
         'context_build_count':len(ctx),'avg_context_chars':(sum(int(x.get('used_chars',0)) for x in ctx)/len(ctx) if ctx else 0),
         'max_context_chars':max([int(x.get('used_chars',0)) for x in ctx] or [0]),
         'avg_working_set_size':(sum(int(x.get('working_set_size',0)) for x in ctx)/len(ctx) if ctx else 0),
+        'selected_evidence_count':sum(int((x.get('breakdown') or {}).get('selected_evidence_count',0)) for x in ctx),
+        'dropped_evidence_count':sum(int((x.get('breakdown') or {}).get('dropped_evidence_count',0)) for x in ctx),
+        'duplicate_observations_collapsed':sum(int((x.get('breakdown') or {}).get('duplicate_observations_collapsed',0)) for x in ctx),
+        'context_rehydrated_item_count':sum(int((x.get('breakdown') or {}).get('rehydrated_item_count',0)) for x in ctx),
+        'max_total_context_chars':max([int((x.get('breakdown') or {}).get('total_context_chars',x.get('used_chars',0)) or 0) for x in ctx] or [0]),
+        'context_budget_violations':sum(
+            1 for x in ctx
+            if int((x.get('breakdown') or {}).get('total_context_chars',x.get('used_chars',0)) or 0)
+            > int(x.get('budget_chars',0) or 0)
+        ),
         'avg_active_item_count':(sum(int(x.get('active_item_count',0)) for x in ctx)/len(ctx) if ctx else 0),
         'max_active_item_count':max([int(x.get('active_item_count',0)) for x in ctx] or [0]),
         'avg_cold_item_count':(sum(int(x.get('cold_item_count',0)) for x in ctx)/len(ctx) if ctx else 0),

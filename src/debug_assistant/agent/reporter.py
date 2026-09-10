@@ -8,15 +8,17 @@ from typing import Any
 from pydantic import ValidationError
 from debug_assistant.models import DiagnosisReport
 from debug_assistant.contracts import DiagnosisReportContract, ReportClaim, compact_validation_error, render_contract, render_contract_compact
+from debug_assistant.context.packing import line_safe_head_tail
 from debug_assistant.llm.base import complete_json_compat
 from debug_assistant.security.redaction import redact_sensitive
+from debug_assistant.reporting.candidates import build_runtime_change_points
 
 SYSTEM="""You are a senior software debugging assistant in FINAL REPORTING stage.
 Produce a development decision report from the supplied structured hypothesis and evidence.
 The investigation phase is complete. You MUST NOT request, call, or suggest executing any tool.
 A tool-like response such as <read_file ...>, <grep ...>, a function_call, tool_call, or AgentAction is invalid in this stage.
 Use only the supplied hypothesis, evidence summaries, and source projections. If evidence is incomplete, record that under uncertainties or next_checks.
-Do not claim code was changed. Do not invent file names, symbols, line numbers or causal facts absent from evidence. Separate uncertainty from conclusions. For important statements, prefer structured claims with claim_type and evidence_ids; the Harness will deterministically derive final claim status.
+Do not claim code was changed. Do not invent file names, symbols, line numbers or causal facts absent from evidence. `recommended_change_points` means the code location a developer should modify to implement the fix; it is not a symptom location, an evidence location, or every relevant file. Change-point line numbers must refer to the buggy base repository. If the exact lines are unknown, leave line_start and line_end null. Return at most 3 `likely_files`, ordered by exploration usefulness; put formal fix locations in `recommended_change_points`. If `CANDIDATE_CHANGE_POINTS_FROM_RUNTIME` is present, preserve only candidates supported by the supplied evidence and rank them; do not replace them with a new guess. Separate uncertainty from conclusions. For important statements, prefer structured claims with claim_type and evidence_ids; the Harness will deterministically derive final claim status.
 evidence_ids must contain only IDs explicitly available in the supplied context. Valid claim_type values are source_fact, causal_inference, diagnosis. Valid status values are observed, supported_inference, supported, hypothesis, acquired_unreviewed, inferred. Never invent enum values or evidence IDs. acquired_unreviewed cannot become supported, and a partial hypothesis cannot become a definitive diagnosis. Return ONLY one valid DiagnosisReport JSON object matching the supplied contract."""
 
 REPAIR_SYSTEM="""You are formatting an existing grounded report. You are NOT performing new diagnosis.
@@ -168,26 +170,6 @@ def _hypothesis_dict(hypothesis) -> dict:
     return dict(getattr(hypothesis,"__dict__",{}) or {})
 
 
-def _line_safe_head_tail(text: str, max_chars: int) -> str:
-    """Bound a source projection while retaining both head and tail line coverage."""
-    if len(text) <= max_chars:
-        return text
-    lines=text.splitlines()
-    half=max(256,max_chars//2-64)
-    head=[]; used=0
-    for line in lines:
-        add=len(line)+(1 if head else 0)
-        if used+add > half: break
-        head.append(line); used+=add
-    tail=[]; used=0
-    for line in reversed(lines):
-        add=len(line)+(1 if tail else 0)
-        if used+add > half: break
-        tail.append(line); used+=add
-    tail=list(reversed(tail))
-    return "\n".join(head+["...[middle omitted for reporter context]..."]+tail)
-
-
 def _candidate_file_ranking(evidence) -> tuple[list[str],dict[str,dict]]:
     stats={}
     for ev in evidence:
@@ -225,7 +207,10 @@ def build_finalization_context(*, task_id: str, issue: str, state_summary: dict,
     by_id={e.evidence_id:e for e in evidence}
     support=[by_id[x] for x in (hyp.get("supporting_evidence_ids") or []) if x in by_id]
     contradict=[by_id[x] for x in (hyp.get("contradicting_evidence_ids") or []) if x in by_id]
+    runtime_candidates=build_runtime_change_points(hyp, evidence)
     candidate_files,candidate_stats=_candidate_file_ranking(evidence)
+    candidate_paths=[str(row.get("file") or "") for row in runtime_candidates if row.get("file")]
+    candidate_files=candidate_paths + [path for path in candidate_files if path not in candidate_paths]
     fallback_source=[]
     if not support:
         # One immutable source observation contributes once even if it was rehydrated later.
@@ -277,8 +262,8 @@ def build_finalization_context(*, task_id: str, issue: str, state_summary: dict,
     for _,_,ev in ranked[:limit]:
         body=""
         obs=obs_get(ev.raw_observation_id) if ev.raw_observation_id else None
-        if obs is not None and getattr(obs,"content",None): body=_line_safe_head_tail(obs.content,per_projection_chars)
-        elif ev.excerpt: body=_line_safe_head_tail(ev.excerpt,per_projection_chars)
+        if obs is not None and getattr(obs,"content",None): body=line_safe_head_tail(obs.content,per_projection_chars,marker="...[middle omitted for reporter context]...")
+        elif ev.excerpt: body=line_safe_head_tail(ev.excerpt,per_projection_chars,marker="...[middle omitted for reporter context]...")
         if not body: continue
         body_lines=body.splitlines()
         if len(body_lines) > max(1,int(max_snippet_lines)):
@@ -298,6 +283,7 @@ def build_finalization_context(*, task_id: str, issue: str, state_summary: dict,
         "SOURCE_EVIDENCE_FALLBACK_SUMMARIES (use only when hypothesis support is absent; these imply candidate files, not confirmed root cause):\n" + fallback_summary + "\n\n"
         "CONTRADICTING_EVIDENCE_SUMMARIES:\n" + ("\n".join(compact(e) for e in contradict) or "(none)") + "\n\n"
         f"CANDIDATE_FILES_FROM_SOURCE_EVIDENCE: {json.dumps(candidate_files,ensure_ascii=False)}\n\n"
+        f"CANDIDATE_CHANGE_POINTS_FROM_RUNTIME: {json.dumps(runtime_candidates,ensure_ascii=False)}\n\n"
         f"REQUIRED_MISSING_EVIDENCE (report only as uncertainties/next_checks; do not investigate):\n{json.dumps(missing,ensure_ascii=False)}\n\n"
         f"OPTIONAL_VALIDATION (report only as uncertainties/next_checks when useful; do not investigate):\n{json.dumps(optional,ensure_ascii=False)}\n\n"
         "CORE_SOURCE_PROJECTIONS:\n" + ("\n\n".join(projections) or "(none)")
@@ -306,7 +292,7 @@ def build_finalization_context(*, task_id: str, issue: str, state_summary: dict,
         marker="CORE_SOURCE_PROJECTIONS:\n"
         prefix, _, source_text=text.partition(marker)
         budget=max(0,int(max_context_chars)-len(prefix)-len(marker))
-        text=prefix+marker+_line_safe_head_tail(source_text,budget) if budget else prefix+marker+"(source projections omitted by context budget)"
+        text=prefix+marker+line_safe_head_tail(source_text,budget,marker="...[middle omitted for reporter context]...") if budget else prefix+marker+"(source projections omitted by context budget)"
     telemetry={
         "reporter_projection_count":len(projections),"reporter_context_chars":len(text),
         "reporter_supporting_evidence_count":len(support),"reporter_source_fallback_evidence_count":len(fallback_source),
@@ -314,6 +300,8 @@ def build_finalization_context(*, task_id: str, issue: str, state_summary: dict,
         "reporter_optional_validation_count":len(optional),"known_context_included":False,
         "evidence_fallback_used":bool(not support and fallback_source),"fallback_candidate_files":candidate_files,
         "fallback_candidate_stats":candidate_stats,
+        "runtime_change_point_count":len(runtime_candidates),
+        "runtime_change_points":runtime_candidates,
         "max_reporter_context_chars":max_context_chars,
         "max_evidence_per_file":max_evidence_per_file,
         "max_snippet_lines":max_snippet_lines,

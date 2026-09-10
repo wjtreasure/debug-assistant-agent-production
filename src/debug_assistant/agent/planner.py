@@ -11,9 +11,12 @@ from debug_assistant.contracts import (AgentActionContract, PlannerIntent, Quest
                                        render_contract, render_contract_compact)
 from debug_assistant.llm.base import complete_json_compat
 from debug_assistant.llm.base import LLMOutputError, LLMResponse, LLMToolCall, ProviderCapabilities
-from debug_assistant.skills.catalog import SKILLS, render_skill_catalog
+from debug_assistant.skills.catalog import INCIDENT_SKILLS, SKILLS, render_skill_catalog
 from debug_assistant.skills.loader import SkillLibrary
 from debug_assistant.tools.registry import PARALLEL_ALLOWED_TOOLS
+from debug_assistant.incidents.contracts import (
+    Contradiction, SourceMechanismStatus, VerificationObligation,
+)
 
 
 class PlannerContractError(ValueError):
@@ -48,12 +51,54 @@ class NativePlannerContractError(PlannerContractError):
             self.metadata["tool"] = tool
 
 
+class PlannerContractExhausted(PlannerContractError):
+    """The bounded native Planner contract recovery path was exhausted."""
+
+    def __init__(self, cause: PlannerContractError):
+        super().__init__(
+            "planner structured contract remained invalid after one bounded retry",
+            validation_errors=list(getattr(cause, "metadata", {}).get("validation_errors", ())),
+        )
+        self.metadata.update(getattr(cause, "metadata", {}))
+        self.metadata["error_type"] = "planner_contract_exhausted"
+
+
+@dataclass(frozen=True, slots=True)
+class NativeSkillSelection:
+    call_id: str
+    skill: str
+    reason: str
+    current_hypothesis: str
+    evidence_gap: str
+    candidate_component: str = ""
+    candidate_fault: str = ""
+    candidate_mechanism: str = ""
+    supporting_evidence_ids: tuple[str, ...] = ()
+    contradicting_evidence_ids: tuple[str, ...] = ()
+    required_evidence_gaps: tuple[str, ...] = ()
+    evidence_sufficiency: str = "insufficient"
+    remaining_evidence_need: str = ""
+    source_mechanism_status: SourceMechanismStatus = "unknown"
+    mechanism_category: str = ""
+    verification_obligations: tuple[VerificationObligation, ...] = ()
+    contradictions: tuple[Contradiction, ...] = ()
+    # Optional provider metadata is useful when valid, but it must not make a
+    # valid tool request unusable merely because an older/model-specific
+    # provider serialized that additive block imperfectly.  The warning is
+    # surfaced by the Harness trace; the flat compatibility projections remain
+    # the only fallback state used for this selection.
+    reasoning_metadata_warnings: tuple[str, ...] = ()
+    reasoning_metadata_normalizations: tuple[str, ...] = ()
+    reasoning_metadata_drops: tuple[str, ...] = ()
+
+
 @dataclass(frozen=True, slots=True)
 class NativePlannerResult:
     """Semantic planner metadata plus provider-native tool requests.
 
-    It intentionally has no ``kind``, ``skill`` or ``parallel`` field. Execution
-    shape is compiled later by ``ToolOrchestrator``.
+    Execution shape is compiled later by ``ToolOrchestrator``. Incident runs also
+    carry a validated skill decision per tool call; repository runs retain their
+    previous schema and leave ``skill_selections`` empty.
     """
 
     response: LLMResponse
@@ -65,6 +110,7 @@ class NativePlannerResult:
     obligation_ids: tuple[str, ...] = ()
     intent: PlannerIntent | None = None
     assistant_text: str | None = None
+    skill_selections: tuple[NativeSkillSelection, ...] = ()
 
 
 class NativeToolPlanner:
@@ -77,6 +123,7 @@ class NativeToolPlanner:
         if not getattr(getattr(self.llm, "capabilities", ProviderCapabilities()), "tool_calling", False):
             raise PlannerContractError("provider does not support native tool calling",
                                        validation_errors=["tool_calling=false"])
+        incident_mode = state.task.metadata.get("task_kind") == "incident"
         system = (
             "You are a read-only repository investigation planner. Request only the "
             "repository tools needed for the current goal. Tool arguments are validated "
@@ -90,8 +137,55 @@ class NativeToolPlanner:
             "file, symbol, or line range, honor that scope first and use explicit supporting "
             "actions only for callers, tests, or history."
         )
+        if incident_mode:
+            system = (
+                "You are the Diagnosis Agent for a read-only production incident. On every action, "
+                "choose the next Skill from the supplied catalog based on the INCIDENT, CURRENT_HYPOTHESIS, "
+                "EVIDENCE_GAP, and PREVIOUS_ACTIONS. Never infer or route on a benchmark fault label. "
+                "Every function call must include the Skill decision and the structured hypothesis-completion fields. "
+                "Explicitly compare CONTINUE INVESTIGATION with FINALIZE CURRENT DIAGNOSIS. Root-cause completion "
+                "requires a component, causal mechanism, supporting evidence, no critical required gap, and no "
+                "critical contradiction. Impact scope is optional and must never block finalization. If evidence is "
+                "sufficient, strongly prefer finalize_diagnosis. Continuing from a sufficient hypothesis requires a "
+                "remaining_evidence_need that names evidence capable of changing the root-cause judgment; otherwise finalize. "
+                "Final Review receives only the ev-* Evidence IDs cited by finalize_diagnosis; uncited Evidence is invisible "
+                "to Review. Cite every collected observation needed to support each component and mechanism claim. "
+                "REJECTED_ACTIONS are policy-rejected requests, not new observations; never repeat their fingerprints. "
+                "A snapshot result with status UNAVAILABLE and semantic_negative=false means only that the benchmark did not "
+                "capture that observation; it is not evidence that a resource is missing or a service is unreachable. "
+                "Keep Direct Observation, evidence-backed inference, and unverified hypothesis distinct. Prefer the narrowest "
+                "candidate fully supported by the cited Evidence. Do not claim that a measured value reaches or exceeds a "
+                "configured threshold unless the cited Evidence directly establishes that numeric relation; an aggregate CPU "
+                "value below a limit does not disprove a direct CFS-throttling observation. Do not state traffic bursts, load "
+                "spikes, dependency amplification, or other causal triggers as facts without direct Evidence. "
+                "For Kubernetes get_resources, name is an exact captured resource name, not a logical service or application "
+                "name; when the exact name is unknown, omit name or list first, then use the returned exact name. "
+                "When TOOL_BUDGET_REMAINING is zero, do not request another observation tool; use "
+                "finalize_diagnosis if the existing evidence supports a component and mechanism. "
+                "Use finalize_diagnosis only when the cited evidence supports both component and causal mechanism. "
+                "At finalize_diagnosis, component/fault/mechanism/evidence_ids are compatibility projections; "
+                "the Runtime freezes the already validated current Hypothesis as the Candidate core. "
+                "Use claim_evidence_mapping and causal_chain_summary to explain that frozen diagnosis, and "
+                "keep their Evidence IDs within the Hypothesis supporting Evidence. "
+                "If a bound application source workspace is available and runtime evidence leaves an implementation gap, "
+                "use code_investigation; file indexes and search hits locate candidates, while only bounded read_file output "
+                "can support a source-backed behavior claim. If the proposed mechanism is an application implementation "
+                "behavior that runtime evidence has not established, do not finalize from telemetry or configuration alone "
+                "when the source workspace is available; use the code Skill to verify it. The supporting_evidence_ids "
+                "field on the same finalize_diagnosis call must include every evidence_ids value, even when both fields "
+                "refer to the same current hypothesis. When SOURCE_MECHANISM_COVERAGE is declared and the workspace "
+                "is available, explicitly set source_mechanism_status to one of unknown, gap, sufficient, or "
+                "not_applicable. Use gap when the current causal mechanism still needs source verification, "
+                "sufficient only after a cited read_file CODE Evidence supports it, and not_applicable only when "
+                "the current mechanism is demonstrably independent of application implementation. A gap or unknown "
+                "source status must be represented by a critical VerificationObligation and investigated with "
+                "code_investigation before finalization.\n\n"
+                + render_skill_catalog(skills=INCIDENT_SKILLS)
+            )
         user = f"{context}\n\nCURRENT_GOAL: {state.task.issue}\n"
         schemas = self.tools.function_schemas()
+        if incident_mode:
+            schemas = [_with_incident_skill_controls(schema) for schema in schemas]
         self.last_prompt_breakdown = {"system_chars": len(system), "context_chars": len(user),
                                       "tool_schema_count": len(schemas)}
         method = getattr(self.llm, "complete_with_tools", None)
@@ -121,6 +215,13 @@ class NativeToolPlanner:
                 error_type="provider_contract_mismatch",
             )
         names = {spec.name for spec in self.tools.specs()}
+        known_evidence_ids = {
+            str(getattr(item, "evidence_id", ""))
+            for item in getattr(state, "evidence", ())
+            if getattr(item, "evidence_id", None)
+        }
+        sanitized_calls = []
+        selections = []
         for call in response.tool_calls:
             if not isinstance(call, LLMToolCall) or not isinstance(call.arguments, dict):
                 raise NativePlannerContractError(
@@ -133,6 +234,140 @@ class NativeToolPlanner:
                     f"unknown tool: {call.name}", error_type="unknown_tool",
                     validation_errors=["unknown_tool"], output={"tool": call.name},
                 )
+            if incident_mode:
+                args = dict(call.arguments)
+                control = {key: args.pop(key, None) for key in _INCIDENT_SKILL_CONTROL_FIELDS}
+                skill = control["skill"]
+                reason = control["skill_reason"]
+                hypothesis = control["current_hypothesis"]
+                evidence_gap = control["evidence_gap"]
+                component = control["candidate_component"]
+                fault = control["candidate_fault"]
+                mechanism = control["candidate_mechanism"]
+                supporting = control["supporting_evidence_ids"]
+                contradicting = control["contradicting_evidence_ids"]
+                required_gaps = control["required_evidence_gaps"]
+                sufficiency = control["evidence_sufficiency"]
+                remaining_need = control["remaining_evidence_need"]
+                source_mechanism_status = control.get("source_mechanism_status") or "unknown"
+                mechanism_category = control["mechanism_category"] or ""
+                raw_obligations = control["verification_obligations"]
+                raw_contradictions = control["contradictions"]
+                if skill not in INCIDENT_SKILLS:
+                    raise NativePlannerContractError(
+                        f"unknown skill: {skill}", error_type="unknown_skill",
+                        validation_errors=["unknown_skill"], output={"tool": call.name},
+                    )
+                if not all(isinstance(value, str) and value.strip() for value in (reason, hypothesis, evidence_gap)):
+                    raise NativePlannerContractError(
+                        "incident tool call is missing skill decision context",
+                        error_type="missing_skill_context",
+                        validation_errors=["skill_reason", "current_hypothesis", "evidence_gap"],
+                        output={"tool": call.name},
+                    )
+                if not all(isinstance(value, str) for value in (component, fault, mechanism, remaining_need)):
+                    raise NativePlannerContractError(
+                        "incident hypothesis completion fields must be strings",
+                        error_type="malformed_hypothesis_completion",
+                        validation_errors=["candidate_component", "candidate_fault", "candidate_mechanism", "remaining_evidence_need"],
+                        output={"tool": call.name},
+                    )
+                if not all(isinstance(value, list) and all(isinstance(item, str) for item in value)
+                           for value in (supporting, contradicting, required_gaps)):
+                    raise NativePlannerContractError(
+                        "incident evidence linkage fields must be string arrays",
+                        error_type="malformed_hypothesis_completion",
+                        validation_errors=["supporting_evidence_ids", "contradicting_evidence_ids", "required_evidence_gaps"],
+                        output={"tool": call.name},
+                    )
+                if not isinstance(mechanism_category, str):
+                    raise NativePlannerContractError(
+                        "mechanism_category must be a string",
+                        error_type="malformed_hypothesis_completion",
+                        validation_errors=["mechanism_category"], output={"tool": call.name},
+                    )
+                if source_mechanism_status not in {
+                    "unknown", "gap", "sufficient", "not_applicable", "blocked",
+                }:
+                    raise NativePlannerContractError(
+                        "invalid source_mechanism_status",
+                        error_type="malformed_hypothesis_completion",
+                        validation_errors=["source_mechanism_status"], output={"tool": call.name},
+                    )
+                obligation_result = _parse_optional_reasoning_items(
+                    raw_obligations, field_name="verification_obligations",
+                    model_type=VerificationObligation,
+                )
+                contradiction_result = _parse_optional_reasoning_items(
+                    raw_contradictions, field_name="contradictions",
+                    model_type=Contradiction,
+                )
+                obligations = obligation_result.items
+                structured_contradictions = contradiction_result.items
+                reasoning_metadata_warnings = (
+                    *obligation_result.validation_warnings,
+                    *contradiction_result.validation_warnings,
+                )
+                reasoning_metadata_normalizations = (
+                    *obligation_result.normalization_actions,
+                    *contradiction_result.normalization_actions,
+                )
+                reasoning_metadata_drops = (
+                    *obligation_result.dropped_items,
+                    *contradiction_result.dropped_items,
+                )
+                structured_ids = [
+                    item.evidence_id for item in structured_contradictions
+                ] + [
+                    evidence_id
+                    for item in obligations
+                    for evidence_id in item.supporting_evidence_ids
+                ]
+                invalid_structured_ids = [
+                    evidence_id for evidence_id in structured_ids
+                    if not evidence_id.startswith("ev-")
+                    or evidence_id not in known_evidence_ids
+                ]
+                if invalid_structured_ids:
+                    raise NativePlannerContractError(
+                        "structured incident metadata may cite only ev-* Evidence IDs that are present",
+                        error_type="invalid_evidence_id_contract",
+                        validation_errors=["verification_obligations", "contradictions"],
+                        output={"tool": call.name},
+                    )
+                invalid_evidence_ids = [
+                    item for item in supporting + contradicting
+                    if not item.startswith("ev-") or item not in known_evidence_ids
+                ]
+                if invalid_evidence_ids:
+                    raise NativePlannerContractError(
+                        "incident hypotheses may cite only ev-* Evidence IDs that are present",
+                        error_type="invalid_evidence_id_contract",
+                        validation_errors=["supporting_evidence_ids", "contradicting_evidence_ids"],
+                        output={"tool": call.name},
+                    )
+                if sufficiency not in {"insufficient", "sufficient"}:
+                    raise NativePlannerContractError(
+                        "invalid evidence_sufficiency",
+                        error_type="malformed_hypothesis_completion",
+                        validation_errors=["evidence_sufficiency"], output={"tool": call.name},
+                    )
+                sanitized_calls.append(LLMToolCall(call.id, call.name, args))
+                selections.append(NativeSkillSelection(
+                    call.id, skill, reason.strip(), hypothesis.strip(), evidence_gap.strip(),
+                    component.strip(), fault.strip(), mechanism.strip(),
+                    tuple(item.strip() for item in supporting if item.strip()),
+                    tuple(item.strip() for item in contradicting if item.strip()),
+                    tuple(item.strip() for item in required_gaps if item.strip()),
+                    sufficiency, remaining_need.strip(), source_mechanism_status,
+                    mechanism_category.strip(),
+                    obligations, structured_contradictions,
+                    reasoning_metadata_warnings,
+                    reasoning_metadata_normalizations,
+                    reasoning_metadata_drops,
+                ))
+            else:
+                sanitized_calls.append(call)
         metadata = response.structured if isinstance(response.structured, dict) else {}
         assistant_text = response.content.strip() if isinstance(response.content, str) else ""
         raw_intent = {
@@ -156,7 +391,7 @@ class NativeToolPlanner:
                 reason=raw_intent["reason"] if isinstance(raw_intent["reason"], str) else None,
             )
         return NativePlannerResult(
-            response=response, tool_calls=response.tool_calls,
+            response=response, tool_calls=tuple(sanitized_calls),
             reason=intent.reason or "",
             information_need=intent.information_need or "",
             expected_evidence=str(metadata.get("expected_evidence") or ""),
@@ -164,7 +399,213 @@ class NativeToolPlanner:
             obligation_ids=tuple(str(x) for x in (metadata.get("obligation_ids") or [])),
             intent=intent,
             assistant_text=assistant_text or None,
+            skill_selections=tuple(selections),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class OptionalReasoningParseResult:
+    """Sanitized result for additive Planner reasoning metadata."""
+
+    items: tuple[Any, ...] = ()
+    dropped_items: tuple[str, ...] = ()
+    normalization_actions: tuple[str, ...] = ()
+    validation_warnings: tuple[str, ...] = ()
+
+
+def _optional_item_schema(model_type) -> dict[str, Any]:
+    """Publish the nested schema from the exact Pydantic runtime model.
+
+    The provider-facing schema stays strict and therefore cannot advertise an
+    arbitrary object that the runtime contract would reject.  The parser still
+    accepts a manually received additive annotation as a compatibility input,
+    records a warning, and removes it before validation.
+    """
+    return copy.deepcopy(model_type.model_json_schema())
+
+
+def _optional_evidence_reference_paths(item: dict[str, Any], *, field_name: str, index: int):
+    """Find explicit non-ev citations before an invalid optional row is dropped."""
+    references = []
+    if field_name == "verification_obligations":
+        raw_ids = item.get("supporting_evidence_ids")
+        if isinstance(raw_ids, (list, tuple)):
+            references.extend(
+                (f"{field_name}[{index}].supporting_evidence_ids[{offset}]", value)
+                for offset, value in enumerate(raw_ids)
+            )
+        elif raw_ids is not None:
+            references.append((f"{field_name}[{index}].supporting_evidence_ids", raw_ids))
+    elif field_name == "contradictions":
+        references.append((f"{field_name}[{index}].evidence_id", item.get("evidence_id")))
+    return tuple(
+        (path, value) for path, value in references
+        if isinstance(value, str) and not value.startswith("ev-")
+    )
+
+
+def _parse_optional_reasoning_items(raw, *, field_name: str, model_type) -> OptionalReasoningParseResult:
+    """Apply safe shape tolerance while retaining strict semantic checks.
+
+    This parser intentionally does not coerce enum values, booleans, IDs, or
+    claims.  A malformed optional row is isolated from valid siblings.  An
+    explicit non-ev citation is different: dropping it would hide a core
+    Evidence contract violation, so it raises a bounded Planner contract error.
+    """
+    if raw is None:
+        return OptionalReasoningParseResult()
+
+    normalization_actions = []
+    validation_warnings = []
+    dropped_items = []
+    if isinstance(raw, dict):
+        required_fields = {
+            name for name, field in model_type.model_fields.items() if field.is_required()
+        }
+        if not required_fields.issubset(raw):
+            return OptionalReasoningParseResult(
+                dropped_items=(f"{field_name}:block:ambiguous_object_shape",),
+                validation_warnings=(f"{field_name}:discarded_ambiguous_object",),
+            )
+        items = [raw]
+        normalization_actions.append(f"{field_name}:object_to_singleton_array")
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+        if isinstance(raw, tuple):
+            normalization_actions.append(f"{field_name}:tuple_to_array")
+    else:
+        return OptionalReasoningParseResult(
+            dropped_items=(f"{field_name}:block:non_array",),
+            validation_warnings=(
+                f"{field_name}:discarded_non_array:{type(raw).__name__}",
+            ),
+        )
+
+    allowed_fields = set(model_type.model_fields)
+    parsed = []
+    for index, item in enumerate(items):
+        item_path = f"{field_name}[{index}]"
+        if not isinstance(item, dict):
+            dropped_items.append(f"{item_path}:non_object")
+            validation_warnings.append(
+                f"{item_path}:discarded_non_object:{type(item).__name__}"
+            )
+            continue
+
+        invalid_references = _optional_evidence_reference_paths(
+            item, field_name=field_name, index=index,
+        )
+        if invalid_references:
+            paths = [path for path, _ in invalid_references]
+            raise NativePlannerContractError(
+                "structured incident metadata may cite only ev-* Evidence IDs",
+                error_type="invalid_evidence_id_contract",
+                validation_errors=paths,
+            )
+
+        unknown_fields = sorted(set(item) - allowed_fields)
+        if unknown_fields:
+            normalization_actions.append(
+                f"{item_path}:ignored_extra_fields:{','.join(unknown_fields)}"
+            )
+            validation_warnings.append(
+                f"{item_path}:ignored_unknown_fields:{','.join(unknown_fields)}"
+            )
+        sanitized = {
+            key: value for key, value in item.items() if key in allowed_fields
+        }
+        try:
+            parsed_item = model_type.model_validate(sanitized)
+        except ValidationError as exc:
+            compact_errors = []
+            for error in exc.errors(include_url=False):
+                location = ".".join(str(part) for part in error.get("loc", ())) or "item"
+                compact_errors.append(f"{location}:{error.get('type', 'validation_error')}")
+            detail = ",".join(compact_errors[:4]) or "validation_error"
+            dropped_items.append(f"{item_path}:schema_invalid")
+            # Keep a block-level category for existing trace consumers while
+            # also retaining the precise item path for new diagnostics.
+            validation_warnings.append(f"{field_name}:discarded_invalid:{item_path}:{detail}")
+            validation_warnings.append(f"{item_path}:discarded_invalid:{detail}")
+            continue
+
+        defaulted = sorted(
+            name for name, field in model_type.model_fields.items()
+            if name not in sanitized and not field.is_required()
+        )
+        if defaulted:
+            normalization_actions.append(
+                f"{item_path}:applied_defaults:{','.join(defaulted)}"
+            )
+        parsed.append(parsed_item)
+
+    return OptionalReasoningParseResult(
+        items=tuple(parsed),
+        dropped_items=tuple(dropped_items),
+        normalization_actions=tuple(normalization_actions),
+        validation_warnings=tuple(validation_warnings),
+    )
+
+
+_INCIDENT_SKILL_CONTROL_FIELDS = (
+    "skill", "skill_reason", "current_hypothesis", "evidence_gap",
+    "candidate_component", "candidate_fault", "candidate_mechanism",
+    "supporting_evidence_ids", "contradicting_evidence_ids",
+    "required_evidence_gaps", "evidence_sufficiency", "remaining_evidence_need",
+    "source_mechanism_status", "mechanism_category", "verification_obligations", "contradictions",
+)
+
+
+def _with_incident_skill_controls(schema: dict[str, Any]) -> dict[str, Any]:
+    """Add planner-only controls without changing the executable tool contract."""
+    enriched = copy.deepcopy(schema)
+    function = enriched.setdefault("function", {})
+    parameters = function.setdefault("parameters", {"type": "object"})
+    properties = parameters.setdefault("properties", {})
+    properties.update({
+        "skill": {"type": "string", "enum": list(INCIDENT_SKILLS), "description": "Selected investigation Skill."},
+        "skill_reason": {"type": "string", "minLength": 1, "description": "Why this Skill closes the current evidence gap."},
+        "current_hypothesis": {"type": "string", "minLength": 1, "description": "Current falsifiable hypothesis before the action."},
+        "evidence_gap": {"type": "string", "minLength": 1, "description": "Specific missing evidence this action should obtain."},
+        "candidate_component": {"type": "string", "description": "Current root-cause component, or empty when unknown."},
+        "candidate_fault": {"type": "string", "description": "Current fault classification in natural language, or empty when unknown."},
+        "candidate_mechanism": {"type": "string", "description": "Current causal mechanism, or empty when unknown."},
+        "supporting_evidence_ids": {"type": "array", "items": {"type": "string", "pattern": "^ev-"}, "description": "Existing ev-* Evidence IDs supporting the current root cause. Include every fact needed to substantiate the component and causal mechanism because Final Review cannot see uncited evidence."},
+        "contradicting_evidence_ids": {"type": "array", "items": {"type": "string", "pattern": "^ev-"}, "description": "Existing ev-* Evidence IDs that critically contradict the current root cause."},
+        "required_evidence_gaps": {"type": "array", "items": {"type": "string"}, "description": "Unresolved critical gaps required for root-cause diagnosis; exclude optional impact analysis."},
+        "evidence_sufficiency": {"type": "string", "enum": ["insufficient", "sufficient"], "description": "Whether component and mechanism are already supported for Final Review."},
+        "remaining_evidence_need": {"type": "string", "description": "If continuing despite sufficient evidence, the critical evidence that could change the root-cause judgment; otherwise empty."},
+        "source_mechanism_status": {
+            "type": "string",
+            "enum": ["unknown", "gap", "sufficient", "not_applicable", "blocked"],
+            "description": "Planner/Reflection semantic status of source-backed application mechanism coverage.",
+        },
+        # These fields are optional planner metadata.  Runtime remains backward
+        # compatible with older providers that emit only required_evidence_gaps
+        # and the flat contradicting_evidence_ids projection.
+        "mechanism_category": {"type": "string", "description": "Stable semantic category for the mechanism, when known."},
+        "verification_obligations": {
+            "type": "array",
+            "items": _optional_item_schema(VerificationObligation),
+            "description": "Optional structured verification obligations.",
+        },
+        "contradictions": {
+            "type": "array",
+            "items": _optional_item_schema(Contradiction),
+            "description": "Optional structured contradiction metadata.",
+        },
+    })
+    required = list(parameters.get("required") or [])
+    # The original incident controls are required for native compatibility and
+    # deterministic hypothesis linkage.  The structured obligation and
+    # contradiction fields are additive metadata: older providers may omit
+    # them and the Harness will use the legacy projections.
+    # ``mechanism_category`` is an optional descriptive projection just like
+    # the two nested metadata blocks.  The canonical causal fields are the
+    # candidate component/fault/mechanism strings above.
+    required_controls = _INCIDENT_SKILL_CONTROL_FIELDS[:-3]
+    parameters["required"] = required + [name for name in required_controls if name not in required]
+    return enriched
 
 
 class PlannerFacade:

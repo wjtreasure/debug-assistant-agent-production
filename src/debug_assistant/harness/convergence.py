@@ -61,7 +61,8 @@ class ConvergenceController:
     def note_nonredundant_action(self) -> None:
         self.state.redundant_request_streak=0
 
-    def assess_reflection(self, hyp: dict[str,Any], *, usage_totals: dict[str,Any] | None=None, allow_budget_recovery: bool=True) -> ProgressAssessment:
+    def assess_reflection(self, hyp: dict[str,Any], *, usage_totals: dict[str,Any] | None=None,
+                          allow_budget_recovery: bool=True, progress_signal: dict[str,Any] | None=None) -> ProgressAssessment:
         prev=self._previous_hypothesis
         if not prev:
             assessment=ProgressAssessment(ProgressKind.PROGRESS,['reflection_baseline'])
@@ -80,6 +81,19 @@ class ConvergenceController:
             kind=ProgressKind.PROGRESS if reasons else ProgressKind.NO_PROGRESS
             if not reasons: reasons=['diagnostic_state_unchanged']
             assessment=ProgressAssessment(kind,reasons,diagnosis_changed,gap_changed,contradiction_changed,support_changed)
+        signal=progress_signal or {}
+        if int(signal.get('new_evidence_count',0) or 0) > 0:
+            assessment.reasons.append('new_evidence')
+            assessment.kind=ProgressKind.PROGRESS
+        if int(signal.get('new_candidate_file_count',0) or 0) > 0:
+            assessment.reasons.append('new_candidate_file')
+            assessment.kind=ProgressKind.PROGRESS
+        if int(signal.get('new_candidate_symbol_count',0) or 0) > 0:
+            assessment.reasons.append('new_candidate_symbol')
+            assessment.kind=ProgressKind.PROGRESS
+        if float(signal.get('confidence_improvement',0.0) or 0.0) > 0.05:
+            assessment.reasons.append('confidence_improved')
+            assessment.kind=ProgressKind.PROGRESS
         self._previous_hypothesis=dict(hyp)
 
         if hyp.get('status') in {'supported','confirmed'} and self.state.first_supported_hypothesis_step is None:

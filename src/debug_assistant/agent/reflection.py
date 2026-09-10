@@ -1,9 +1,17 @@
 from __future__ import annotations
 import json
+import copy
 import time
 from pydantic import ValidationError
 from debug_assistant.contracts import ReflectionContract, ReflectionDecision, ObligationReview, compact_validation_error, render_contract, render_contract_compact
-from debug_assistant.llm.base import LLMDeadlineExceeded, complete_json_compat
+from debug_assistant.llm.base import LLMDeadlineExceeded, complete_json_compat, extract_json
+from debug_assistant.incidents.contracts import (
+    ReflectionContradictionReview, ReflectionFeedback, ReflectionObligationReview,
+)
+
+
+class ReflectionContractExhausted(ValueError):
+    """Incident Reflection core schema remained invalid after one repair."""
 
 SYSTEM="""You are a critical reviewer for a read-only debugging agent. Detect goal drift, premature certainty, unsupported claims and direct falsifying evidence. Do not invent evidence. Explicitly state the strongest current diagnosis and whether repository evidence is sufficient to support a specific causal mechanism and location. Evidence IDs must come from the context.
 
@@ -14,6 +22,32 @@ Also emit a compact structured root-cause identity. root_cause_target should be 
 contradicting_evidence_ids contains only evidence that directly falsifies the proposed causal explanation. A buggy test expectation, an alternative implementation detail, incomplete information, missing validation, or a failing test consistent with the bug is NOT a contradiction unless it directly disproves the diagnosis. Keep the state concise."""
 
 REPAIR_SYSTEM="""Repair one invalid reflection JSON object. Preserve its meaning and evidence IDs. Change only fields required to satisfy the supplied schema. For unknown scalar root-cause fields use null, never an object/list or invented content. Return exactly one corrected JSON object and nothing else."""
+
+
+def _clear_partial_requirement_ranges(data):
+    """Keep a malformed line hint from invalidating an otherwise usable reflection.
+
+    A single line number is not a trustworthy range. Preserve the requirement's
+    semantic target and scope, but represent that uncertain range as unknown.
+    Strict contract validation remains unchanged for direct callers.
+    """
+    if not isinstance(data, dict):
+        return data
+    result = copy.deepcopy(data)
+    for field in ("required_missing_evidence", "optional_validation", "new_requirements"):
+        rows = result.get(field)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            start, end = row.get("line_start"), row.get("line_end")
+            if (start is None) ^ (end is None) or (
+                isinstance(start, int) and isinstance(end, int) and end < start
+            ):
+                row["line_start"] = None
+                row["line_end"] = None
+    return result
 
 
 class Reflector:
@@ -58,6 +92,7 @@ class Reflector:
             return remaining
         data=complete_json_compat(self.llm,SYSTEM,user,model=self.model or None,logical_timeout_seconds=remaining_timeout(),on_attempt_started=on_attempt_started)
         self.last_repair_attempted=False
+        data = _clear_partial_requirement_ranges(data)
         data,invalid_reviews=self._sanitize_individual_reviews(data)
         try:
             out=ReflectionContract.model_validate(data).model_dump(); out['_invalid_obligation_reviews']=invalid_reviews; return out
@@ -104,5 +139,276 @@ class TypedReflection:
         # the legacy reflector. One malformed refine row must not discard otherwise
         # valid diagnosis/evidence input or turn a recoverable model defect into a
         # whole reflection failure.
+        data = _clear_partial_requirement_ranges(data)
         data, _invalid_reviews = Reflector._sanitize_individual_reviews(data)
         return ReflectionDecision.model_validate(data)
+
+
+def _normalize_incident_reflection_metadata(data):
+    """Normalize only unambiguous optional Incident Reflection structures.
+
+    ``reason`` and the flat Evidence-ID arrays remain strict.  The two review
+    collections are optional explanatory metadata, so malformed siblings can
+    be isolated while valid rows survive.  Explicit non-ev references are left
+    untouched and therefore fail the core Evidence contract instead of being
+    silently removed.
+    """
+    if not isinstance(data, dict):
+        return data, (), (), ()
+
+    result = dict(data)
+    actions = []
+    drops = []
+    warnings = []
+    known_fields = set(ReflectionFeedback.model_fields)
+    extra_fields = sorted(set(result) - known_fields)
+    for field in extra_fields:
+        result.pop(field, None)
+    if extra_fields:
+        actions.append("top_level:ignored_extra_fields:" + ",".join(extra_fields))
+        warnings.append("top_level:ignored_unknown_fields:" + ",".join(extra_fields))
+
+    review_models = {
+        "obligation_reviews": ReflectionObligationReview,
+        "contradiction_reviews": ReflectionContradictionReview,
+    }
+    for field_name, model_type in review_models.items():
+        if field_name not in result:
+            continue
+        raw = result[field_name]
+        if isinstance(raw, tuple):
+            raw = list(raw)
+            result[field_name] = raw
+            actions.append(f"{field_name}:tuple_to_array")
+        elif isinstance(raw, dict):
+            required = {
+                name for name, field in model_type.model_fields.items() if field.is_required()
+            }
+            if not required.issubset(raw):
+                result.pop(field_name, None)
+                drops.append(f"{field_name}:block:ambiguous_object_shape")
+                warnings.append(f"{field_name}:discarded_ambiguous_object")
+                continue
+            raw = [raw]
+            result[field_name] = raw
+            actions.append(f"{field_name}:object_to_singleton_array")
+        elif not isinstance(raw, list):
+            result.pop(field_name, None)
+            drops.append(f"{field_name}:block:non_array")
+            warnings.append(
+                f"{field_name}:discarded_non_array:{type(raw).__name__}"
+            )
+            continue
+
+        valid = []
+        allowed_fields = set(model_type.model_fields)
+        for index, item in enumerate(raw):
+            item_path = f"{field_name}[{index}]"
+            if not isinstance(item, dict):
+                drops.append(f"{item_path}:non_object")
+                warnings.append(f"{item_path}:discarded_non_object:{type(item).__name__}")
+                continue
+            explicit_non_ev = []
+            if field_name == "obligation_reviews":
+                values = item.get("supporting_evidence_ids")
+                values = values if isinstance(values, (list, tuple)) else [values]
+                explicit_non_ev.extend(
+                    value for value in values
+                    if isinstance(value, str) and not value.startswith("ev-")
+                )
+            else:
+                value = item.get("evidence_id")
+                if isinstance(value, str) and not value.startswith("ev-"):
+                    explicit_non_ev.append(value)
+            # Keep the invalid row intact.  Strict Pydantic validation and the
+            # existing one-shot repair path must handle this core violation.
+            if explicit_non_ev:
+                valid.append(item)
+                continue
+            unknown_fields = sorted(set(item) - allowed_fields)
+            if unknown_fields:
+                actions.append(
+                    f"{item_path}:ignored_extra_fields:{','.join(unknown_fields)}"
+                )
+                warnings.append(
+                    f"{item_path}:ignored_unknown_fields:{','.join(unknown_fields)}"
+                )
+            sanitized = {key: value for key, value in item.items() if key in allowed_fields}
+            try:
+                model_type.model_validate(sanitized)
+            except ValidationError as exc:
+                detail = ",".join(
+                    f"{'.'.join(str(part) for part in error.get('loc', ())) or 'item'}:"
+                    f"{error.get('type', 'validation_error')}"
+                    for error in exc.errors(include_url=False)[:4]
+                ) or "validation_error"
+                drops.append(f"{item_path}:schema_invalid")
+                warnings.append(f"{item_path}:discarded_invalid:{detail}")
+                continue
+            valid.append(sanitized)
+        result[field_name] = valid
+
+    return result, tuple(actions), tuple(drops), tuple(warnings)
+
+
+class IncidentReflectionAgent:
+    """Triggered, tool-less semantic reflection for the Incident runtime.
+
+    The agent receives a compact structured snapshot and returns feedback only.
+    DiagnosisHarness validates Evidence IDs and decides how that feedback changes
+    control flow; this class never executes a Tool or mutates a Hypothesis.
+    """
+
+    _SYSTEM = """You are the Incident Reflection Agent. Review the compact structured
+    diagnosis state supplied by the Harness. Do not call tools, access ground truth,
+    invent evidence, or replace the current hypothesis. Return only structured feedback:
+    identify supported/unsupported claims, remaining gaps, obligation and contradiction
+    reviews, whether the semantic hypothesis is stable, and the highest-information-gain
+    direction. All cited Evidence IDs must be existing ev-* IDs from the input. When
+    application source is declared and available, treat an unknown or gap source-mechanism
+    status as an unresolved critical gap until bounded read_file CODE Evidence is present;
+    do not infer source coverage from a runtime symptom. Do not return raw chain-of-thought
+    or the complete action history."""
+
+    def __init__(self, llm, model: str = ""):
+        self.llm = llm
+        self.model = model
+        self.last_usage: dict = {}
+        self.last_call_count = 0
+        self.last_schema_repaired = False
+        self.last_schema_error = ""
+        self.last_failure_type = ""
+        self.last_normalization_actions: list[str] = []
+        self.last_metadata_drops: list[str] = []
+        self.last_metadata_warnings: list[str] = []
+        self.last_prompt_breakdown: dict = {}
+
+    def reflect(self, snapshot: dict, *, logical_timeout_seconds: float | None = None,
+                on_attempt_started=None) -> ReflectionFeedback:
+        from debug_assistant.contracts import compact_validation_error, render_contract
+        self.last_usage = {}
+        self.last_call_count = 0
+        self.last_schema_repaired = False
+        self.last_schema_error = ""
+        self.last_failure_type = ""
+        self.last_normalization_actions = []
+        self.last_metadata_drops = []
+        self.last_metadata_warnings = []
+        contract = render_contract(ReflectionFeedback, "INCIDENT_REFLECTION_SCHEMA")
+        user = (
+            "STRUCTURED_REFLECTION_INPUT:\n"
+            + json.dumps(snapshot, ensure_ascii=False, sort_keys=True, default=str)
+            + "\n\n"
+            + contract
+        )
+        self.last_prompt_breakdown = {
+            "system_chars": len(self._SYSTEM),
+            "context_chars": len(user),
+            "raw_history_included": False,
+        }
+        logical_deadline = (
+            None if logical_timeout_seconds is None
+            else time.monotonic() + max(0.0, float(logical_timeout_seconds))
+        )
+
+        def remaining_timeout() -> float | None:
+            if logical_deadline is None:
+                return None
+            remaining = logical_deadline - time.monotonic()
+            if remaining <= 0:
+                raise LLMDeadlineExceeded(
+                    "Incident Reflection logical timeout exhausted before schema repair"
+                )
+            return remaining
+
+        def complete_feedback(system: str, prompt: str):
+            timeout = remaining_timeout()
+            if hasattr(self.llm, "complete_json"):
+                return complete_json_compat(
+                    self.llm, system, prompt, model=self.model or None,
+                    logical_timeout_seconds=timeout,
+                    on_attempt_started=on_attempt_started,
+                )
+            # A structured-only provider is a valid capability boundary.  Keep
+            # the same JSON-shaped contract and extract the provider-neutral
+            # response payload without adding another reflection implementation.
+            method = getattr(self.llm, "complete_structured", None)
+            if method is None:
+                raise ValueError("provider has no JSON or structured reflection API")
+            import inspect
+            try:
+                parameters = inspect.signature(method).parameters
+                has_varkw = any(
+                    p.kind is inspect.Parameter.VAR_KEYWORD
+                    for p in parameters.values()
+                )
+            except (TypeError, ValueError):
+                parameters, has_varkw = {}, False
+            kwargs = {"model": self.model or None, "schema": ReflectionFeedback}
+            if "logical_timeout_seconds" in parameters or has_varkw:
+                kwargs["logical_timeout_seconds"] = timeout
+            if "on_attempt_started" in parameters or has_varkw:
+                kwargs["on_attempt_started"] = on_attempt_started
+            response = method(system, prompt, **kwargs)
+            structured = getattr(response, "structured", None)
+            if structured is not None:
+                return structured
+            content = getattr(response, "content", response)
+            return extract_json(content) if isinstance(content, str) else content
+
+        self.last_call_count = 1
+        raw = complete_feedback(self._SYSTEM, user)
+        self._add_usage()
+        raw, actions, drops, warnings = _normalize_incident_reflection_metadata(raw)
+        self.last_normalization_actions.extend(actions)
+        self.last_metadata_drops.extend(drops)
+        self.last_metadata_warnings.extend(warnings)
+        try:
+            return ReflectionFeedback.model_validate(raw)
+        except ValidationError as first_error:
+            self.last_schema_error = "validation error: " + json.dumps(
+                compact_validation_error(first_error), ensure_ascii=False,
+            )
+            repair_user = (
+                "INVALID_INCIDENT_REFLECTION:\n"
+                + json.dumps(raw, ensure_ascii=False, default=str)
+                + "\n\nVALIDATION_ERRORS:\n"
+                + json.dumps(compact_validation_error(first_error), ensure_ascii=False)
+                + "\n\n"
+                + contract
+            )
+            self.last_schema_repaired = True
+            self.last_prompt_breakdown["repair_attempted"] = True
+            self.last_call_count += 1
+            repaired = complete_feedback(
+                "Repair only the JSON shape of Incident Reflection feedback; preserve all semantics and Evidence IDs.",
+                repair_user,
+            )
+            self._add_usage()
+            repaired, actions, drops, warnings = _normalize_incident_reflection_metadata(repaired)
+            self.last_normalization_actions.extend(actions)
+            self.last_metadata_drops.extend(drops)
+            self.last_metadata_warnings.extend(warnings)
+            try:
+                return ReflectionFeedback.model_validate(repaired)
+            except ValidationError as second_error:
+                self.last_schema_error += "\nRepair validation error: " + json.dumps(
+                    compact_validation_error(second_error), ensure_ascii=False,
+                )
+                self.last_failure_type = "reflection_contract_exhausted"
+                raise ReflectionContractExhausted(
+                    "incident reflection schema validation failed after one repair: "
+                    + json.dumps(compact_validation_error(second_error), ensure_ascii=False)
+                ) from second_error
+
+    # A descriptive alias makes the role convenient for direct deterministic tests.
+    review = reflect
+
+    def _add_usage(self) -> None:
+        usage = dict(getattr(self.llm, "last_usage", {}) or {})
+        self.last_usage["prompt_tokens"] = int(self.last_usage.get("prompt_tokens", 0) or 0) + int(
+            usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
+        )
+        self.last_usage["completion_tokens"] = int(self.last_usage.get("completion_tokens", 0) or 0) + int(
+            usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
+        )

@@ -1,16 +1,24 @@
 from __future__ import annotations
 
 from pathlib import Path
-import ast, os, re, subprocess, time
+import ast, json, os, re, subprocess, time
 from pydantic import Field, model_validator
 
 from .base import Tool, ToolSpec, ToolArgs
 from debug_assistant.models import ToolObservation
-from debug_assistant.repository.safe_fs import SafeRepositoryFS, IGNORED
+from debug_assistant.repository.safe_fs import SafeRepositoryFS, IGNORED, TEXT_SUFFIXES
 from debug_assistant.repository.paths import (
     RepositoryPathResolver, RepositoryPathMatcher, ResolutionMode,
-    RepositoryPathError, PathRejectedError,
+    RepositoryPathError, PathRejectedError, PathNotFoundError, normalize_path_syntax,
 )
+
+
+# Source-returning repository tools share these bounds.  ``read_file`` and
+# ``symbol_search`` therefore cannot silently grow separate unbounded read
+# paths as their result formats evolve.
+REPOSITORY_SOURCE_MAX_LINES = 200
+REPOSITORY_SOURCE_MAX_CHARS = 12000
+REPOSITORY_SYMBOL_MAX_RESULTS = 12
 
 
 def _obs(name, started, ok, content, *, error_type=None, retryable=False, **meta):
@@ -37,18 +45,20 @@ class GrepArgs(ToolArgs):
 class ReadFileArgs(ToolArgs):
     path: str = Field(min_length=1)
     start_line: int = Field(default=1, ge=1)
-    end_line: int = Field(default=200, ge=1)
+    end_line: int = Field(default=REPOSITORY_SOURCE_MAX_LINES, ge=1)
     @model_validator(mode='after')
     def check_range(self):
         if self.start_line > self.end_line:
             raise ValueError('start_line must be <= end_line')
-        if self.end_line - self.start_line + 1 > 200:
-            raise ValueError('read_file may request at most 200 lines per call')
+        if self.end_line - self.start_line + 1 > REPOSITORY_SOURCE_MAX_LINES:
+            raise ValueError(
+                f'read_file may request at most {REPOSITORY_SOURCE_MAX_LINES} lines per call'
+            )
         return self
 
 class SymbolSearchArgs(ToolArgs):
     query: str = Field(min_length=1)
-    max_results: int = Field(default=60, ge=1, le=60)
+    max_results: int = Field(default=REPOSITORY_SYMBOL_MAX_RESULTS, ge=1, le=REPOSITORY_SYMBOL_MAX_RESULTS)
 
 class GitLogArgs(ToolArgs):
     path: str = ''
@@ -69,6 +79,109 @@ class _RepositoryTool(Tool):
         self.fs=fs or SafeRepositoryFS(self.root)
         self.resolver=resolver or RepositoryPathResolver(self.fs)
         self.matcher=matcher or RepositoryPathMatcher()
+
+
+def _numbered_source_context(
+    lines: list[str], start_line: int, end_line: int, *, max_chars: int,
+) -> tuple[str, int | None, int | None, bool]:
+    """Return a complete-line, bounded source slice with trustworthy coverage."""
+    start = max(1, int(start_line))
+    requested_end = max(start, int(end_line))
+    bounded_end = min(len(lines), requested_end, start + REPOSITORY_SOURCE_MAX_LINES - 1)
+    rendered: list[str] = []
+    used = 0
+    truncated = bounded_end < requested_end
+    for line_no in range(start, bounded_end + 1):
+        value = f"{line_no:5d} | {lines[line_no - 1]}"
+        addition = len(value) + (1 if rendered else 0)
+        if used + addition > max(0, int(max_chars)):
+            truncated = True
+            break
+        rendered.append(value)
+        used += addition
+    if not rendered:
+        return "", None, None, True
+    return "\n".join(rendered), start, start + len(rendered) - 1, truncated
+
+
+def _balanced_brace_end(lines: list[str], start_line: int) -> int:
+    """Find a conservative brace-delimited declaration end without parsing code."""
+    depth = 0
+    opened = False
+    block_comment = False
+    quote: str | None = None
+    escaped = False
+    for line_no in range(max(1, int(start_line)), len(lines) + 1):
+        line = lines[line_no - 1]
+        index = 0
+        while index < len(line):
+            char = line[index]
+            next_char = line[index + 1] if index + 1 < len(line) else ""
+            if block_comment:
+                if char == "*" and next_char == "/":
+                    block_comment = False
+                    index += 2
+                    continue
+                index += 1
+                continue
+            if quote is not None:
+                if quote != "`" and escaped:
+                    escaped = False
+                elif quote != "`" and char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = None
+                index += 1
+                continue
+            if char == "/" and next_char == "/":
+                break
+            if char == "/" and next_char == "*":
+                block_comment = True
+                index += 2
+                continue
+            if char in {'"', "'", '`'}:
+                quote = char
+            elif char == "{":
+                opened = True
+                depth += 1
+            elif char == "}" and opened:
+                depth -= 1
+                if depth == 0:
+                    return line_no
+            index += 1
+        if opened and depth == 0:
+            return line_no
+    # A malformed or brace-less declaration is represented only by its
+    # declaration line; callers must not infer a complete body from a fallback.
+    return min(len(lines), max(1, int(start_line)))
+
+
+def _symbol_match(
+    *, path: str, name: str, kind: str, start_line: int, end_line: int,
+    lines: list[str], max_source_chars: int,
+    callers: list[dict] | None = None, callees: list[dict] | None = None,
+) -> dict:
+    context, context_start, context_end, source_truncated = _numbered_source_context(
+        lines, start_line, end_line, max_chars=max_source_chars,
+    )
+    signature = lines[start_line - 1].strip() if 0 < start_line <= len(lines) else ""
+    return {
+        "symbol": name,
+        "name": name,
+        "kind": kind,
+        "file": path,
+        "start_line": int(start_line),
+        "end_line": int(end_line),
+        "signature": signature,
+        "source_context": context,
+        "source_context_start_line": context_start,
+        "source_context_end_line": context_end,
+        "source_context_truncated": bool(source_truncated),
+        "truncated": bool(source_truncated),
+        "callers": list(callers or []),
+        "callees": list(callees or []),
+        "relations_available": bool(callers or callees),
+    }
 
 
 class RepoTreeTool(_RepositoryTool):
@@ -133,12 +246,20 @@ class GrepTool(_RepositoryTool):
 class ReadFileTool(_RepositoryTool):
     spec=ToolSpec(
         'read_file',
-        'Read source lines with stable line numbers. Repository paths are canonicalized; unique read-only suffix/basename recovery is allowed, ambiguity is returned as a structured tool error. start_line/end_line are inclusive and at most 200 lines.',
+        f'Read source lines with stable line numbers. Repository paths are canonicalized; unique read-only suffix/basename recovery is allowed, ambiguity is returned as a structured tool error. start_line/end_line are inclusive and at most {REPOSITORY_SOURCE_MAX_LINES} lines.',
         ReadFileArgs,'repository_read','light','none',16000)
-    def __init__(self, root, *, fs=None, resolver=None, matcher=None): self._init_paths(root,fs=fs,resolver=resolver,matcher=matcher)
-    def execute(self,path,start_line=1,end_line=200):
+    def __init__(self, root, *, fs=None, resolver=None, matcher=None):
+        self._init_paths(root,fs=fs,resolver=resolver,matcher=matcher)
+        self._failed_paths=set()
+    def execute(self,path,start_line=1,end_line=REPOSITORY_SOURCE_MAX_LINES):
         t=time.time()
         try:
+            normalized=normalize_path_syntax(path)
+            if normalized in self._failed_paths:
+                return _obs(self.spec.name,t,False,
+                            f'path not found in repository (cached): {path}',
+                            error_type='path_not_found',input_path=path,candidates=[],
+                            planner_retryable=False,cached=True)
             resolved=self.resolver.resolve_file(path,mode=ResolutionMode.READ_TOLERANT)
             lines=self.fs.read_text(resolved.relative_path).splitlines()
             s=max(1,int(start_line)); requested_end=int(end_line)
@@ -148,28 +269,121 @@ class ReadFileTool(_RepositoryTool):
                             error_type='range_out_of_bounds',actual_line_count=len(lines),
                             requested_start_line=s,requested_end_line=requested_end,
                             path=resolved.relative_path)
-            e=min(len(lines),requested_end,s+199)
+            e=min(len(lines),requested_end,s+REPOSITORY_SOURCE_MAX_LINES-1)
             text='\n'.join(f"{i:5d} | {lines[i-1]}" for i in range(s,e+1))
             return _obs(self.spec.name,t,True,text,path=resolved.relative_path,start_line=s,end_line=e,requested_end_line=requested_end,
                         requested_start_line=s,actual_start_line=s,actual_end_line=e,
                         clamped=e<requested_end,truncated=e<min(len(lines),requested_end),path_resolution=resolved.metadata(str(path)))
+        except PathNotFoundError as e:
+            self._failed_paths.add(normalized)
+            return _path_error_obs(self.spec.name,t,e)
         except RepositoryPathError as e: return _path_error_obs(self.spec.name,t,e)
         except Exception as e: return _obs(self.spec.name,t,False,str(e),error_type=type(e).__name__)
 
 
 class SymbolSearchTool(_RepositoryTool):
-    spec=ToolSpec('symbol_search','Find Python classes/functions and their line ranges. Results always use canonical repository-relative paths.',SymbolSearchArgs,'repository_search','medium','none',12000)
+    spec=ToolSpec(
+        'symbol_search',
+        'Locate declared symbols and return bounded candidate context in the same result. '
+        'Each match includes a canonical file, signature, exact symbol range, '
+        'numbered preview, and caller/callee fields when available. The result is '
+        'discovery only; use read_file to verify source and create CODE Evidence.',
+        SymbolSearchArgs, 'repository_search', 'medium', 'none', 12000,
+    )
     def __init__(self, root, *, fs=None, resolver=None, matcher=None): self._init_paths(root,fs=fs,resolver=resolver,matcher=matcher)
     def execute(self,query,max_results=60):
-        t=time.time(); q=query.lower(); out=[]; limit=min(int(max_results),60)
-        for sf in self.fs.iter_files(suffixes={'.py'}):
-            try: tree=ast.parse(self.fs.read_text(sf.rel))
-            except Exception: continue
-            for n in ast.walk(tree):
-                if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)) and q in n.name.lower():
-                    out.append(f"{sf.rel}:{n.lineno}-{getattr(n,'end_lineno',n.lineno)} {type(n).__name__} {n.name}")
-                    if len(out)>=limit: return _obs(self.spec.name,t,True,'\n'.join(out),matches=len(out),truncated=True)
-        return _obs(self.spec.name,t,True,'\n'.join(out),matches=len(out),truncated=False)
+        t=time.time(); q=str(query).lower(); out=[]; limit=min(int(max_results),REPOSITORY_SYMBOL_MAX_RESULTS); stopped=False
+        for sf in self.fs.iter_files(suffixes=TEXT_SUFFIXES):
+            try:
+                text=self.fs.read_text(sf.rel)
+            except (OSError, ValueError):
+                continue
+            if sf.rel.lower().endswith('.py'):
+                try: tree=ast.parse(text)
+                except Exception: continue
+                lines=text.splitlines()
+                for n in ast.walk(tree):
+                    if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)) and q in n.name.lower():
+                        out.append((sf.rel, n.name, type(n).__name__, n.lineno,
+                                    getattr(n, 'end_lineno', n.lineno), lines))
+                        if len(out)>=limit:
+                            stopped=True
+                            break
+                if stopped: break
+                continue
+            for line_no, line in enumerate(text.splitlines(), 1):
+                declaration = _generic_symbol_declaration(line)
+                if declaration is None or q not in declaration[1].lower():
+                    continue
+                kind, name = declaration
+                out.append((sf.rel, name, kind, line_no,
+                            _balanced_brace_end(text.splitlines(), line_no),
+                            text.splitlines()))
+                if len(out)>=limit:
+                    stopped=True
+                    break
+            if stopped: break
+
+        # The tool output has a shared character budget.  Give the first few
+        # matches enough context to be useful while keeping a broad query from
+        # expanding into an entire repository dump.  Later matches remain valid
+        # retrieval locations, but explicitly report omitted context.
+        output_limit = int(self.spec.output_limit or REPOSITORY_SOURCE_MAX_CHARS)
+        source_budget = min(REPOSITORY_SOURCE_MAX_CHARS, max(1000, output_limit - output_limit // 3))
+        context_matches = max(1, min(len(out), 6))
+        per_match_budget = max(1000, source_budget // context_matches)
+        matches=[]
+        for index, (path, name, kind, start, end, lines) in enumerate(out):
+            if index < context_matches:
+                budget = min(REPOSITORY_SOURCE_MAX_CHARS, per_match_budget)
+                match = _symbol_match(
+                    path=path, name=name, kind=kind, start_line=start, end_line=end,
+                    lines=lines, max_source_chars=budget,
+                )
+            else:
+                match = {
+                    "symbol": name, "name": name, "kind": kind, "file": path,
+                    "start_line": int(start), "end_line": int(end),
+                    "signature": lines[start - 1].strip() if start <= len(lines) else "",
+                    "source_context": "", "source_context_start_line": None,
+                    "source_context_end_line": None, "source_context_truncated": True,
+                    "truncated": True, "callers": [], "callees": [],
+                    "relations_available": False, "source_context_omitted": True,
+                }
+            matches.append(match)
+        payload={
+            "query": str(query), "matches": matches,
+            "truncated": bool(stopped or any(item.get("truncated") for item in matches)),
+            "source_context_budget_chars": source_budget,
+        }
+        return _obs(
+            self.spec.name, t, True, json.dumps(payload, ensure_ascii=False),
+            matches=len(matches), truncated=payload["truncated"],
+            information_source="candidate_retrieval",
+        )
+
+
+_GO_FUNCTION = re.compile(r'^\s*func\s+(?:\([^)]*\)\s*)?(?P<name>[A-Za-z_]\w*)\s*\(')
+_TYPE_DECLARATION = re.compile(r'^\s*(?:type|class|interface|struct|enum)\s+(?P<name>[A-Za-z_]\w*)\b')
+_FUNCTION_DECLARATION = re.compile(
+    r'^\s*(?:(?:public|private|protected|internal|static|async|virtual|override|final|synchronized|abstract|export)\s+)*'
+    r'(?:[A-Za-z_$][\w$<>\[\],.?]*\s+)+(?P<name>[A-Za-z_$][\w$]*)\s*\('
+)
+_JS_FUNCTION = re.compile(r'^\s*(?:async\s+)?function\s+(?P<name>[A-Za-z_$][\w$]*)\s*\(')
+
+
+def _generic_symbol_declaration(line: str) -> tuple[str, str] | None:
+    """Recognize conservative declaration forms outside Python AST parsing."""
+    for pattern, kind in (
+        (_GO_FUNCTION, "Function"),
+        (_TYPE_DECLARATION, "Type"),
+        (_JS_FUNCTION, "Function"),
+        (_FUNCTION_DECLARATION, "Function"),
+    ):
+        match = pattern.match(line)
+        if match:
+            return kind, match.group("name")
+    return None
 
 
 class GitLogTool(_RepositoryTool):

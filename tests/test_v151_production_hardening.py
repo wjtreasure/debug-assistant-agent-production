@@ -217,3 +217,24 @@ def test_trace_metrics_count_obligation_scope_rejections(tmp_path):
     metrics = summarize_trace(path)
     assert metrics["route_rejections"] == 1
     assert metrics["obligation_scope_rejections"] == 1
+
+
+def test_trace_metrics_count_review_repair_attempt_that_times_out(tmp_path):
+    path = tmp_path / "incident-review-timeout.jsonl"
+    path.write_text(
+        "\n".join([
+            json.dumps({"type": "REVIEW_STAGE", "payload": {
+                "stage": "first_pass", "schema_repair": False,
+            }}),
+            json.dumps({"type": "REVIEW_STAGE", "payload": {
+                "stage": "schema_repair", "schema_repair": True,
+                "failure_type": "LLMDeadlineExceeded",
+            }}),
+            json.dumps({"type": "REVIEW_FAILED", "payload": {}}),
+            json.dumps({"type": "RUN_END", "payload": {"summary": {}}}),
+        ]),
+        encoding="utf-8",
+    )
+    metrics = summarize_trace(path)
+    assert metrics["review_calls"] == 2
+    assert metrics["schema_repair_count"] == 1

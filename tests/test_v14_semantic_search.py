@@ -42,3 +42,99 @@ def test_search_engine_degrades_semantic_to_lexical(tmp_path):
     assert diag.degraded is True and diag.effective_mode=='lexical'
     assert rows and rows[0]['path']=='x.py'
     idx.close()
+
+
+def test_hybrid_ast_refinement_stays_in_candidates_and_uses_call_relations(tmp_path):
+    repo=tmp_path/'repo'; repo.mkdir()
+    (repo/'target.py').write_text(
+        'def helper(value):\n    return value + 1\n\n'
+        'def target(value):\n    return helper(value)\n\n'
+        'def caller(value):\n    return target(value)\n',
+        encoding='utf-8',
+    )
+    (repo/'global_match.py').write_text('def target(value):\n    return value\n', encoding='utf-8')
+    (repo/'unrelated.py').write_text('def stable(value):\n    return value\n', encoding='utf-8')
+    idx=RepositoryIndex(repo,tmp_path/'idx.sqlite'); idx.build()
+    try:
+        rows, diagnostics=idx.refine_hybrid_candidates(
+            [
+                {'path':'target.py','score':0.03,'source':'hybrid','snippet':'target'},
+                {'path':'unrelated.py','score':0.02,'source':'hybrid','snippet':'other'},
+            ],
+            'target behavior', limit=2,
+        )
+        assert {row['path'] for row in rows} == {'target.py','unrelated.py'}
+        target=next(row for row in rows if row['path']=='target.py')
+        match=target['matched_symbols'][0]
+        assert match['symbol']=='target'
+        assert match['kind']=='FunctionDef'
+        assert match['source_range']==[4,5]
+        assert any(item['symbol']=='caller' for item in match['callers'])
+        assert any(item['symbol']=='helper' for item in match['callees'])
+        assert diagnostics['relations_used'] >= 2
+        assert 'global_match.py' not in {row['path'] for row in rows}
+    finally:
+        idx.close()
+
+
+def test_hybrid_ast_does_not_promote_weak_symbol_over_hybrid_rank(tmp_path):
+    repo=tmp_path/'repo'; repo.mkdir()
+    (repo/'strong.py').write_text('def unrelated(value):\n    return value\n', encoding='utf-8')
+    (repo/'weak.py').write_text('def target(value):\n    return value\n', encoding='utf-8')
+    idx=RepositoryIndex(repo,tmp_path/'idx.sqlite'); idx.build()
+    try:
+        rows, diagnostics=idx.refine_hybrid_candidates(
+            [
+                {'path':'strong.py','score':0.030,'source':'hybrid'},
+                {'path':'weak.py','score':0.029,'source':'hybrid'},
+            ],
+            'target', limit=2,
+        )
+        assert diagnostics['ast_status']=='applied'
+        assert [row['path'] for row in rows] == ['strong.py','weak.py']
+    finally:
+        idx.close()
+
+
+def test_hybrid_ast_explicitly_degrades_without_python_symbols(tmp_path):
+    repo=tmp_path/'repo'; repo.mkdir()
+    (repo/'main.go').write_text('package demo\nfunc Run() {}\n', encoding='utf-8')
+    idx=RepositoryIndex(repo,tmp_path/'idx.sqlite'); idx.build()
+    try:
+        rows, diagnostics=idx.refine_hybrid_candidates(
+            [{'path':'main.go','score':0.03,'source':'hybrid'}], 'Run', limit=1,
+        )
+        assert [row['path'] for row in rows] == ['main.go']
+        assert diagnostics['ast_available'] is False
+        assert diagnostics['ast_status']=='unsupported_language'
+    finally:
+        idx.close()
+
+
+def test_search_engine_hybrid_ast_refines_the_fused_candidate_set(tmp_path):
+    repo=tmp_path/'repo'; repo.mkdir()
+    (repo/'target.py').write_text(
+        'def helper(value):\n    return value + 1\n\n'
+        'def target(value):\n    return helper(value)\n',
+        encoding='utf-8',
+    )
+    (repo/'other.py').write_text('def unrelated(value):\n    return value\n', encoding='utf-8')
+
+    class AvailableSemanticIndex:
+        available=True
+
+        def search(self, query, *, limit, deadline=None):
+            return [{'path':'target.py','snippet':'target behavior'}]
+
+    idx=RepositoryIndex(repo,tmp_path/'idx.sqlite'); idx.build()
+    try:
+        engine=RepositorySearchEngine(idx,AvailableSemanticIndex())
+        rows, diagnostics=engine.search('target behavior', mode='hybrid_ast', limit=2)
+        assert diagnostics.requested_mode=='hybrid_ast'
+        assert diagnostics.effective_mode=='hybrid_ast'
+        assert diagnostics.ast_status=='applied'
+        assert diagnostics.ast_matches >= 1
+        assert [row['path'] for row in rows] == ['target.py']
+        assert rows[0]['matched_symbols'][0]['source_range']==[4,5]
+    finally:
+        idx.close()

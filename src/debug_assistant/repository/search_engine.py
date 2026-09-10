@@ -12,6 +12,12 @@ class RetrievalDiagnostics:
     lexical_candidates:int=0
     semantic_candidates:int=0
     rrf_k:int=60
+    ast_available:bool=False
+    ast_status:str='not_requested'
+    ast_matches:int=0
+    ast_relations:int=0
+    ast_supported_candidates:int=0
+    ast_unsupported_candidates:int=0
 
 
 def reciprocal_rank_fusion(rankings:list[list[dict]], *, k:int=60, limit:int=20):
@@ -58,14 +64,74 @@ class RepositorySearchEngine:
             except Exception as exc:
                 rows=self.lexical.search(query,limit=limit)
                 return rows,RetrievalDiagnostics(mode,'lexical',len(rows),True,True,f'semantic_query_failed:{type(exc).__name__}',lexical_candidates=len(rows),rrf_k=self.rrf_k)
-        if mode=='hybrid':
+        if mode in {'hybrid','hybrid_ast'}:
             lex=self.lexical.search(query,limit=max(limit,20))
             if not semantic_available:
+                # ``hybrid_ast`` still has useful deterministic value when the
+                # optional semantic index is unavailable: lexical/BM25 recall
+                # remains the candidate boundary and the existing Python AST
+                # pass may refine those candidates.  Never label this result
+                # as Hybrid, because no RRF fusion actually happened.
+                if mode == 'hybrid_ast':
+                    refined, ast_diag = self.lexical.refine_hybrid_candidates(
+                        lex[:limit], query, limit=limit,
+                    )
+                    ast_available = bool(ast_diag.get('ast_available'))
+                    effective = 'lexical_ast' if ast_available else 'lexical'
+                    reason = 'semantic_index_unavailable'
+                    if not ast_available:
+                        reason += ':ast_index_unavailable'
+                    return refined, RetrievalDiagnostics(
+                        mode, effective, len(refined), False, True, reason,
+                        lexical_candidates=len(lex), rrf_k=self.rrf_k,
+                        ast_available=ast_available,
+                        ast_status=str(ast_diag.get('ast_status') or 'unavailable'),
+                        ast_matches=int(ast_diag.get('matched_symbol_count') or 0),
+                        ast_relations=int(ast_diag.get('relations_used') or 0),
+                        ast_supported_candidates=int(ast_diag.get('supported_candidate_count') or 0),
+                        ast_unsupported_candidates=int(ast_diag.get('unsupported_candidate_count') or 0),
+                    )
                 return lex[:limit],RetrievalDiagnostics(mode,'lexical',min(len(lex),limit),False,True,'semantic_index_unavailable',lexical_candidates=len(lex),rrf_k=self.rrf_k)
             try:
                 sem=self.semantic.search(query,limit=max(limit,20),deadline=self.deadline)
             except Exception as exc:
+                if mode == 'hybrid_ast':
+                    refined, ast_diag = self.lexical.refine_hybrid_candidates(
+                        lex[:limit], query, limit=limit,
+                    )
+                    ast_available = bool(ast_diag.get('ast_available'))
+                    effective = 'lexical_ast' if ast_available else 'lexical'
+                    reason = f'semantic_query_failed:{type(exc).__name__}'
+                    if not ast_available:
+                        reason += ':ast_index_unavailable'
+                    return refined, RetrievalDiagnostics(
+                        mode, effective, len(refined), True, True, reason,
+                        lexical_candidates=len(lex), rrf_k=self.rrf_k,
+                        ast_available=ast_available,
+                        ast_status=str(ast_diag.get('ast_status') or 'unavailable'),
+                        ast_matches=int(ast_diag.get('matched_symbol_count') or 0),
+                        ast_relations=int(ast_diag.get('relations_used') or 0),
+                        ast_supported_candidates=int(ast_diag.get('supported_candidate_count') or 0),
+                        ast_unsupported_candidates=int(ast_diag.get('unsupported_candidate_count') or 0),
+                    )
                 return lex[:limit],RetrievalDiagnostics(mode,'lexical',min(len(lex),limit),True,True,f'semantic_query_failed:{type(exc).__name__}',lexical_candidates=len(lex),rrf_k=self.rrf_k)
             rows=reciprocal_rank_fusion([lex,sem],k=self.rrf_k,limit=limit)
-            return rows,RetrievalDiagnostics(mode,'hybrid',len(rows),True,False,'',len(lex),len(sem),self.rrf_k)
-        raise ValueError("mode must be one of: lexical, semantic, hybrid")
+            if mode=='hybrid':
+                return rows,RetrievalDiagnostics(mode,'hybrid',len(rows),True,False,'',len(lex),len(sem),self.rrf_k)
+            refined, ast_diag=self.lexical.refine_hybrid_candidates(
+                rows, query, limit=limit,
+            )
+            ast_available=bool(ast_diag.get('ast_available'))
+            ast_status=str(ast_diag.get('ast_status') or 'unavailable')
+            degraded=not ast_available
+            reason='' if ast_available else 'ast_index_unavailable'
+            return refined,RetrievalDiagnostics(
+                mode, 'hybrid_ast' if ast_available else 'hybrid', len(refined), True,
+                degraded, reason, len(lex), len(sem), self.rrf_k,
+                ast_available, ast_status,
+                int(ast_diag.get('matched_symbol_count') or 0),
+                int(ast_diag.get('relations_used') or 0),
+                int(ast_diag.get('supported_candidate_count') or 0),
+                int(ast_diag.get('unsupported_candidate_count') or 0),
+            )
+        raise ValueError("mode must be one of: lexical, semantic, hybrid, hybrid_ast")

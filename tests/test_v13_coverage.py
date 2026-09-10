@@ -13,4 +13,10 @@ def test_read_coverage_exact_and_subrange_reuse_only():
 def test_observation_store_rehydrates_original_object():
     s=ObservationStore(); o=ToolObservation('read_file',True,'x',{'path':'a.py','start_line':1,'end_line':2})
     s.add(o)
-    assert s.get(o.observation_id) is o
+    stored=s.get(o.observation_id)
+    assert stored is not o
+    assert stored.content == 'x'
+    o.content='mutated after storage'
+    assert s.get(o.observation_id).content == 'x'
+    stored.content='mutated returned copy'
+    assert s.get(o.observation_id).content == 'x'

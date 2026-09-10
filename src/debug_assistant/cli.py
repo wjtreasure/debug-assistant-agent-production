@@ -32,7 +32,7 @@ def main(argv=None):
         cfg=AppConfig.from_env().apply_experiment_file(a.config or None); r=run_prepared(a.tasks,a.output,AgentHarness(cfg),a.limit,resume=not a.no_resume,sample=a.sample,seed=a.seed); print(json.dumps(r,indent=2)); return
     if a.cmd=='eval-localization':
         from debug_assistant.evaluation.localization import evaluate_dataset
-        r=evaluate_dataset(a.gold,a.predictions); Path(a.output).parent.mkdir(parents=True,exist_ok=True); Path(a.output).write_text(json.dumps(r,indent=2),encoding='utf-8'); print(json.dumps(r['aggregate'],indent=2)); return
+        r=evaluate_dataset(a.gold,a.predictions); Path(a.output).parent.mkdir(parents=True,exist_ok=True); Path(a.output).write_text(json.dumps(r,indent=2),encoding='utf-8'); print(json.dumps({'fix_localization':r['fix_localization'],'exploration':r['exploration'],'execution':r['execution'],'coverage':r['coverage']},indent=2)); return
     if a.cmd=='trace-metrics':
         from debug_assistant.evaluation.trace_metrics import summarize_trace
         print(json.dumps(summarize_trace(a.trace),indent=2)); return

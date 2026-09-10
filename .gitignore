@@ -8,9 +8,15 @@ __pycache__/
 .debug_assistant/
 runs/
 cache/
+tests/
+experiments/
+data/
 data/swe_lite_*/
 data/dev-00000-of-00001.parquet
+data/cloudops_official/**/tool_cache.json
 docs/
+!docs/evaluation.md
+!docs/runtime_unification_task_a_preflight.md
 *.egg-info/
 build/
 dist/

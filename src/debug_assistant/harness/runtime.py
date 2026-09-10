@@ -20,6 +20,7 @@ from debug_assistant.memory.observation_store import ObservationStore
 from debug_assistant.memory.coverage import ReadCoverageIndex
 from debug_assistant.memory.hypothesis import HypothesisManager, normalize_target, normalize_location
 from debug_assistant.context.manager import ContextManager
+from debug_assistant.context.packing import line_safe_head_tail, line_safe_truncate
 from debug_assistant.agent.planner import Planner, PlannerFacade, NativePlannerResult, PlannerContractError, NativePlannerContractError
 from debug_assistant.agent.reflection import Reflector, TypedReflection
 from debug_assistant.contracts import ReflectionDecision
@@ -191,6 +192,9 @@ class AgentHarness:
         reflection_context_metrics={}
         semantic_no_progress_streak=0
         last_semantic_fingerprint=None
+        last_progress_support_ids=set()
+        last_progress_symbol=""
+        last_progress_confidence=0.0
         last_context_result={}
         need_tracker=InformationNeedTracker(max_no_gain_attempts=2) if flags.information_need_tracking else None
         obligations=None
@@ -238,18 +242,6 @@ class AgentHarness:
 
         def build_ctx(stage: RuntimeStage):
             nonlocal requested_context_ids
-            result=ctxmgr.build(state,memory,observations,max_context_chars=h.max_context_chars,max_steps=h.max_steps,max_tool_calls=h.max_tool_calls,requested_ids=requested_context_ids)
-            trace.record('CONTEXT_BUILT',{
-                'stage':stage.value,'budget_chars':result.budget_chars,'used_chars':result.used_chars,'catalog_size':result.catalog_size,
-                'working_set_size':result.working_set_size,'selected':result.selected,'dropped':result.dropped,
-                'invalid_requested_ids':result.invalid_requested_ids,'breakdown':result.breakdown,
-                'known_context_chars':result.known_context_chars,'active_item_count':result.active_item_count,
-                'cold_item_count':result.cold_item_count,'eviction_count':result.eviction_count,
-                'projection_count':result.projection_count,'display_coverage':result.display_coverage,
-            })
-            last_context_result[stage.value]=result
-            if result.invalid_requested_ids: trace.record('CONTEXT_REQUEST_INVALID',{'ids':result.invalid_requested_ids,'stage':stage.value})
-            requested_context_ids=[]
             extra=[]
             if need_tracker is not None:
                 advisory=need_tracker.advisory(current_need)
@@ -261,7 +253,27 @@ class AgentHarness:
                 extra.append(f'BUDGET_STATE: phase={snap.phase}; remaining_ratio={snap.remaining_ratio:.3f}; tokens={snap.tokens_used}/{h.max_total_tokens}; llm_calls={snap.llm_calls_used}/{h.max_llm_calls}; wall_time={snap.wall_time_seconds:.1f}/{h.max_wall_time_seconds}s')
             if last_planner_contract_feedback:
                 extra.append('PREVIOUS_PLANNER_CONTRACT_ERROR:\n'+json.dumps(last_planner_contract_feedback,ensure_ascii=False))
-            return result.text + ('\n\n'+'\n\n'.join(extra) if extra else '')
+            suffix=('\n\n'+'\n\n'.join(extra)) if extra else ''
+            result=ctxmgr.build(
+                state,memory,observations,max_context_chars=h.max_context_chars,
+                max_steps=h.max_steps,max_tool_calls=h.max_tool_calls,
+                requested_ids=requested_context_ids,
+                external_context_chars=len(suffix),
+            )
+            trace.record('CONTEXT_BUILT',{
+                'stage':stage.value,'step':state.step,'budget_chars':result.budget_chars,'used_chars':result.used_chars,'catalog_size':result.catalog_size,
+                'working_set_size':result.working_set_size,'selected':result.selected,'dropped':result.dropped,
+                'invalid_requested_ids':result.invalid_requested_ids,'breakdown':result.breakdown,
+                'known_context_chars':result.known_context_chars,'active_item_count':result.active_item_count,
+                'cold_item_count':result.cold_item_count,'eviction_count':result.eviction_count,
+                'projection_count':result.projection_count,'display_coverage':result.display_coverage,
+                'diagnostic_context_chars':len(result.text),'external_context_chars':len(suffix),
+                'planner_context_chars':len(result.text)+len(suffix),
+            })
+            last_context_result[stage.value]=result
+            if result.invalid_requested_ids: trace.record('CONTEXT_REQUEST_INVALID',{'ids':result.invalid_requested_ids,'stage':stage.value})
+            requested_context_ids=[]
+            return result.text + suffix
 
         def _current_llm_calls() -> int:
             try:
@@ -429,6 +441,50 @@ class AgentHarness:
             trace.record('EVIDENCE_BUNDLE_BUILT',{'bundle_id':bundle.bundle_id,'information_need_root_id':bundle.root_id,'obligation_ids':[x.obligation_id for x in bundle.items],'chars':bundle.chars,'source_projection_count':len(bundle.items)})
             return bundle
 
+        def _assess_convergence(review: dict):
+            nonlocal last_progress_support_ids, last_progress_symbol, last_progress_confidence
+            if controller is None:
+                return None
+            hypothesis_state=state.current_hypothesis or {}
+            target=str(hypothesis_state.get('root_cause_target') or '')
+            support_ids=set(hypothesis_state.get('supporting_evidence_ids') or [])
+            support_ids.update(hypothesis_state.get('contradicting_evidence_ids') or [])
+            signal={
+                # Raw observations are exploration activity, not semantic progress.
+                # Only evidence newly adopted by the hypothesis should influence
+                # convergence; otherwise repeated broad reads can postpone the
+                # no-progress guard indefinitely.
+                'new_evidence_count': len(support_ids-last_progress_support_ids),
+                'new_candidate_file_count': 0,
+                'new_candidate_symbol_count': int(bool(target and target != last_progress_symbol)),
+                'confidence_improvement': float(hypothesis_state.get('confidence') or 0.0) - last_progress_confidence,
+            }
+            assessment=controller.assess_reflection(
+                hypothesis_state,
+                usage_totals=(_usage_snapshot(llm).get('totals') or {}),
+                allow_budget_recovery=not rejected_since_last_evidence,
+                progress_signal=signal,
+            )
+            last_progress_confidence=float(hypothesis_state.get('confidence') or 0.0)
+            last_progress_support_ids=support_ids
+            last_progress_symbol=target
+            state.no_progress_count += int(assessment.kind is ProgressKind.NO_PROGRESS)
+            state.convergence_mode=controller.state.mode.value
+            state.forced_finalization=controller.state.forced_finalization
+            state.budget_critical_entered=controller.state.budget_critical_entered
+            state.first_supported_hypothesis_step=controller.state.first_supported_hypothesis_step
+            state.first_stable_diagnosis_step=controller.state.first_stable_diagnosis_step
+            state.prompt_tokens_at_first_stable_diagnosis=controller.state.prompt_tokens_at_first_stable_diagnosis
+            state.completion_tokens_at_first_stable_diagnosis=controller.state.completion_tokens_at_first_stable_diagnosis
+            state.tokens_at_first_stable_diagnosis=controller.state.tokens_at_first_stable_diagnosis
+            trace.record('PROGRESS' if assessment.kind is ProgressKind.PROGRESS else 'NO_PROGRESS',{
+                'step':state.step,'reasons':assessment.reasons,'no_progress_streak':controller.state.no_progress_streak,
+                'diagnosis_changed':assessment.diagnosis_changed,'required_gap_changed':assessment.required_gap_changed,
+                'contradiction_changed':assessment.contradiction_changed,'support_changed':assessment.support_changed,
+                'progress_signal':signal,
+            })
+            return assessment
+
         def _reflection_signature(bundle):
             if bundle is None:
                 payload={'root_id':getattr(current_need,'need_id',None),
@@ -444,24 +500,24 @@ class AgentHarness:
                 item=bundle.items[0]
                 projection=item.content or f'SOURCE {item.file}:{item.start_line}-{item.end_line} (shared projection already acquired)'
                 compact_bundle=(f'=== OBLIGATION {item.obligation_id} ===\n'
-                                f'SOURCE {item.file}:{item.start_line}-{item.end_line}\n{projection[:3500]}')
-                open_rows=json.dumps([x for x in (obligations.summary() if obligations is not None else [])
-                                      if x.get('obligation_id')==item.obligation_id],ensure_ascii=False,default=str)[:1800]
-                issue=task.issue[:1800]
-                hyp=json.dumps(state.current_hypothesis or {},ensure_ascii=False,default=str)[:2200]
+                                f'SOURCE {item.file}:{item.start_line}-{item.end_line}\n{line_safe_truncate(projection,3500)[0]}')
+                open_rows=line_safe_truncate(json.dumps([x for x in (obligations.summary() if obligations is not None else [])
+                                      if x.get('obligation_id')==item.obligation_id],ensure_ascii=False,default=str),1800)[0]
+                issue=line_safe_truncate(task.issue,1800)[0]
+                hyp=line_safe_truncate(json.dumps(state.current_hypothesis or {},ensure_ascii=False,default=str),2200)[0]
                 text=("COMPACT_FOCUSED_REFLECTION_RETRY\nISSUE_SUMMARY:\n"+issue+
                       "\n\nCURRENT_HYPOTHESIS:\n"+hyp+"\n\nTARGET_OBLIGATION:\n"+open_rows+
                       "\n\nEXACT_SOURCE_PROJECTION:\n"+compact_bundle)
             else:
-                issue=task.issue[:5000]
-                hyp=json.dumps(state.current_hypothesis or {},ensure_ascii=False,default=str)[:7000]
-                open_rows=json.dumps(obligations.summary() if obligations is not None else [],ensure_ascii=False,default=str)[:5000]
+                issue=line_safe_truncate(task.issue,5000)[0]
+                hyp=line_safe_truncate(json.dumps(state.current_hypothesis or {},ensure_ascii=False,default=str),7000)[0]
+                open_rows=line_safe_truncate(json.dumps(obligations.summary() if obligations is not None else [],ensure_ascii=False,default=str),5000)[0]
                 text=("FOCUSED_REFLECTION\nISSUE:\n"+issue+"\n\nCURRENT_HYPOTHESIS:\n"+hyp+
                       "\n\nOPEN_OBLIGATIONS:\n"+open_rows+"\n\nEVIDENCE_BUNDLE:\n"+bundle.text)
             cap=max(1, int(h.focused_reflection_max_chars))
             if target_chars is not None:
                 cap=min(cap,max(1,int(target_chars)))
-            text=text[:cap]
+            text=line_safe_head_tail(text,cap,marker='...[focused reflection context omitted]...')
             trace.record('FOCUSED_REFLECTION_CONTEXT_BUILT',{
                 'reflection_id':active_presentation_plans[0]['reflection_id'] if active_presentation_plans else None,
                 'obligation_ids':[x['obligation_id'] for x in active_presentation_plans[:1] if compact] or [x['obligation_id'] for x in active_presentation_plans],
@@ -561,27 +617,9 @@ class AgentHarness:
                     raise
 
             hs=hypothesis.state
-            if controller is not None:
-                old_mode=controller.state.mode
-                assessment=controller.assess_reflection(
-                    state.current_hypothesis,
-                    usage_totals=(_usage_snapshot(llm).get('totals') or {}),
-                    allow_budget_recovery=not rejected_since_last_evidence,
-                )
-                state.no_progress_count += int(assessment.kind is ProgressKind.NO_PROGRESS)
-                state.convergence_mode=controller.state.mode.value
-                state.forced_finalization=controller.state.forced_finalization
-                state.budget_critical_entered=controller.state.budget_critical_entered
-                state.first_supported_hypothesis_step=controller.state.first_supported_hypothesis_step
-                state.first_stable_diagnosis_step=controller.state.first_stable_diagnosis_step
-                state.prompt_tokens_at_first_stable_diagnosis=controller.state.prompt_tokens_at_first_stable_diagnosis
-                state.completion_tokens_at_first_stable_diagnosis=controller.state.completion_tokens_at_first_stable_diagnosis
-                state.tokens_at_first_stable_diagnosis=controller.state.tokens_at_first_stable_diagnosis
-                trace.record('PROGRESS' if assessment.kind is ProgressKind.PROGRESS else 'NO_PROGRESS',{
-                    'step':state.step,'reasons':assessment.reasons,'no_progress_streak':controller.state.no_progress_streak,
-                    'diagnosis_changed':assessment.diagnosis_changed,'required_gap_changed':assessment.required_gap_changed,
-                    'contradiction_changed':assessment.contradiction_changed,'support_changed':assessment.support_changed,
-                })
+            old_mode=controller.state.mode if controller is not None else None
+            assessment=_assess_convergence(review)
+            if controller is not None and assessment is not None:
                 if old_mode != controller.state.mode:
                     trace.record('CONVERGENCE_MODE_CHANGED',{'from':old_mode.value,'to':controller.state.mode.value,'step':state.step})
                 if controller.state.mode is ConvergenceMode.BUDGET_CRITICAL:
@@ -696,7 +734,7 @@ class AgentHarness:
                     trace.record('FALLBACK_REPORT_BUILT',{'evidence_ids':report.evidence_ids,'confidence':report.confidence,'primary_report_failure':asdict(failure)})
                     return report
                 if flags.fallback_reporter and state.evidence:
-                    report=fallback.build_from_evidence(task.task_id,state.evidence,candidates); state.report_source='fallback'; report.acquired_unreviewed=[{**x,'reason':'reporter_failed'} for x in ready_unreviewed]
+                    report=fallback.build_from_evidence(task.task_id,state.evidence,candidates,hypothesis=(hypothesis.state if hypothesis is not None else state.current_hypothesis)); state.report_source='fallback'; report.acquired_unreviewed=[{**x,'reason':'reporter_failed'} for x in ready_unreviewed]
                     report,_=apply_reporting_rules(report,evidence=state.evidence,repository_index=index,obligations=obligations,hypothesis=(hypothesis.state if hypothesis is not None else None))
                     if not getattr(reporter,'last_fallback_reason',None):
                         trace.record('REPORTER_FALLBACK_TRIGGERED',{'reason':'primary_failure','source':'evidence_fallback'})
@@ -737,7 +775,13 @@ class AgentHarness:
         def _acquire_observation(obs, *, need=None, mode='', action_tool='', update_need=True):
             """Phase A only: persist immutable observation/evidence facts. Semantic matching is separate."""
             nonlocal pending_route_recovery, rejected_since_last_evidence, pending_reconciliation, force_reflect
-            state.observations.append(obs); observations.add(obs); trace.record('TOOL_OBSERVATION',asdict(obs))
+            observations.add(obs)
+            source_tool=tools.get(obs.tool)
+            if source_tool is not None:
+                _truncate_observation_content(
+                    obs,min(h.max_tool_output_chars,source_tool.spec.output_limit or h.max_tool_output_chars)
+                )
+            state.observations.append(obs); trace.record('TOOL_OBSERVATION',asdict(obs))
             path_resolution=(obs.metadata or {}).get('path_resolution')
             if path_resolution: trace.record('PATH_RESOLVED',path_resolution)
             path_pattern=(obs.metadata or {}).get('path_pattern')
@@ -792,6 +836,68 @@ class AgentHarness:
                 'evidence_goal': evidence_goal or '',
             }
             return text.strip(), structured
+
+        def _reuse_read(arguments, information_need: str) -> bool:
+            """Route every Planner mode through the same Store/rehydrate boundary."""
+            nonlocal last_redundant_key, force_reflect
+            if not flags.observation_reuse:
+                return False
+            path=arguments.get('path'); start=arguments.get('start_line'); end=arguments.get('end_line')
+            if not path or not isinstance(start,int) or not isinstance(end,int):
+                return False
+            try:
+                resolved=tools.path_resolver.resolve_file(path,mode=ResolutionMode.READ_TOLERANT)
+                if resolved.strategy != 'exact_relative' or resolved.relative_path != path:
+                    trace.record('PATH_RESOLVED',{**resolved.metadata(str(path)),'stage':'pre_reuse'})
+                path=resolved.relative_path; arguments['path']=path
+            except RepositoryPathError:
+                pass
+            hit=coverage.find_covering(path=path,start_line=start,end_line=end)
+            if not hit:
+                return False
+            observation=observations.get(hit.observation_id)
+            if observation is None:
+                return False
+            need=normalize_target(information_need)
+            request_key=(normalize_location(path,repo),start,end,need)
+            visible=ctxmgr.is_visible_range(hit.path,start,end)
+            same_need=request_key==last_redundant_key
+            if visible and same_need:
+                state.redundant_request_count+=1
+                streak=controller.note_redundant() if controller is not None else 1
+                trace.record('REDUNDANT_CONTEXT_REQUEST',{
+                    'requested':{'path':path,'start_line':start,'end_line':end},
+                    'covered_by':observation.observation_id,'information_need':need,
+                    'redundant_request_streak':streak,
+                    'message':'requested source is already fully visible; reason from current context',
+                })
+                if streak>=2:
+                    force_reflect=True
+            else:
+                ctxmgr.rehydrate(
+                    observation.observation_id,path=hit.path,start_line=start,end_line=end,
+                    information_need=need,
+                )
+                state.observation_reuse_count+=1; state.rehydration_count+=1
+                state.rehydration_saved_tool_calls+=1
+                state.rehydration_saved_chars+=len(observation.content or '')
+                if controller is not None:
+                    controller.note_nonredundant_action()
+                payload={
+                    'requested':{'path':path,'start_line':start,'end_line':end},
+                    'reused_observation_id':observation.observation_id,
+                    'original_coverage':{'start_line':hit.start_line,'end_line':hit.end_line},
+                    'information_need':need,'information_need_satisfied':True,
+                    'was_visible':visible,'saved_tool_calls':1,
+                    'saved_chars':len(observation.content or ''),
+                }
+                trace.record('OBSERVATION_REHYDRATED',payload)
+                if start > hit.start_line or end < hit.end_line:
+                    trace.record('OBSERVATION_SUBRANGE_REHYDRATED',payload)
+                trace.record('OBSERVATION_REUSED',payload)
+                force_reflect=True
+            last_redundant_key=request_key
+            return True
 
         try:
             repo=Path(task.repo_path).resolve()
@@ -958,15 +1064,17 @@ class AgentHarness:
                             if isinstance(review, ReflectionDecision):
                                 trace.record('SEMANTIC_REDUCER_STARTED', {'reflection_id': reflection_id, 'typed': True})
                                 typed_reducer.evidence=list(state.evidence)
-                                candidate=typed_reducer.reduce_and_commit(review, reflection_id=reflection_id, presented_evidence_ids=set())
+                                candidate=typed_reducer.reduce_and_commit(review, reflection_id=reflection_id, presented_evidence_ids=set(), step=state.step)
                                 semantic_revision=candidate.revision
                                 state.current_hypothesis=asdict(candidate.hypothesis)
+                                trace.record('HYPOTHESIS_UPDATED', state.current_hypothesis)
                                 review={
                                     'decision': review.decision,
                                     'evidence_sufficient': candidate.hypothesis.evidence_sufficient,
                                     'supporting_evidence_ids': candidate.hypothesis.supporting_evidence_ids,
                                     'contradicting_evidence_ids': candidate.hypothesis.contradicting_evidence_ids,
                                 }
+                                _assess_convergence(review)
                             elif flags.hypothesis_state:
                                 trace.record('SEMANTIC_REDUCER_STARTED', {'reflection_id': reflection_id, 'typed': False})
                                 review=update_hypothesis(review,reflection_id=reflection_id)
@@ -1000,7 +1108,16 @@ class AgentHarness:
                         # semantic_no_progress_streak counts only successful semantic
                         # transactions. It may trigger conservative finalization, but
                         # never while READY evidence still awaits review.
-                        if semantic_no_progress_streak >= max(1,int(h.semantic_no_progress_limit)) and not force_reflect and state.evidence:
+                        controller_no_progress=(controller is not None and
+                                                controller.state.no_progress_streak >= max(1,int(h.semantic_no_progress_limit)))
+                        if (semantic_no_progress_streak >= max(1,int(h.semantic_no_progress_limit)) or controller_no_progress) and not force_reflect and state.evidence:
+                            trace.record('CONVERGENCE_EARLY_FINALIZATION',{
+                                'step':state.step,
+                                'reason':'no_information_gain',
+                                'semantic_no_progress_streak':semantic_no_progress_streak,
+                                'controller_no_progress_streak':controller.state.no_progress_streak if controller is not None else None,
+                                'limit':h.semantic_no_progress_limit,
+                            })
                             finalize_now('semantic_no_progress_limit'); break
                         post_reflection_budget=_budget_snapshot('post_reflection')
                         if state.status=='budget_exhausted': break
@@ -1097,6 +1214,20 @@ class AgentHarness:
                         reason=planned.reason, expected_evidence=planned.expected_evidence,
                         retain_context_ids=planned.retain_context_ids,
                     ) for call in planned.tool_calls]
+                    requests = [
+                        request for request in requests
+                        if not (request.name == 'read_file' and _reuse_read(
+                            request.arguments,
+                            planned.information_need or planned.expected_evidence or planned.reason,
+                        ))
+                    ]
+                    if not requests:
+                        trace.record('NATIVE_PLANNER_NO_TOOL_TURN', {
+                            'has_content': bool(planned.assistant_text),
+                            'policy_decision': 'rehydrate_then_reflect',
+                        })
+                        force_reflect=True
+                        continue
                     orchestrator.max_tool_calls=max(0, h.max_tool_calls-state.tool_calls)
                     try:
                         execution_plan=orchestrator.build_plan(requests)
@@ -1140,9 +1271,6 @@ class AgentHarness:
                         state.failure=failure; state.status='failed'; break
                     acquired_ids=[]; any_gain=False
                     for obs in native_observations:
-                        tool=tools.get(obs.tool)
-                        if tool is not None:
-                            _truncate_observation_content(obs,min(h.max_tool_output_chars,tool.spec.output_limit or h.max_tool_output_chars))
                         ev=_acquire_observation(obs,need=current_need,mode='native_tool_calling',action_tool=obs.tool,update_need=False)
                         if ev: acquired_ids.append(ev.evidence_id); any_gain=True
                     if current_need is not None and need_tracker is not None:
@@ -1242,54 +1370,12 @@ class AgentHarness:
                     force_reflect=True
                     continue
 
-                # Coverage/reuse precedes exact-repeat blocking for read_file. V1.3.1 distinguishes
-                # already-visible redundant requests from cold observations that must be rehydrated.
-                reused=False
-                if flags.observation_reuse and action.tool=='read_file':
-                    p=action.arguments.get('path'); sline=action.arguments.get('start_line'); eline=action.arguments.get('end_line')
-                    if p and isinstance(sline,int) and isinstance(eline,int):
-                        # Canonicalize before coverage lookup so equivalent spellings (./a.py,
-                        # Windows separators, unique read-only suffix/basename hints) share the
-                        # same immutable observation identity. Ambiguity/not-found is left to the
-                        # Tool to return as a structured observation.
-                        try:
-                            resolved_path=tools.path_resolver.resolve_file(p,mode=ResolutionMode.READ_TOLERANT)
-                            if resolved_path.strategy != 'exact_relative' or resolved_path.relative_path != p:
-                                trace.record('PATH_RESOLVED',{**resolved_path.metadata(str(p)),'stage':'pre_reuse'})
-                            p=resolved_path.relative_path; action.arguments['path']=p
-                        except RepositoryPathError:
-                            pass
-                        hit=coverage.find_covering(path=p,start_line=sline,end_line=eline)
-                        if hit:
-                            obs=observations.get(hit.observation_id)
-                            if obs is not None:
-                                need=normalize_target(action.information_need or action.expected_evidence or action.reason)
-                                req_key=(normalize_location(p,repo),sline,eline,need)
-                                visible=ctxmgr.is_visible_range(hit.path,sline,eline)
-                                same_need=(req_key==last_redundant_key)
-                                if visible and same_need:
-                                    state.redundant_request_count+=1; reused=True
-                                    streak=controller.note_redundant() if controller is not None else 1
-                                    trace.record('REDUNDANT_CONTEXT_REQUEST',{
-                                        'requested':{'path':p,'start_line':sline,'end_line':eline},'covered_by':obs.observation_id,
-                                        'information_need':need,'redundant_request_streak':streak,'message':'requested source is already fully visible; reason from current context',
-                                    })
-                                    if streak>=2: force_reflect=True
-                                else:
-                                    ctxmgr.rehydrate(obs.observation_id,path=hit.path,start_line=sline,end_line=eline,information_need=need); state.observation_reuse_count+=1; state.rehydration_count+=1; state.rehydration_saved_tool_calls+=1; state.rehydration_saved_chars+=len(obs.content or ''); reused=True
-                                    if controller is not None: controller.note_nonredundant_action()
-                                    payload={
-                                        'requested':{'path':p,'start_line':sline,'end_line':eline},'reused_observation_id':obs.observation_id,
-                                        'original_coverage':{'start_line':hit.start_line,'end_line':hit.end_line},
-                                        'information_need':need,'information_need_satisfied':True,'was_visible':visible,'saved_tool_calls':1,'saved_chars':len(obs.content or ''),
-                                    }
-                                    trace.record('OBSERVATION_REHYDRATED',payload)
-                                    if sline > hit.start_line or eline < hit.end_line:
-                                        trace.record('OBSERVATION_SUBRANGE_REHYDRATED',payload)
-                                    trace.record('OBSERVATION_REUSED',payload)  # backward-compatible aggregate event
-                                    force_reflect = True
-                                last_redundant_key=req_key
-                if reused: continue
+                # Native and legacy Planner modes share one immutable Store/rehydrate path.
+                if action.tool=='read_file' and _reuse_read(
+                    action.arguments,
+                    action.information_need or action.expected_evidence or action.reason,
+                ):
+                    continue
 
                 if controller is not None:
                     controller.note_nonredundant_action(); last_redundant_key=None
@@ -1325,8 +1411,7 @@ class AgentHarness:
                     finally:
                         budget_gate.release(reservation)
                     for child in group.children:
-                        obs=child.observation; tool=tools.get(child.tool)
-                        effective_limit=min(h.max_tool_output_chars,tool.spec.output_limit or h.max_tool_output_chars); _truncate_observation_content(obs,effective_limit)
+                        obs=child.observation
                         ev=_acquire_observation(obs,need=current_need,mode='parallel',action_tool=child.tool,update_need=False)
                         if ev: acquired_ids.append(ev.evidence_id); any_gain=True
                         for derived in _expand_inspect_sources(obs):
@@ -1355,7 +1440,6 @@ class AgentHarness:
                         obs=execute_with_retry(tool,action.arguments,policy=retry_policy,absolute_deadline=time.monotonic()+min(attempt_budget,hard_remaining),on_retry=lambda n,o: trace.record('TOOL_RETRY',{'attempt':n,'tool':action.tool,'error':o.content[:500]}))
                     finally:
                         budget_gate.release(reservation)
-                    effective_limit=min(h.max_tool_output_chars,tool.spec.output_limit or h.max_tool_output_chars); _truncate_observation_content(obs,effective_limit)
                     # Record retrieval telemetry only after all source observations derived
                     # from this single Action have been acquired.  In particular,
                     # inspect_symbol_context(include_source=true) is one Action that

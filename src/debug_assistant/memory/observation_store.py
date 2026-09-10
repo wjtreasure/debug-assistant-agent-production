@@ -1,4 +1,5 @@
 from __future__ import annotations
+import copy
 from debug_assistant.models import ToolObservation
 
 class ObservationStore:
@@ -9,14 +10,13 @@ class ObservationStore:
     def add(self, obs: ToolObservation) -> None:
         if obs.observation_id not in self._items:
             self._order.append(obs.observation_id)
-        self._items[obs.observation_id] = obs
+        # The Store is the immutable rehydration source. Runtime may later bound a
+        # state/trace copy, but that must not corrupt the authoritative Observation.
+        self._items[obs.observation_id] = copy.deepcopy(obs)
 
     def get(self, observation_id: str) -> ToolObservation | None:
-        return self._items.get(observation_id)
-
-    def recent(self, n: int) -> list[ToolObservation]:
-        if n <= 0: return []
-        return [self._items[x] for x in self._order[-n:] if x in self._items]
+        item=self._items.get(observation_id)
+        return copy.deepcopy(item) if item is not None else None
 
     def all(self) -> list[ToolObservation]:
-        return [self._items[x] for x in self._order if x in self._items]
+        return [copy.deepcopy(self._items[x]) for x in self._order if x in self._items]

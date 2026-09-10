@@ -31,6 +31,8 @@ class OpenAICompatibleClient(LLMClient):
     attempts share the same deadline rather than receiving independent timeout budgets.
     """
 
+    requires_process_timeout = True
+
     def __init__(
         self,
         base_url: str,

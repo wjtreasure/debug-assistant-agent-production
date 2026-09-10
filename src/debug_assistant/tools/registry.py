@@ -3,7 +3,10 @@ import json
 from typing import Any
 from pydantic import ValidationError
 from debug_assistant.contracts import compact_validation_error
-from .repository import RepoTreeTool,GrepTool,ReadFileTool,SymbolSearchTool,GitLogTool,GitShowTool,DiscoverTestsTool
+from .repository import (
+    RepoTreeTool, GrepTool, ReadFileTool, SymbolSearchTool, GitLogTool,
+    GitShowTool, DiscoverTestsTool, REPOSITORY_SOURCE_MAX_LINES,
+)
 from .indexed import CodeSearchTool,IndexedSymbolSearchTool,InspectSymbolContextTool
 from debug_assistant.repository.safe_fs import SafeRepositoryFS
 from debug_assistant.repository.paths import RepositoryPathResolver, RepositoryPathMatcher
@@ -15,7 +18,7 @@ PARALLEL_ALLOWED_TOOLS = frozenset({
 })
 
 class ToolRegistry:
-    def __init__(self, repo_root, index=None, fs=None):
+    def __init__(self, repo_root, index=None, fs=None, *, code_search_default_mode='lexical'):
         self.fs=fs or SafeRepositoryFS(repo_root)
         self.path_resolver=RepositoryPathResolver(self.fs)
         self.path_matcher=RepositoryPathMatcher()
@@ -23,7 +26,7 @@ class ToolRegistry:
         symbol=IndexedSymbolSearchTool(index) if index is not None else SymbolSearchTool(repo_root,**kw)
         tools=[RepoTreeTool(repo_root,**kw),GrepTool(repo_root,**kw),ReadFileTool(repo_root,**kw),symbol,GitLogTool(repo_root,**kw),GitShowTool(repo_root,**kw),DiscoverTestsTool(repo_root,**kw)]
         if index is not None:
-            tools.insert(2,CodeSearchTool(index))
+            tools.insert(2,CodeSearchTool(index, default_mode=code_search_default_mode))
             tools.insert(3,InspectSymbolContextTool(index))
         self._tools={t.spec.name:t for t in tools}
 
@@ -60,7 +63,7 @@ class ToolRegistry:
         """Apply only deterministic, semantics-preserving mechanical repairs.
 
         V1.3.2.2 intentionally keeps this tiny. For read_file, an inclusive range
-        wider than 200 lines is clamped to the first 200 requested lines. Ambiguous
+        wider than the repository source bound is clamped to that bound. Ambiguous
         path/name/type errors are never guessed or repaired here.
         """
         if name != 'read_file' or not isinstance(args,dict):
@@ -69,21 +72,21 @@ class ToolRegistry:
             return None,None
         try:
             start=int(args.get('start_line',1))
-            end=int(args.get('end_line',200))
+            end=int(args.get('end_line',REPOSITORY_SOURCE_MAX_LINES))
         except (TypeError,ValueError):
             return None,None
-        if start < 1 or end < start or (end-start+1) <= 200:
+        if start < 1 or end < start or (end-start+1) <= REPOSITORY_SOURCE_MAX_LINES:
             return None,None
         repaired=dict(args)
         repaired['start_line']=start
-        repaired['end_line']=start+199
+        repaired['end_line']=start+REPOSITORY_SOURCE_MAX_LINES-1
         return repaired,{
             'tool':'read_file',
-            'reason':'inclusive_range_exceeds_200_lines',
+            'reason':'inclusive_range_exceeds_repository_source_bound',
             'original_arguments':dict(args),
             'repaired_arguments':dict(repaired),
             'requested_line_count':end-start+1,
-            'repaired_line_count':200,
+            'repaired_line_count':REPOSITORY_SOURCE_MAX_LINES,
         }
 
     def render(self, compact: bool=False):

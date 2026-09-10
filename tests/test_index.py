@@ -8,3 +8,18 @@ def test_task_index(tmp_path):
     assert any(x['name']=='alpha_value' for x in idx.symbols('alpha'))
     assert any(x['path']=='pkg/a.py' for x in idx.search('alpha_value'))
     idx.close()
+
+
+def test_lexical_search_accepts_punctuated_multiline_issue_text(tmp_path):
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    (repo / 'schema.py').write_text(
+        "def _invoke_field_validators(data):\n"
+        "    return data['value']\n"
+    )
+    idx = RepositoryIndex(repo, tmp_path / 'idx.sqlite')
+    idx.build()
+    issue = "TypeError: 'NoneType' object is not subscriptable\n"
+    issue += "Failure at _invoke_field_validators(data=result)."
+    assert any(row['path'] == 'schema.py' for row in idx.search(issue))
+    idx.close()

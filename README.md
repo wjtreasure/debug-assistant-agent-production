@@ -199,10 +199,12 @@ redacted from runtime artifacts.
 ## Traces and metrics
 
 Tasks emit JSONL traces containing lifecycle, tool, evidence, obligation,
-reflection, budget, and finalization events. The evaluation tools report
-localization quality such as File Hit@k, MRR, symbol/range hits, and prediction
-coverage, alongside runtime health indicators such as fallbacks, route
-rejections, partial results, and forced finalization.
+reflection, budget, and finalization events. The evaluation tools separate
+`fix_localization` (based on `recommended_change_points`) from `exploration`
+(based on `likely_files` and trace evidence), alongside runtime health
+indicators such as fallbacks, route rejections, partial results, and forced
+finalization. See [docs/evaluation.md](docs/evaluation.md) for the formal
+schema and metric definitions.
 
 ## Versioned experiments
 

@@ -20,7 +20,7 @@ def _skill_hash():
 def _dataset_hash(root:Path,candidates:list[Path]):
     h=hashlib.sha256()
     for d in candidates:
-        for name in ('task.json','issue.md','ground_truth.json'):
+        for name in ('task.json','issue.md','ground_truth.json','evaluation_only.json'):
             p=d/name
             if p.exists():
                 h.update(str(d.name+'/'+name).encode()); h.update(p.read_bytes())

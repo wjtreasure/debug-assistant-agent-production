@@ -1,6 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
-import ast, sqlite3, time, threading
+import ast, re, sqlite3, time, threading
 from .safe_fs import SafeRepositoryFS, TEXT_SUFFIXES
 
 
@@ -95,8 +95,33 @@ class RepositoryIndex:
     def search(self,query,limit=40):
         limit=min(int(limit),100); rows=[]
         if self.fts:
-            q=' OR '.join(x.replace('"','') for x in str(query).split() if x) or str(query)
-            try:rows=self._fetchall('SELECT path, snippet(files_fts,1,"[","]"," … ",18), bm25(files_fts) FROM files_fts WHERE files_fts MATCH ? ORDER BY bm25(files_fts) LIMIT ?',(q,limit))
+            # Issue text is arbitrary user/provider input. Passing whitespace
+            # chunks directly to FTS5 makes punctuation such as ``:``/``(``
+            # become query syntax and can invalidate the whole MATCH clause.
+            # Keep the existing OR-style lexical retrieval, but build a safe
+            # token query instead of falling back to an impossible full-text
+            # LIKE match for a multi-line issue.
+            raw_terms = re.findall(r"[\w]+", str(query), flags=re.UNICODE)
+            terms = []
+            seen = set()
+            for term in raw_terms:
+                key = term.casefold()
+                if len(term) < 2 or key in seen:
+                    continue
+                seen.add(key)
+                terms.append(term)
+            # Very long stack traces can contain thousands of unique tokens.
+            # Prefer longer, identifier-like terms while retaining original
+            # order; this keeps the query bounded and preserves useful names.
+            if len(terms) > 64:
+                selected = sorted(
+                    enumerate(terms), key=lambda item: (-len(item[1]), item[0]),
+                )[:64]
+                terms = [term for _, term in sorted(selected)]
+            q = " OR ".join(f'"{term}"' for term in terms)
+            try:
+                if q:
+                    rows=self._fetchall('SELECT path, snippet(files_fts,1,"[","]"," … ",18), bm25(files_fts) FROM files_fts WHERE files_fts MATCH ? ORDER BY bm25(files_fts) LIMIT ?',(q,limit))
             except sqlite3.OperationalError:rows=[]
         if not rows:
             like=f'%{query}%'; rows=[(*r,0.0) for r in self._fetchall('SELECT path, substr(content,1,800) FROM files_fts WHERE content LIKE ? OR path LIKE ? LIMIT ?',(like,like,limit))]
@@ -106,12 +131,209 @@ class RepositoryIndex:
         like=f'%{query}%'; rows=self._fetchall('SELECT path,name,qualified_name,kind,start_line,end_line FROM symbols WHERE name LIKE ? OR qualified_name LIKE ? ORDER BY length(name),path LIMIT ?',(like,like,min(int(limit),100)))
         return [{'path':r[0],'name':r[1],'qualified_name':r[2],'kind':r[3],'start_line':r[4],'end_line':r[5]} for r in rows]
 
+    def _symbols_in_files(self, files, *, limit_per_file=100):
+        """Return indexed Python declarations restricted to candidate files.
+
+        This deliberately does not use the global ``symbols()`` result as a
+        candidate generator.  A refinement pass must inspect the files already
+        recalled by Hybrid; a repository-wide symbol hit is not a new retrieval
+        candidate.
+        """
+        paths=tuple(dict.fromkeys(str(path) for path in files if str(path)))
+        if not paths:
+            return []
+        placeholders=','.join('?' for _ in paths)
+        rows=self._fetchall(
+            f'SELECT path,name,qualified_name,kind,start_line,end_line '
+            f'FROM symbols WHERE path IN ({placeholders}) '
+            f'ORDER BY path,length(name),start_line',
+            paths,
+        )
+        grouped={path:[] for path in paths}
+        for row in rows:
+            if len(grouped[row[0]]) < max(1,int(limit_per_file)):
+                grouped[row[0]].append({
+                    'path':row[0], 'name':row[1], 'qualified_name':row[2],
+                    'kind':row[3], 'start_line':row[4], 'end_line':row[5],
+                })
+        return [item for path in paths for item in grouped[path]]
+
     def resolve_symbol(self,symbol:str,file:str|None=None):
         rows=self.symbols(symbol,100)
         exact=[r for r in rows if symbol in {r['name'],r['qualified_name']} or r['qualified_name'].endswith('.'+symbol)]
         if file:exact=[r for r in exact if r['path']==file]
         uniq={(r['path'],r['qualified_name'],r['start_line'],r['end_line']):r for r in exact}
         return list(uniq.values())
+
+    def refine_hybrid_candidates(self, rows, query, *, limit=20,
+                                 max_symbols_per_file=8,
+                                 max_callers=3, max_callees=3):
+        """Refine Hybrid files with bounded, existing Python AST evidence.
+
+        The input rows are the complete candidate boundary.  This method never
+        adds a file returned by a global symbol lookup.  It enriches each
+        candidate with declaration ranges and, when a symbol resolves uniquely,
+        direct caller/callee metadata from the existing call table.  Source is
+        intentionally not read here; runtime verification must use ``read_file``.
+        """
+        started=time.monotonic()
+        candidate_rows=[]; seen=set()
+        for row in list(rows or [])[:max(1,int(limit))]:
+            path=str(row.get('path') or '')
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            candidate_rows.append(dict(row))
+        if not candidate_rows:
+            return [], {
+                'ast_available':False, 'ast_status':'unavailable',
+                'candidate_count':0, 'matched_symbol_count':0,
+                'supported_candidate_count':0, 'unsupported_candidate_count':0,
+                'relations_used':0, 'elapsed_ms':int((time.monotonic()-started)*1000),
+            }
+
+        supported_paths={
+            row['path'] for row in candidate_rows
+            if str(row['path']).casefold().endswith('.py')
+        }
+        unsupported_count=len(candidate_rows)-len(supported_paths)
+        if not supported_paths:
+            return candidate_rows[:max(1,int(limit))], {
+                'ast_available':False, 'ast_status':'unsupported_language',
+                'candidate_count':len(candidate_rows), 'matched_symbol_count':0,
+                'supported_candidate_count':0,
+                'unsupported_candidate_count':unsupported_count,
+                'relations_used':0, 'elapsed_ms':int((time.monotonic()-started)*1000),
+            }
+
+        # The index is Python-AST based.  If it has no declarations, callers
+        # receive the unchanged Hybrid result with an explicit degradation state.
+        if not self._fetchall('SELECT 1 FROM symbols LIMIT 1'):
+            return candidate_rows[:max(1,int(limit))], {
+                'ast_available':False, 'ast_status':'unavailable',
+                'candidate_count':len(candidate_rows), 'matched_symbol_count':0,
+                'supported_candidate_count':len(supported_paths),
+                'unsupported_candidate_count':unsupported_count,
+                'relations_used':0, 'elapsed_ms':int((time.monotonic()-started)*1000),
+            }
+
+        tokens=[]; token_set=set()
+        for token in re.findall(r'\b[A-Za-z_][A-Za-z0-9_]{2,}\b',str(query)):
+            key=token.casefold()
+            if key not in token_set:
+                token_set.add(key); tokens.append(key)
+            if len(tokens)>=64:
+                break
+        symbols=self._symbols_in_files(
+            [row['path'] for row in candidate_rows],
+            limit_per_file=max_symbols_per_file*4,
+        )
+        by_path={}
+        for symbol in symbols:
+            name=str(symbol.get('name') or '').casefold()
+            qualified=str(symbol.get('qualified_name') or '').casefold()
+            components={part for part in qualified.split('.') if part}
+            exact_name=name in token_set
+            qualified_component=bool(components & token_set)
+            qualified_query=bool('.' in qualified and qualified in str(query).casefold())
+            if not (exact_name or qualified_component):
+                continue
+            strength=0.65 if exact_name else 0.45
+            if qualified_query:
+                strength+=0.15
+            item=dict(symbol)
+            item['_match_strength']=min(1.0,strength)
+            by_path.setdefault(symbol['path'],[]).append(item)
+
+        total_matches=0; relation_count=0
+        for row in candidate_rows:
+            matched=sorted(
+                by_path.get(row['path'],[]),
+                key=lambda item:(-float(item['_match_strength']),
+                                 len(str(item.get('qualified_name') or '')),
+                                 int(item.get('start_line') or 0)),
+            )[:max(1,int(max_symbols_per_file))]
+            public=[]
+            for symbol in matched:
+                query_symbol=str(symbol.get('qualified_name') or symbol.get('name') or '')
+                relation={}
+                try:
+                    relation=self.inspect_symbol_context(
+                        query_symbol, row['path'], include_source=False,
+                        max_callers=max_callers, max_callees=max_callees,
+                    )
+                except Exception:
+                    relation={}
+                callers=list(relation.get('callers') or []) if relation.get('ok') else []
+                callees=list(relation.get('callees') or []) if relation.get('ok') else []
+                relation_total=len(callers)+len(callees)
+                relation_count+=relation_total
+                structural=min(
+                    1.0,
+                    float(symbol['_match_strength'])
+                    + min(0.20, 0.05*relation_total)
+                    + (0.10 if len(matched)>1 else 0.0),
+                )
+                public.append({
+                    'symbol':query_symbol,
+                    'name':symbol.get('name'),
+                    'qualified_name':symbol.get('qualified_name'),
+                    'kind':symbol.get('kind'),
+                    'file':symbol.get('path'),
+                    'source_range':[int(symbol['start_line']),int(symbol['end_line'])],
+                    'start_line':int(symbol['start_line']),
+                    'end_line':int(symbol['end_line']),
+                    'callers':callers,
+                    'callees':callees,
+                    'structural_relevance':structural,
+                })
+            total_matches+=len(public)
+            row['matched_symbols']=public
+            row['source_ranges']=[item['source_range'] for item in public]
+            row['structural_relevance']=max(
+                (item['structural_relevance'] for item in public), default=0.0,
+            )
+            row['caller_count']=sum(len(item['callers']) for item in public)
+            row['callee_count']=sum(len(item['callees']) for item in public)
+
+        if total_matches:
+            # Calibrate the structural bonus to the largest existing Hybrid
+            # score.  RRF scores are intentionally small; an absolute bonus
+            # would otherwise let one weak symbol outrank a strong Hybrid hit.
+            # A lone exact declaration is useful location metadata, but is not
+            # enough structural evidence to change the Hybrid order.  Call
+            # relations or multiple matches must provide the extra signal.
+            hybrid_scores=[float(row.get('score') or 0.0) for row in candidate_rows]
+            reference=max(hybrid_scores,default=0.0)
+            if reference<=0.0:
+                reference=1.0
+                hybrid_scores=[1.0/(index+1) for index in range(len(candidate_rows))]
+            for index,row in enumerate(candidate_rows):
+                base=float(row.get('score') or 0.0)
+                if base<=0.0:
+                    base=hybrid_scores[index]
+                relevance=float(row.get('structural_relevance') or 0.0)
+                calibrated=max(0.0,min(1.0,(relevance-0.65)/0.35))
+                row['score']=base + reference*0.10*calibrated
+                if row.get('structural_relevance'):
+                    row['source']=f"{row.get('source','hybrid')}+ast_refinement"
+            candidate_rows.sort(
+                key=lambda row:(-float(row.get('score') or 0.0),str(row.get('path') or '')),
+            )
+            status='applied'
+        else:
+            status='available_no_match'
+        for row in candidate_rows:
+            row.pop('_match_strength',None)
+        return candidate_rows[:max(1,int(limit))], {
+            'ast_available':True, 'ast_status':status,
+            'candidate_count':len(candidate_rows),
+            'matched_symbol_count':total_matches,
+            'supported_candidate_count':len(supported_paths),
+            'unsupported_candidate_count':unsupported_count,
+            'relations_used':relation_count,
+            'elapsed_ms':int((time.monotonic()-started)*1000),
+        }
 
     def _source(self,path,start,end,max_chars):
         try:lines=self.fs.read_text(path,max_bytes=1_000_000).splitlines(); a=max(1,int(start)); b=min(len(lines),int(end)); txt='\n'.join(f'{i:5d} | {lines[i-1]}' for i in range(a,b+1)); return txt[:max_chars]

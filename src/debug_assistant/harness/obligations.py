@@ -499,6 +499,18 @@ class EvidenceObligationTracker:
         child, tr=self._upsert(raw, required=True, refined_from=obligation_id)
         if child is None:
             return None, []
+        # A typed Reflection may emit the same child both as a new requirement
+        # and as the target of an explicit ``refine`` review. ``sync`` creates
+        # that child first without lineage; the explicit review is authoritative
+        # for the relationship, so repair the missing back-reference here before
+        # superseding the parent.
+        if child.obligation_id != obligation_id and child.refined_from is None:
+            child.refined_from = obligation_id
+            self._event("OBLIGATION_REFINEMENT_LINK_REPAIRED", {
+                "parent_obligation_id": obligation_id,
+                "child_obligation_id": child.obligation_id,
+                "reason": "child_already_emitted_as_new_requirement",
+            })
         transitions=[]
         if tr: transitions.append(tr)
         if child.obligation_id != obligation_id and self.mark_superseded(obligation_id, child.obligation_id):

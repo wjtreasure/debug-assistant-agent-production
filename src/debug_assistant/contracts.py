@@ -215,13 +215,26 @@ class ReportClaim(StrictModel):
 
 class ChangePoint(StrictModel):
     file: str = ""
-    symbol: str = ""
+    symbol: str | None = None
+    line_start: int | None = Field(default=None, ge=1)
+    line_end: int | None = Field(default=None, ge=1)
     reason: str = ""
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    supporting_evidence_ids: list[str] = Field(default_factory=list)
+    supporting_hypothesis_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_range(self):
+        if (self.line_start is None) ^ (self.line_end is None):
+            raise ValueError("line_start and line_end must be provided together")
+        if self.line_start is not None and self.line_end < self.line_start:
+            raise ValueError("line_end must be >= line_start")
+        return self
 
 class DiagnosisReportContract(StrictModel):
     summary: str = ""
     root_cause: str = ""
-    likely_files: list[str] = Field(default_factory=list)
+    likely_files: list[str] = Field(default_factory=list, max_length=3)
     likely_symbols: list[str] = Field(default_factory=list)
     likely_file_source: Literal["llm", "hypothesis", "partial_hypothesis", "evidence_fallback"] = "llm"
     impact_scope: list[str] = Field(default_factory=list)

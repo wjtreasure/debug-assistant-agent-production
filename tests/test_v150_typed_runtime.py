@@ -4,6 +4,7 @@ import pytest
 import httpx
 
 from debug_assistant.agent.planner import NativePlannerContractError, NativeToolPlanner, PlannerContractError
+from debug_assistant.agent.reflection import TypedReflection
 from debug_assistant.contracts import ReflectionDecision
 from debug_assistant.harness.obligations import EvidenceObligationTracker
 from debug_assistant.harness.semantic_reducer import SemanticReducer
@@ -127,6 +128,23 @@ def test_reflection_decision_does_not_accept_derived_state_fields():
         ReflectionDecision.model_validate({"diagnosis": "x", "evidence_sufficient": True})
 
 
+def test_typed_reflection_drops_only_incomplete_line_hint():
+    client = MockLLMClient(responses=[{
+        "decision": "continue",
+        "diagnosis": "partial",
+        "new_requirements": [{
+            "target": "source",
+            "file": "src/a.py",
+            "line_start": 12,
+            "reason": "inspect source",
+        }],
+    }])
+    result = TypedReflection(client).review("context")
+    assert result.new_requirements[0].file == "src/a.py"
+    assert result.new_requirements[0].line_start is None
+    assert result.new_requirements[0].line_end is None
+
+
 def test_semantic_reducer_never_supports_with_required_gap(tmp_path):
     tracker = EvidenceObligationTracker(repo_root=tmp_path)
     manager = HypothesisManager(tmp_path)
@@ -204,6 +222,67 @@ def test_native_runtime_enters_orchestrator_without_parallel_json(monkeypatch, t
     assert "SEMANTIC_REDUCER_RESULT" in types
     assert "DERIVED_HYPOTHESIS_STATE" in types
     assert "ACTION_PROPOSED" not in types
+
+
+def test_native_runtime_reuses_covered_reads_through_context_manager(monkeypatch, tmp_path):
+    from debug_assistant.config import AppConfig, HarnessConfig, ModelConfig
+    from debug_assistant.harness.runtime import AgentHarness
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "a.py").write_text("needle = 1\n" * 80)
+
+    class NativeReuseLLM:
+        capabilities = ProviderCapabilities(tool_calling=True, parallel_tool_calls=True)
+
+        def __init__(self):
+            self.calls = []
+            self.native_calls = 0
+
+        def _usage(self):
+            usage = {"model": "fake", "prompt_tokens": 1, "completion_tokens": 1,
+                     "total_tokens": 2, "input_tokens": 1, "output_tokens": 1}
+            self.calls.append(usage)
+            return usage
+
+        def complete_with_tools(self, system, user, *, tools, **kwargs):
+            self.native_calls += 1
+            if self.native_calls == 1:
+                calls = (LLMToolCall("r1", "read_file", {"path": "a.py", "start_line": 1, "end_line": 20}),)
+            elif self.native_calls == 2:
+                calls = (LLMToolCall("r2", "read_file", {"path": "./a.py", "start_line": 5, "end_line": 10}),)
+            else:
+                calls = ()
+            return LLMResponse(content="inspect", tool_calls=calls, usage=self._usage())
+
+        def complete_json(self, system, user, **kwargs):
+            self._usage()
+            if "FINAL_REPORT_SCHEMA" in user:
+                return {"summary": "done", "root_cause": "uncertain", "likely_files": ["a.py"],
+                        "likely_symbols": [], "impact_scope": [], "recommended_change_points": [],
+                        "uncertainties": [], "next_checks": [], "evidence_ids": [], "confidence": .2}
+            return {"decision": "continue", "reason": "inspect", "diagnosis": "partial",
+                    "supporting_evidence_ids": [], "contradicting_evidence_ids": [],
+                    "obligation_reviews": [], "new_requirements": [], "optional_validation": [],
+                    "recommended_next_goal": "inspect", "confidence": .2}
+
+    fake = NativeReuseLLM()
+    monkeypatch.setattr("debug_assistant.harness.runtime.build_llm", lambda cfg: fake)
+    cfg = AppConfig(model=ModelConfig(provider="mock"), harness=HarnessConfig(
+        build_task_index=False, max_steps=4, reflect_every=10, finalization_reserve_seconds=0,
+        planner_start_guard_seconds=0, reflection_start_guard_seconds=0,
+        trace_dir=str(tmp_path / "traces")))
+    result = AgentHarness(cfg).run(TaskSpec("native-reuse", "inspect source", str(repo)))
+    events = [json.loads(line) for line in open(result["trace"]["trace_path"], encoding="utf-8")]
+
+    assert result["state"]["tool_calls"] == 1
+    assert result["state"]["observation_reuse_count"] == 1
+    assert any(event["type"] == "OBSERVATION_REHYDRATED" for event in events)
+    assert any(
+        event["type"] == "NATIVE_PLANNER_NO_TOOL_TURN"
+        and event["payload"]["policy_decision"] == "rehydrate_then_reflect"
+        for event in events
+    )
 
 
 def test_native_no_tool_turn_is_not_planner_failure(monkeypatch, tmp_path):

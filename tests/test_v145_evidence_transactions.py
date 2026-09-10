@@ -91,6 +91,26 @@ def test_refine_is_atomic_parent_supersession_plus_child_creation(tmp_path):
     assert transitions
 
 
+def test_refine_links_child_precreated_by_same_reflection(tmp_path):
+    tr=EvidenceObligationTracker(repo_root=tmp_path,symbol_lookup=_symbol_lookup)
+    tr.sync([{'target':'foo behavior','location':'a.py','goal_type':'behavior','reason':'broad'}])
+    parent=next(iter(tr.items.values()))
+    tr.sync([
+        {'target':'foo behavior','location':'a.py','goal_type':'behavior','reason':'broad'},
+        {'target':'bar behavior','location':'a.py','goal_type':'behavior','reason':'delegated'},
+    ])
+    child=next(item for item in tr.items.values() if item.obligation_id != parent.obligation_id)
+    tr.note_evidence(_source(),'def foo(): pass')
+    tr.mark_presented(parent.obligation_id,reflection_id='R1',projection_id='P1',evidence_fingerprint=tr.evidence_fingerprint(parent))
+    ok,_=tr.apply_explicit_review({
+        'obligation_id':parent.obligation_id,'decision':'refine','reason':'real cause is delegated',
+        'refined_requirement':{'target':'bar behavior','location':'a.py','goal_type':'behavior','reason':'delegated'},
+    },reflection_id='R1')
+    assert ok is True
+    assert parent.superseded_by == child.obligation_id
+    assert child.refined_from == parent.obligation_id
+
+
 class _SlowTransport(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request):
         await asyncio.sleep(0.2)

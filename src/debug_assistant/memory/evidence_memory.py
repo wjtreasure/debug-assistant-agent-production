@@ -1,5 +1,4 @@
 from __future__ import annotations
-from collections import deque
 from hashlib import sha1
 import re
 from debug_assistant.models import Evidence, ToolObservation
@@ -40,66 +39,70 @@ class EvidenceMemory:
     Raw bounded ToolObservations remain authoritative in trace/state. Evidence is a compact,
     provenance-backed historical representation and must never overstate excerpt coverage.
     """
-    def __init__(self, max_recent=8):
-        self.recent=deque(maxlen=max_recent)
+    def __init__(self):
         self.pinned: list[Evidence]=[]
         self._seen=set()
+        self._evidence_by_fingerprint: dict[str, Evidence] = {}
+        self._evidence_by_observation_id: dict[str, Evidence] = {}
 
-    def add_observation(self, obs: ToolObservation):
-        self.recent.append(obs)
+    def evidence_for_observation(self, observation_id: str) -> Evidence | None:
+        """Return the canonical Evidence representing an immutable Observation.
+
+        Observation IDs are internal provenance.  Model-facing context uses the
+        returned Evidence ID, including when two observations contain the same fact.
+        """
+        return self._evidence_by_observation_id.get(observation_id)
+
+    def add_observation(self, obs: ToolObservation, *, evidence_id: str | None = None,
+                        kind: str | None = None, source: str | None = None,
+                        summary: str | None = None, excerpt: str | None = None,
+                        target: str | None = None, tags: list[str] | None = None):
         if not obs.ok or not obs.content.strip():
+            return None
+        # A captured query can be available while returning an empty collection
+        # (for example, no error logs). Preserve that raw Observation, but do not
+        # promote the absence of records into a citable causal fact.
+        if (obs.metadata or {}).get('semantic_negative') is True:
             return None
         # Retrieval results are candidate locations, not causal evidence. They must be
         # verified by a source-reading observation before entering the evidence ledger.
         if (obs.metadata or {}).get('information_source') == 'candidate_retrieval':
             return None
+        # Even if a legacy/custom symbol tool labels its bounded preview as
+        # source_read, symbol lookup is still discovery.  Only read_file is the
+        # canonical source-verification observation.
+        if obs.tool == 'symbol_search':
+            return None
+        meta = obs.metadata or {}
         key=sha1((obs.tool+'|'+obs.content).encode('utf-8','ignore')).hexdigest()[:12]
         if key in self._seen:
+            existing = self._evidence_by_fingerprint.get(key)
+            if existing is not None:
+                self._evidence_by_observation_id[obs.observation_id] = existing
             return None
         self._seen.add(key)
-        meta=obs.metadata
-        excerpt, excerpt_truncated=_complete_line_excerpt(obs.content, 1800)
-        source_start=meta.get('start_line') if obs.tool == 'read_file' else None
-        source_end=meta.get('end_line') if obs.tool == 'read_file' else None
+        if excerpt is None:
+            evidence_excerpt, excerpt_truncated=_complete_line_excerpt(obs.content, 1800)
+        else:
+            evidence_excerpt, excerpt_truncated=excerpt, False
+        source_read = obs.tool == 'read_file'
+        source_start=meta.get('start_line') if source_read else None
+        source_end=meta.get('end_line') if source_read else None
         excerpt_start=excerpt_end=None
         if obs.tool == 'read_file':
-            excerpt_start, excerpt_end=_read_file_excerpt_coverage(excerpt)
+            excerpt_start, excerpt_end=_read_file_excerpt_coverage(evidence_excerpt)
         ev=Evidence(
-            evidence_id=f"ev-{key}", kind=obs.tool, source=obs.tool,
-            summary=obs.content[:700].replace('\n',' '), excerpt=excerpt,
+            evidence_id=evidence_id or f"ev-{key}", kind=kind or obs.tool, source=source or obs.tool,
+            summary=summary or obs.content[:700].replace('\n',' '), target=target,
+            excerpt=evidence_excerpt,
             file=meta.get('path'), line_start=source_start, line_end=source_end,
             raw_observation_id=obs.observation_id,
             source_start_line=source_start, source_end_line=source_end,
             excerpt_start_line=excerpt_start, excerpt_end_line=excerpt_end,
             excerpt_truncated=excerpt_truncated,
-            confidence=0.65,
+            confidence=0.65, tags=list(tags or []),
         )
         self.pinned.append(ev)
+        self._evidence_by_fingerprint[key] = ev
+        self._evidence_by_observation_id[obs.observation_id] = ev
         return ev
-
-    def context(self, max_chars=24000, *, recent_observation_ids: set[str] | None=None) -> str:
-        recent_observation_ids=recent_observation_ids or set()
-        chunks=[]; used=0
-        for e in reversed(self.pinned):
-            location=''
-            if e.file:
-                if e.source_start_line is not None and e.source_end_line is not None:
-                    location=f" {e.file}:{e.source_start_line}-{e.source_end_line}"
-                else:
-                    location=f" {e.file}"
-            # Recent raw observations own the full content. Historical ledger keeps only concise metadata/summary.
-            if e.raw_observation_id in recent_observation_ids:
-                text=(f"[{e.evidence_id}] {e.kind}{location} "
-                      f"(raw={e.raw_observation_id}; full bounded content is in RECENT_RAW_OBSERVATIONS)\n")
-            else:
-                coverage=''
-                if e.excerpt_truncated:
-                    if e.excerpt_start_line is not None and e.excerpt_end_line is not None:
-                        coverage=f" [compressed excerpt {e.excerpt_start_line}-{e.excerpt_end_line}; source {e.source_start_line}-{e.source_end_line}]"
-                    else:
-                        coverage=" [compressed excerpt; exact excerpt line coverage unavailable]"
-                text=f"[{e.evidence_id}] {e.kind}{location}{coverage}: {e.summary}\n"
-            if used+len(text)>max_chars:
-                break
-            chunks.append(text); used+=len(text)
-        return ''.join(reversed(chunks)) or '(no evidence yet)'
