@@ -248,6 +248,13 @@ class CloudOpsSnapshotToolRegistry:
     def get(self, name: str):
         return self._tools.get(name)
 
+    def register(self, tool: Tool) -> None:
+        """Register an optional capability-layer tool on this existing registry."""
+        name = str(tool.spec.name)
+        if name == self._finalize_spec.name or name in self._tools:
+            raise ValueError(f"tool already registered: {name}")
+        self._tools[name] = tool
+
     def specs(self):
         return [tool.spec for tool in self._tools.values()] + [self._finalize_spec]
 

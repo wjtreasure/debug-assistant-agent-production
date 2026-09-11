@@ -83,6 +83,9 @@ class Evidence:
     excerpt_truncated: bool = False
     confidence: float = 0.5
     tags: list[str] = field(default_factory=list)
+    # Structured source metadata is kept on the canonical Evidence record so
+    # Incident Review can receive a faithful projection without a second store.
+    provenance: dict[str, Any] = field(default_factory=dict)
 
 @dataclass(slots=True)
 class Hypothesis:

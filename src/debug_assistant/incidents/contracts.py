@@ -125,6 +125,14 @@ class IncidentEvidence(BaseModel):
     target: str
     summary: str
     observation_id: str
+    excerpt: str = ""
+    file: str | None = None
+    start_line: int | None = None
+    end_line: int | None = None
+    raw_observation_id: str | None = None
+    truncation: bool = False
+    tags: tuple[str, ...] = ()
+    provenance: dict[str, Any] = Field(default_factory=dict)
 
 
 class IncidentHypothesis(BaseModel):

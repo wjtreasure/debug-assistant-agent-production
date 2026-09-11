@@ -2,6 +2,7 @@ from __future__ import annotations
 from hashlib import sha1
 import re
 from debug_assistant.models import Evidence, ToolObservation
+from debug_assistant.memory.evidence_boundary import is_canonical_source_evidence
 
 _LINE_RE = re.compile(r"^\s*(\d+)\s*\|")
 
@@ -66,7 +67,11 @@ class EvidenceMemory:
             return None
         # Retrieval results are candidate locations, not causal evidence. They must be
         # verified by a source-reading observation before entering the evidence ledger.
-        if (obs.metadata or {}).get('information_source') == 'candidate_retrieval':
+        information_source = (obs.metadata or {}).get('information_source')
+        if information_source in {
+            'candidate_retrieval', 'prior', 'knowledge_candidate',
+            'incident_memory', 'domain_rag', 'static_kg',
+        }:
             return None
         # Even if a legacy/custom symbol tool labels its bounded preview as
         # source_read, symbol lookup is still discovery.  Only read_file is the
@@ -91,6 +96,13 @@ class EvidenceMemory:
         excerpt_start=excerpt_end=None
         if obs.tool == 'read_file':
             excerpt_start, excerpt_end=_read_file_excerpt_coverage(evidence_excerpt)
+        provenance = dict(meta.get('provenance') or {})
+        if meta.get('information_source'):
+            provenance.setdefault('information_source', meta.get('information_source'))
+        if meta.get('context_kind'):
+            provenance.setdefault('context_kind', meta.get('context_kind'))
+        if meta.get('path'):
+            provenance.setdefault('path', meta.get('path'))
         ev=Evidence(
             evidence_id=evidence_id or f"ev-{key}", kind=kind or obs.tool, source=source or obs.tool,
             summary=summary or obs.content[:700].replace('\n',' '), target=target,
@@ -101,8 +113,16 @@ class EvidenceMemory:
             excerpt_start_line=excerpt_start, excerpt_end_line=excerpt_end,
             excerpt_truncated=excerpt_truncated,
             confidence=0.65, tags=list(tags or []),
+            provenance=provenance,
         )
         self.pinned.append(ev)
         self._evidence_by_fingerprint[key] = ev
         self._evidence_by_observation_id[obs.observation_id] = ev
         return ev
+
+    def source_evidence_ids(self) -> tuple[str, ...]:
+        """Return only canonical bounded ``read_file`` CODE Evidence IDs."""
+        return tuple(
+            item.evidence_id for item in self.pinned
+            if is_canonical_source_evidence(None, item, evidence_memory=self)
+        )

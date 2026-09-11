@@ -35,6 +35,10 @@ from debug_assistant.incidents.contracts import (
 from debug_assistant.models import ActionKind, ActionProposal, AgentState, TaskSpec, ToolObservation
 from debug_assistant.memory.evidence_memory import EvidenceMemory
 from debug_assistant.memory.observation_store import ObservationStore
+from debug_assistant.knowledge import (
+    CapabilitySnapshot, HybridRouter, IncidentEntityExtractor,
+    KnowledgeCoordinator, KnowledgeQueryBuilder, KnowledgeRetrievalTool,
+)
 from debug_assistant.llm.base import LLMDeadlineExceeded, LLMError
 from debug_assistant.skills.catalog import INCIDENT_SKILLS
 from debug_assistant.tools.cloudops_snapshot import CloudOpsSnapshotToolRegistry
@@ -193,7 +197,9 @@ class DiagnosisHarness:
 
     def __init__(self, llm, review_llm=None, *, model: str = "", review_model: str = "",
                  config: DiagnosisHarnessConfig | None = None,
-                 topology_path: str | Path | None = None, search_engine=None):
+                 topology_path: str | Path | None = None, search_engine=None,
+                 knowledge_store=None, domain_rag=None, static_graph=None,
+                 knowledge_coordinator: KnowledgeCoordinator | None = None):
         self.llm = llm
         self.review_llm = review_llm or llm
         self.model = model
@@ -203,6 +209,10 @@ class DiagnosisHarness:
         # default CloudOps path still creates a task-scoped lexical index and
         # degrades explicitly when no semantic engine is injected.
         self.search_engine = search_engine
+        self.knowledge_coordinator = knowledge_coordinator or KnowledgeCoordinator(
+            knowledge_store=knowledge_store, domain_rag=domain_rag,
+            static_graph=static_graph,
+        )
         self.topology_path = Path(topology_path) if topology_path else (
             Path(__file__).resolve().parents[3] / "data" / "online_boutique" / "service_topology.json"
         )
@@ -218,6 +228,19 @@ class DiagnosisHarness:
         source_workspace_available = bool(
             getattr(getattr(tools, "source_binding", None), "available", False)
         )
+        entities = IncidentEntityExtractor().extract(case)
+        capabilities = CapabilitySnapshot.detect(
+            case, tools, source_workspace_available=source_workspace_available,
+            domain_rag=self.knowledge_coordinator.domain_rag,
+            knowledge_store=self.knowledge_coordinator.knowledge_store,
+            static_graph=self.knowledge_coordinator.static_graph,
+        )
+        router_decision = HybridRouter().route(case, entities, capabilities)
+        query_builder = KnowledgeQueryBuilder()
+        knowledge_tool = KnowledgeRetrievalTool(self.knowledge_coordinator, case.case_id)
+        knowledge_enabled = bool(self.knowledge_coordinator.available_sources)
+        if knowledge_enabled:
+            tools.register(knowledge_tool)
         planner = NativeToolPlanner(self.llm, tools, self.model)
         reviewer = FinalReviewAgent(self.review_llm, self.review_model)
         reflection_agent = IncidentReflectionAgent(self.llm, self.model)
@@ -288,6 +311,44 @@ class DiagnosisHarness:
             "case_id": case.case_id, "summary": case.summary, "system": case.system,
             "namespace": case.namespace, "evidence_sources": case.evidence_sources,
         })
+        if knowledge_enabled:
+            trace.record("CAPABILITY_DETECTED", capabilities.model_dump(mode="json"))
+            trace.record("ROUTER_DECISION", {
+                **router_decision.model_dump(mode="json"),
+                "entities": entities.model_dump(mode="json"),
+            })
+        prior_context = None
+        pre_retrieval_queries = (
+            query_builder.build(case, entities, router_decision)
+            if knowledge_enabled else ()
+        )
+        for query in pre_retrieval_queries:
+            trace.record("KNOWLEDGE_QUERY_BUILT", {
+                "query": query.model_dump(mode="json"), "stage": "pre_retrieval",
+            })
+        if pre_retrieval_queries:
+            query = pre_retrieval_queries[0]
+            retrieval_result = self.knowledge_coordinator.retrieve(query)
+            prior_context = self.knowledge_coordinator.prior_context(
+                query, result=retrieval_result,
+            )
+            trace.record("KNOWLEDGE_RETRIEVED", {
+                "stage": "pre_retrieval",
+                **retrieval_result.diagnostics.model_dump(mode="json"),
+                "candidate_count": len(retrieval_result.candidates),
+            })
+            if retrieval_result.diagnostics.degraded:
+                trace.record("KNOWLEDGE_RETRIEVAL_DEGRADED", {
+                    "stage": "pre_retrieval",
+                    "reason": retrieval_result.diagnostics.reason,
+                })
+            trace.record("PRIOR_CONTEXT_PACKED", {
+                "stage": "pre_retrieval", "context_id": prior_context.context_id,
+                "source_types": list(prior_context.source_types),
+                "candidate_count": len(prior_context.candidates),
+                "packed_chars": prior_context.packed_chars,
+                "packed_tokens": prior_context.packed_tokens,
+            })
 
         def add_usage(usage_source) -> None:
             nonlocal prompt_tokens, completion_tokens
@@ -298,6 +359,8 @@ class DiagnosisHarness:
                 usage = dict(getattr(usage_source, "last_usage", None) or {})
             prompt_tokens += int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
             completion_tokens += int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+            if prompt_tokens + completion_tokens > self.config.max_total_tokens:
+                raise RuntimeError("max_total_tokens exceeded after LLM response")
 
         def budget_snapshot(boundary: str) -> Any:
             return budget.snapshot(
@@ -542,16 +605,21 @@ class DiagnosisHarness:
                     target=item.target or "",
                     summary=item.summary,
                     observation_id=item.raw_observation_id or "",
+                    excerpt=item.excerpt,
+                    file=item.file,
+                    start_line=item.source_start_line,
+                    end_line=item.source_end_line,
+                    raw_observation_id=item.raw_observation_id,
+                    truncation=item.excerpt_truncated,
+                    tags=tuple(item.tags),
+                    provenance=dict(item.provenance),
                 )
                 for item in evidence_memory.pinned
             )
 
         def source_evidence_ids() -> tuple[str, ...]:
             """Return canonical CODE Evidence from verified source-reading tools."""
-            return tuple(
-                item.evidence_id for item in evidence_memory.pinned
-                if item.source in {"read_file", "symbol_search"}
-            )
+            return evidence_memory.source_evidence_ids()
 
         obligation_state: dict[str, VerificationObligation] = {}
 
@@ -952,6 +1020,7 @@ class DiagnosisHarness:
                 "trigger_reason": reason,
                 "recent_structured_actions": actions[-6:],
                 "review_feedback": review_feedback_text or None,
+                "prior_knowledge": prior_context.model_dump(mode="json") if prior_context else None,
             }
             try:
                 admit("reflection", count_llm=True)
@@ -1113,6 +1182,7 @@ class DiagnosisHarness:
             nonlocal final_candidate_step, termination_reason
             nonlocal duplicate_calls
             nonlocal planner_contract_retry_used
+            nonlocal prior_context
             start_steps, start_tools = state.step, state.tool_calls
 
             def ensure_review_progress(candidate: RootCauseCandidate,
@@ -1177,6 +1247,10 @@ class DiagnosisHarness:
                     reflection_feedback=reflection_feedback,
                     tool_health=tool_circuit.summary(),
                     reflection_trigger=reflection_trigger,
+                    entities=entities,
+                    capabilities=capabilities,
+                    router_decision=router_decision,
+                    prior_context=prior_context,
                 )
                 control_prefix = (
                     "AGENT_CONTROL_STATE:\n"
@@ -1295,8 +1369,6 @@ class DiagnosisHarness:
                         trace.record("PLANNER_CALL_FAILED", planner_failure)
                         raise
                 add_usage(result)
-                if prompt_tokens + completion_tokens > self.config.max_total_tokens:
-                    raise RuntimeError("max_total_tokens exceeded after planner response")
                 trace.record("PLANNER_CALL_COMPLETED", {
                     "step": state.step + 1,
                     "prompt_breakdown": dict(planner.last_prompt_breakdown),
@@ -1528,6 +1600,29 @@ class DiagnosisHarness:
                     action["observation_status"] = observation.metadata.get("status")
                     action["semantic_negative"] = observation.metadata.get("semantic_negative")
                     trace.record("TOOL_OBSERVATION", observation)
+                    if call.name == "knowledge_retrieval":
+                        retrieved = getattr(knowledge_tool, "last_result", None)
+                        retrieved_context = getattr(knowledge_tool, "last_prior_context", None)
+                        if retrieved_context is not None:
+                            prior_context = retrieved_context
+                            trace.record("KNOWLEDGE_RETRIEVED", {
+                                "stage": "on_demand",
+                                **retrieved.diagnostics.model_dump(mode="json"),
+                                "candidate_count": len(retrieved.candidates),
+                            })
+                            if retrieved.diagnostics.degraded:
+                                trace.record("KNOWLEDGE_RETRIEVAL_DEGRADED", {
+                                    "stage": "on_demand",
+                                    "reason": retrieved.diagnostics.reason,
+                                })
+                            trace.record("PRIOR_CONTEXT_PACKED", {
+                                "stage": "on_demand",
+                                "context_id": retrieved_context.context_id,
+                                "source_types": list(retrieved_context.source_types),
+                                "candidate_count": len(retrieved_context.candidates),
+                                "packed_chars": retrieved_context.packed_chars,
+                                "packed_tokens": retrieved_context.packed_tokens,
+                            })
                     if call.name == "code_search":
                         retrieval_metadata = dict(observation.metadata or {})
                         trace.record("RETRIEVAL_MODE", {
@@ -1775,8 +1870,6 @@ class DiagnosisHarness:
                     error_type = type(exc).__name__
                     error_message = "Final Review response remained invalid after one schema repair attempt"
                     break
-                if prompt_tokens + completion_tokens > self.config.max_total_tokens:
-                    raise RuntimeError("max_total_tokens exceeded after review response")
                 trace.record("FINAL_REVIEW", {
                     "round": review_rounds, "schema_repaired": reviewer.last_schema_repaired,
                     "schema_validation_error": (
@@ -2126,7 +2219,11 @@ class DiagnosisHarness:
                                available_code_tools=(), source_evidence_ids=(),
                                reflection_feedback: str = "",
                                tool_health: dict[str, Any] | None = None,
-                               reflection_trigger: str = "") -> dict[str, Any]:
+                               reflection_trigger: str = "",
+                               entities: Any | None = None,
+                               capabilities: Any | None = None,
+                               router_decision: Any | None = None,
+                               prior_context: Any | None = None) -> dict[str, Any]:
         current = hypotheses[-1] if hypotheses else None
         visible_actions = [
             {key: value for key, value in action.items() if key != "observation_id"}
@@ -2134,6 +2231,12 @@ class DiagnosisHarness:
         ]
         return {
             "INCIDENT": {"summary": case.summary, "system": case.system, "namespace": case.namespace},
+            "ENTITIES": entities.model_dump(mode="json") if hasattr(entities, "model_dump") else {},
+            "CAPABILITIES": capabilities.model_dump(mode="json") if hasattr(capabilities, "model_dump") else {},
+            "ROUTER_DECISION": router_decision.model_dump(mode="json") if hasattr(router_decision, "model_dump") else {},
+            "PRIOR_KNOWLEDGE": (
+                prior_context.model_dump(mode="json") if hasattr(prior_context, "model_dump") else None
+            ),
             "AVAILABLE_EVIDENCE_SOURCES": list(available_evidence_sources),
             "SOURCE_WORKSPACE": {
                 "available": bool(source_workspace_available),
