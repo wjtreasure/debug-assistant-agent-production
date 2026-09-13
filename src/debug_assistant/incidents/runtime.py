@@ -22,6 +22,10 @@ from debug_assistant.context.manager import ContextManager
 from debug_assistant.context.projection import IncidentProjectionPolicy
 from debug_assistant.harness.trace import TraceRecorder
 from debug_assistant.harness.budget import BudgetController
+from debug_assistant.harness.dynamic_budget import (
+    BudgetState, DynamicBudgetController, ProgressMarker, PromptBudgetExceeded,
+    progress_made, resolve_model_capability,
+)
 from debug_assistant.harness.deadline import RunDeadline
 from debug_assistant.harness.retry import RetryPolicy
 from debug_assistant.harness.tool_executor import execute_with_retry
@@ -40,6 +44,7 @@ from debug_assistant.knowledge import (
     KnowledgeCoordinator, KnowledgeQueryBuilder, KnowledgeRetrievalTool,
 )
 from debug_assistant.llm.base import LLMDeadlineExceeded, LLMError
+from debug_assistant.llm.base import ModelCapability
 from debug_assistant.skills.catalog import INCIDENT_SKILLS
 from debug_assistant.tools.cloudops_snapshot import CloudOpsSnapshotToolRegistry
 
@@ -85,6 +90,11 @@ class DiagnosisHarnessConfig:
     review_llm_timeout_seconds: float = 45.0
     max_llm_calls: int = 40
     max_total_tokens: int = 120_000
+    terminal_reserve_tokens: int = 0
+    terminal_reserve_llm_calls: int = 3
+    context_pressure_ratio: float = 0.75
+    hard_pressure_ratio: float = 0.95
+    max_cost_per_incident: float | None = None
     max_wall_time_seconds: float = 900.0
     finalization_reserve_seconds: float = 0.0
     tool_retry_attempts: int = 1
@@ -115,6 +125,11 @@ class DiagnosisHarnessConfig:
             max_tool_calls=source.max_tool_calls,
             max_llm_calls=source.max_llm_calls,
             max_total_tokens=source.max_total_tokens,
+            max_cost_per_incident=getattr(source, "max_cost_per_incident", None),
+            terminal_reserve_tokens=getattr(source, "terminal_reserve_tokens", 0),
+            terminal_reserve_llm_calls=getattr(source, "terminal_reserve_llm_calls", 3),
+            context_pressure_ratio=getattr(source, "context_pressure_ratio", 0.75),
+            hard_pressure_ratio=getattr(source, "hard_pressure_ratio", 0.95),
             max_wall_time_seconds=source.max_wall_time_seconds,
             finalization_reserve_seconds=source.finalization_reserve_seconds,
             planner_llm_timeout_seconds=(
@@ -150,6 +165,14 @@ class DiagnosisHarnessConfig:
             raise ValueError("max_context_chars must be positive")
         if self.max_llm_calls <= 0 or self.max_total_tokens <= 0 or self.max_wall_time_seconds <= 0:
             raise ValueError("LLM, token, and wall-clock budgets must be positive")
+        if self.terminal_reserve_tokens < 0 or self.terminal_reserve_llm_calls <= 0:
+            raise ValueError("terminal reserves must be non-negative tokens and positive calls")
+        if not 0.5 <= self.context_pressure_ratio < 1.0:
+            raise ValueError("context pressure ratio must be in [0.5, 1.0)")
+        if not self.context_pressure_ratio <= self.hard_pressure_ratio <= 1.0:
+            raise ValueError("hard pressure ratio must be >= pressure ratio and <= 1")
+        if self.max_cost_per_incident is not None and self.max_cost_per_incident <= 0:
+            raise ValueError("max_cost_per_incident must be positive when configured")
         if self.finalization_reserve_seconds < 0 or self.finalization_reserve_seconds >= self.max_wall_time_seconds:
             raise ValueError("finalization reserve must be smaller than the run deadline")
         if self.tool_retry_attempts <= 0 or self.max_duplicate_actions <= 0 or self.max_no_progress <= 0:
@@ -237,6 +260,8 @@ class DiagnosisHarness:
         )
         router_decision = HybridRouter().route(case, entities, capabilities)
         query_builder = KnowledgeQueryBuilder()
+        # The Knowledge tool receives the current prior ceiling.  It remains a
+        # normal Tool and never enters the Evidence ledger.
         knowledge_tool = KnowledgeRetrievalTool(self.knowledge_coordinator, case.case_id)
         knowledge_enabled = bool(self.knowledge_coordinator.available_sources)
         if knowledge_enabled:
@@ -276,6 +301,8 @@ class DiagnosisHarness:
         )
         active_skill = ""
         prompt_tokens = completion_tokens = 0
+        run_cost = 0.0
+        cost_measured = False
         review_rounds = 0
         reflection_calls = 0
         reflection_feedback = ""
@@ -307,9 +334,26 @@ class DiagnosisHarness:
             finalization_reserve_seconds=math.floor(self.config.finalization_reserve_seconds),
             started_at=state.started_at,
         )
+        model_capability = resolve_model_capability(self.llm, model=self.model)
+        dynamic_budget = DynamicBudgetController(
+            model_capability,
+            max_context_chars=self.config.max_context_chars,
+            max_total_tokens=self.config.max_total_tokens,
+            max_llm_calls=self.config.max_llm_calls,
+            max_wall_time_seconds=self.config.max_wall_time_seconds,
+            max_cost_per_incident=self.config.max_cost_per_incident,
+            terminal_reserve_tokens=self.config.terminal_reserve_tokens,
+            terminal_reserve_llm_calls=self.config.terminal_reserve_llm_calls,
+            terminal_reserve_seconds=self.config.finalization_reserve_seconds,
+            pressure_ratio=self.config.context_pressure_ratio,
+            hard_pressure_ratio=self.config.hard_pressure_ratio,
+            started_at=state.started_at,
+        )
         trace.record("INCIDENT_STARTED", {
             "case_id": case.case_id, "summary": case.summary, "system": case.system,
             "namespace": case.namespace, "evidence_sources": case.evidence_sources,
+            "model_capability": model_capability.as_dict(),
+            "terminal_reserve": dynamic_budget.terminal_reserve_payload(),
         })
         if knowledge_enabled:
             trace.record("CAPABILITY_DETECTED", capabilities.model_dump(mode="json"))
@@ -318,8 +362,21 @@ class DiagnosisHarness:
                 "entities": entities.model_dump(mode="json"),
             })
         prior_context = None
+        initial_prior_capacity = dynamic_budget.available_prior_capacity(
+            critical_state_tokens=dynamic_budget.estimate_json_tokens({
+                "incident": case.summary, "entities": entities.model_dump(mode="json"),
+                "router": router_decision.model_dump(mode="json"),
+            }),
+            verified_evidence_tokens=0,
+            required_control_tokens=dynamic_budget.terminal_reserve_tokens,
+        )
+        if initial_prior_capacity is not None:
+            initial_prior_budget = max(1, min(100_000, initial_prior_capacity))
+            knowledge_tool.max_token_budget = initial_prior_budget
+        else:
+            initial_prior_budget = None
         pre_retrieval_queries = (
-            query_builder.build(case, entities, router_decision)
+            query_builder.build(case, entities, router_decision, token_budget=initial_prior_budget)
             if knowledge_enabled else ()
         )
         for query in pre_retrieval_queries:
@@ -350,17 +407,75 @@ class DiagnosisHarness:
                 "packed_tokens": prior_context.packed_tokens,
             })
 
-        def add_usage(usage_source) -> None:
-            nonlocal prompt_tokens, completion_tokens
+        def add_usage(usage_source, *, stage: str = "unknown", prompt_breakdown: dict[str, Any] | None = None) -> None:
+            nonlocal prompt_tokens, completion_tokens, run_cost, cost_measured
+            run_tokens_before = prompt_tokens + completion_tokens
             usage = dict(getattr(usage_source, "usage", None) or {})
             if not usage and hasattr(usage_source, "response"):
                 usage = dict(getattr(usage_source.response, "usage", None) or {})
             if not usage and hasattr(usage_source, "last_usage"):
                 usage = dict(getattr(usage_source, "last_usage", None) or {})
-            prompt_tokens += int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
-            completion_tokens += int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+            actual_prompt_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+            actual_completion_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+            raw_cost = usage.get("cost", usage.get("total_cost", usage.get("estimated_cost")))
+            try:
+                actual_cost = None if raw_cost is None else float(raw_cost)
+            except (TypeError, ValueError):
+                actual_cost = None
+            prompt_tokens += actual_prompt_tokens
+            completion_tokens += actual_completion_tokens
+            if actual_cost is not None:
+                run_cost += max(0.0, actual_cost)
+                cost_measured = True
+            dynamic_budget.set_run_usage(
+                tokens_used=prompt_tokens + completion_tokens,
+                llm_calls_used=llm_calls,
+                cost_used=run_cost,
+            )
+            breakdown = dict(prompt_breakdown or getattr(usage_source, "last_prompt_breakdown", {}) or {})
+            estimated_prompt_tokens = int(
+                breakdown.get("estimated_prompt_tokens", breakdown.get("last_estimated_prompt_tokens", 0)) or 0
+            )
+            dynamic_budget.record_actual_usage(
+                stage=stage,
+                estimated_prompt_tokens=estimated_prompt_tokens,
+                actual_prompt_tokens=actual_prompt_tokens if usage else None,
+                actual_completion_tokens=actual_completion_tokens if usage else None,
+                actual_cost=actual_cost,
+            )
+            after_state = dynamic_budget.decision(
+                stage,
+                estimated_prompt_tokens=estimated_prompt_tokens,
+                tokens_used=prompt_tokens,
+                llm_calls_used=llm_calls,
+                cost_used=run_cost,
+            )
+            trace.record("LLM_CALL_USAGE", {
+                "phase": stage,
+                "provider": model_capability.provider or type(self.llm).__name__,
+                "model": model_capability.model or self.model,
+                "estimated_prompt_tokens": estimated_prompt_tokens,
+                "actual_prompt_tokens": actual_prompt_tokens if usage else None,
+                "actual_completion_tokens": actual_completion_tokens if usage else None,
+                "actual_cost": actual_cost,
+                "run_tokens_before": run_tokens_before,
+                "run_tokens_after": prompt_tokens + completion_tokens,
+                "run_cost_after": run_cost,
+                "context_state": after_state.state.value,
+                "context_breakdown": dict(breakdown.get("token_breakdown") or breakdown),
+                "compaction_applied": after_state.state is not BudgetState.NORMAL,
+                "prior_pruned": False,
+                "rehydrated_evidence_count": 0,
+                "cache_hit": False,
+                "duplicate_blocked": False,
+            })
             if prompt_tokens + completion_tokens > self.config.max_total_tokens:
                 raise RuntimeError("max_total_tokens exceeded after LLM response")
+            if (
+                dynamic_budget.max_cost_per_incident is not None
+                and run_cost > dynamic_budget.max_cost_per_incident
+            ):
+                raise RuntimeError("max_cost_per_incident exceeded after LLM response")
 
         def budget_snapshot(boundary: str) -> Any:
             return budget.snapshot(
@@ -369,6 +484,10 @@ class DiagnosisHarness:
             )
 
         def budget_payload(snapshot) -> dict[str, Any]:
+            dynamic_state = dynamic_budget.decision(
+                "runtime", tokens_used=prompt_tokens, llm_calls_used=llm_calls,
+                cost_used=run_cost,
+            )
             return {
                 "steps_used": snapshot.steps_used,
                 "tool_calls_used": snapshot.tool_calls_used,
@@ -378,14 +497,52 @@ class DiagnosisHarness:
                 "remaining_ratio": snapshot.remaining_ratio,
                 "phase": snapshot.phase,
                 "seconds_until_forced_finalization": snapshot.seconds_until_forced_finalization,
+                "context_state": dynamic_state.state.value,
+                "input_hard_capacity": dynamic_state.input_hard_capacity,
+                "cost_used": run_cost,
+                "max_cost_per_incident": dynamic_budget.max_cost_per_incident,
+                "remaining_run_cost": dynamic_state.remaining_run_cost,
+                "terminal_reserve_tokens": dynamic_state.terminal_reserve_tokens,
+                "terminal_reserve_llm_calls": dynamic_state.terminal_reserve_llm_calls,
             }
 
         def admit(stage: str, *, count_llm: bool = False) -> None:
             nonlocal llm_calls, planner_calls, review_calls
             deadline.check()
             snapshot = budget_snapshot("pre_" + stage)
+            dynamic_budget.set_run_usage(
+                tokens_used=prompt_tokens + completion_tokens,
+                llm_calls_used=llm_calls,
+                cost_used=run_cost,
+            )
+            dynamic_state = dynamic_budget.decision(
+                stage, tokens_used=prompt_tokens, llm_calls_used=llm_calls,
+                cost_used=run_cost,
+            )
+            if dynamic_state.state is not BudgetState.NORMAL:
+                trace.record("RUN_BUDGET_PRESSURE", {
+                    "stage": stage,
+                    "context_state": dynamic_state.state.value,
+                    "reason": dynamic_state.reason,
+                    "remaining_run_tokens": dynamic_state.remaining_run_tokens,
+                    "remaining_run_cost": dynamic_state.remaining_run_cost,
+                    "terminal_reserve_tokens": dynamic_state.terminal_reserve_tokens,
+                    "terminal_reserve_llm_calls": dynamic_state.terminal_reserve_llm_calls,
+                })
+                if "terminal reserve" in dynamic_state.reason:
+                    trace.record("TERMINAL_RESERVE_PROTECTED", {
+                        "stage": stage,
+                        "reason": dynamic_state.reason,
+                        "remaining_run_tokens": dynamic_state.remaining_run_tokens,
+                        "remaining_run_cost": dynamic_state.remaining_run_cost,
+                    })
             if snapshot.tokens_used >= self.config.max_total_tokens:
                 raise RuntimeError("max_total_tokens exceeded")
+            if (
+                dynamic_budget.max_cost_per_incident is not None
+                and run_cost >= dynamic_budget.max_cost_per_incident
+            ):
+                raise RuntimeError("max_cost_per_incident exceeded")
             if count_llm:
                 if llm_calls >= self.config.max_llm_calls:
                     raise RuntimeError("max_llm_calls exceeded")
@@ -518,6 +675,8 @@ class DiagnosisHarness:
                     "deterministic_normalized": bool(
                         getattr(reviewer, "last_deterministic_normalized", False)
                     ),
+                    "prompt_breakdown": dict(getattr(reviewer, "last_prompt_breakdown", {}) or {}),
+                    "prompt_breakdowns": list(getattr(reviewer, "last_prompt_breakdowns", ()) or ()),
                 })
             trace.record(
                 "REVIEW_FAILED" if terminal_error else "REVIEW_COMPLETED",
@@ -539,6 +698,9 @@ class DiagnosisHarness:
                     "deterministic_normalized": bool(
                         getattr(reviewer, "last_deterministic_normalized", False)
                     ),
+                    "usage": dict(getattr(reviewer, "last_usage", {}) or {}),
+                    "prompt_breakdown": dict(getattr(reviewer, "last_prompt_breakdown", {}) or {}),
+                    "prompt_breakdowns": list(getattr(reviewer, "last_prompt_breakdowns", ()) or ()),
                 },
             )
 
@@ -885,7 +1047,11 @@ class DiagnosisHarness:
                 claim=selection.current_hypothesis,
                 evidence_gap=selection.evidence_gap,
                 component=selection.candidate_component,
-                fault=selection.candidate_fault,
+                fault=(selection.candidate_fault
+                       or selection.candidate_fault_code
+                       or selection.candidate_fault_explanation),
+                fault_code=selection.candidate_fault_code,
+                fault_explanation=selection.candidate_fault_explanation,
                 mechanism=selection.candidate_mechanism,
                 supporting_evidence_ids=selection.supporting_evidence_ids,
                 contradicting_evidence_ids=flat_contradictions,
@@ -966,6 +1132,7 @@ class DiagnosisHarness:
 
         def trigger_reflection(reason: str, *, review_feedback_text: str = "") -> str:
             nonlocal reflection_calls, reflection_feedback, reflection_trigger, schema_repair_count
+            nonlocal llm_calls
             if not self.config.enable_reflection or self.config.max_reflection_calls == 0:
                 return ""
             # Test doubles and old compatibility providers may only implement
@@ -1022,27 +1189,57 @@ class DiagnosisHarness:
                 "review_feedback": review_feedback_text or None,
                 "prior_knowledge": prior_context.model_dump(mode="json") if prior_context else None,
             }
+            reflection_prior_capacity = dynamic_budget.available_prior_capacity(
+                critical_state_tokens=dynamic_budget.estimate_json_tokens({
+                    "hypothesis": snapshot["current_hypothesis"],
+                    "gaps": snapshot["required_gaps"],
+                }),
+                verified_evidence_tokens=dynamic_budget.estimate_json_tokens(
+                    snapshot["relevant_evidence"]
+                ),
+                required_control_tokens=dynamic_budget.estimate_json_tokens({
+                    "actions": snapshot["recent_structured_actions"],
+                    "contradictions": snapshot["contradictions"],
+                }),
+            )
+            bounded_reflection_prior = self._bound_prior_context(
+                prior_context, reflection_prior_capacity, dynamic_budget.estimate_tokens,
+            )
+            snapshot["prior_knowledge"] = (
+                bounded_reflection_prior.model_dump(mode="json")
+                if bounded_reflection_prior else None
+            )
             try:
                 admit("reflection", count_llm=True)
                 timeout = provider_timeout(self.config.planner_llm_timeout_seconds)
                 feedback = self._provider_call(
                     reflection_agent.reflect, snapshot,
                     logical_timeout_seconds=timeout,
+                    prompt_budget=dynamic_budget,
                     hard_timeout_seconds=timeout,
                     state_source=reflection_agent,
                     state_attributes=(
                         "last_usage", "last_call_count", "last_prompt_breakdown",
+                        "last_prompt_breakdowns",
                         "last_normalization_actions", "last_metadata_drops",
                         "last_metadata_warnings", "last_failure_type",
                     ),
                 )
-                add_usage(reflection_agent)
+                add_usage(
+                    reflection_agent, stage="reflection",
+                    prompt_breakdown=getattr(reflection_agent, "last_prompt_breakdown", None),
+                )
                 extra_calls = max(0, int(getattr(reflection_agent, "last_call_count", 1)) - 1)
                 if extra_calls:
                     llm_calls += extra_calls
                     schema_repair_count += extra_calls
                     if llm_calls > self.config.max_llm_calls:
                         raise RuntimeError("max_llm_calls exceeded during reflection repair")
+                    dynamic_budget.set_run_usage(
+                        tokens_used=prompt_tokens + completion_tokens,
+                        llm_calls_used=llm_calls,
+                        cost_used=run_cost,
+                    )
                 if getattr(reflection_agent, "last_normalization_actions", None):
                     trace.record("REFLECTION_REASONING_METADATA_NORMALIZED", {
                         "call": reflection_calls, "trigger": reason,
@@ -1061,9 +1258,30 @@ class DiagnosisHarness:
                 reflection_feedback = json.dumps(feedback.model_dump(), ensure_ascii=False)
                 trace.record("REFLECTION_RESULT", {
                     "call": reflection_calls, "trigger": reason,
+                    "usage": dict(getattr(reflection_agent, "last_usage", {}) or {}),
+                    "prompt_breakdown": dict(getattr(reflection_agent, "last_prompt_breakdown", {}) or {}),
+                    "prompt_breakdowns": list(getattr(reflection_agent, "last_prompt_breakdowns", ()) or ()),
                     **feedback.model_dump(),
                 })
                 return reflection_feedback
+            except PromptBudgetExceeded as exc:
+                llm_calls = max(0, llm_calls - 1)
+                reflection_calls = max(0, reflection_calls - 1)
+                dynamic_budget.set_run_usage(
+                    tokens_used=prompt_tokens + completion_tokens,
+                    llm_calls_used=llm_calls,
+                    cost_used=run_cost,
+                )
+                trace.record("CONTEXT_PRESSURE", {
+                    "stage": "reflection",
+                    "context_state": exc.decision.state.value,
+                    "reason": exc.decision.reason,
+                    "estimated_prompt_tokens": exc.decision.estimated_prompt_tokens,
+                    "input_hard_capacity": exc.decision.input_hard_capacity,
+                    "breakdown": exc.decision.breakdown,
+                    "compaction_applied": True,
+                })
+                return ""
             except ReflectionContractExhausted as exc:
                 trace.record("REFLECTION_CONTRACT_EXHAUSTED", {
                     "call": reflection_calls, "trigger": reason,
@@ -1183,7 +1401,31 @@ class DiagnosisHarness:
             nonlocal duplicate_calls
             nonlocal planner_contract_retry_used
             nonlocal prior_context
+            nonlocal llm_calls, planner_calls
             start_steps, start_tools = state.step, state.tool_calls
+            prompt_compaction_attempts = 0
+
+            def progress_marker() -> ProgressMarker:
+                current = hypotheses[-1] if hypotheses else None
+                hypothesis_identity = (
+                    json.dumps(current.model_dump(), ensure_ascii=False, sort_keys=True, default=str)
+                    if current is not None else ""
+                )
+                return ProgressMarker(
+                    evidence_ids=frozenset(item.evidence_id for item in evidence_memory.pinned),
+                    hypothesis=(hypothesis_identity,),
+                    open_obligations=frozenset(
+                        item.id for item in (current.verification_obligations if current else ())
+                        if item.status == "OPEN"
+                    ),
+                    blocking_contradictions=frozenset(
+                        item.evidence_id for item in (current.contradictions if current else ())
+                        if item.blocks_finalization and item.status == "OPEN"
+                    ),
+                    components=frozenset(
+                        value for value in ((current.component,) if current else ()) if value
+                    ),
+                )
 
             def ensure_review_progress(candidate: RootCauseCandidate,
                                         current_hypothesis: IncidentHypothesis | None) -> None:
@@ -1209,6 +1451,7 @@ class DiagnosisHarness:
                 )
 
             while state.step - start_steps < step_limit:
+                progress_before_action = progress_marker()
                 tool_budget_remaining = max(0, tool_limit - (state.tool_calls - start_tools))
                 agent_steps_remaining = max(0, step_limit - (state.step - start_steps))
                 runtime_budget = budget_snapshot("investigation_loop")
@@ -1234,6 +1477,47 @@ class DiagnosisHarness:
                     return finalize_candidate(
                         fallback, termination_reason, hypothesis=hypotheses[-1],
                     )
+                dynamic_budget.set_run_usage(
+                    tokens_used=prompt_tokens + completion_tokens,
+                    llm_calls_used=llm_calls,
+                    cost_used=run_cost,
+                )
+                dynamic_state = dynamic_budget.decision(
+                    "planner_context", tokens_used=prompt_tokens,
+                    llm_calls_used=llm_calls,
+                    cost_used=run_cost,
+                )
+                current_evidence_payload = [
+                    item.model_dump(mode="json") for item in incident_evidence()
+                ]
+                prior_capacity = dynamic_budget.available_prior_capacity(
+                    critical_state_tokens=dynamic_budget.estimate_json_tokens({
+                        "incident": {"summary": case.summary, "system": case.system},
+                        "hypothesis": hypotheses[-1].model_dump() if hypotheses else None,
+                    }),
+                    verified_evidence_tokens=dynamic_budget.estimate_json_tokens(current_evidence_payload),
+                    required_control_tokens=dynamic_budget.estimate_json_tokens({
+                        "actions": actions[-8:], "rejected_actions": rejected_actions[-4:],
+                        "obligations": hypotheses[-1].verification_obligations if hypotheses else (),
+                    }),
+                    output_protocol_reserve=dynamic_budget.capability.protocol_safety_reserve_tokens,
+                )
+                bounded_prior = self._bound_prior_context(
+                    prior_context, prior_capacity, dynamic_budget.estimate_tokens,
+                )
+                if prior_context is not None and bounded_prior is not None and (
+                    len(bounded_prior.candidates) != len(prior_context.candidates)
+                    or bounded_prior.packed_tokens != prior_context.packed_tokens
+                ):
+                    trace.record("PRIOR_PRUNED", {
+                        "stage": "planner",
+                        "before_candidates": len(prior_context.candidates),
+                        "after_candidates": len(bounded_prior.candidates),
+                        "before_tokens": prior_context.packed_tokens,
+                        "after_tokens": bounded_prior.packed_tokens,
+                        "available_prior_capacity": prior_capacity,
+                        "context_state": dynamic_state.state.value,
+                    })
                 control_state = self._planner_control_state(
                     case, hypotheses, actions, review_feedback,
                     tool_budget_remaining=tool_budget_remaining,
@@ -1250,21 +1534,51 @@ class DiagnosisHarness:
                     entities=entities,
                     capabilities=capabilities,
                     router_decision=router_decision,
-                    prior_context=prior_context,
+                    prior_context=bounded_prior,
                 )
                 control_prefix = (
                     "AGENT_CONTROL_STATE:\n"
                     + json.dumps(control_state, ensure_ascii=False)
                     + "\n\nDIAGNOSTIC_CONTEXT:\n"
                 )
+                dynamic_context_tokens = dynamic_budget.context_token_budget(
+                    state=dynamic_state.state,
+                )
                 context_result = context_manager.build(
                     state, evidence_memory, observation_store,
-                    max_context_chars=self.config.max_context_chars,
+                    max_context_chars=(
+                        None if dynamic_context_tokens is not None else self.config.max_context_chars
+                    ),
+                    max_context_tokens=dynamic_context_tokens,
+                    token_estimator=dynamic_budget.estimate_tokens,
                     max_steps=step_limit, max_tool_calls=tool_limit,
                     include_agent_control_state=False,
                     external_context_chars=len(control_prefix),
+                    pressure_state=dynamic_state.state.value,
                 )
                 context = control_prefix + context_result.text
+                if dynamic_state.state is not BudgetState.NORMAL:
+                    trace.record("CONTEXT_PRESSURE", {
+                        "stage": "planner",
+                        "context_state": dynamic_state.state.value,
+                        "reason": dynamic_state.reason,
+                        "budget_tokens": context_result.budget_tokens,
+                        "used_tokens": context_result.used_tokens,
+                        "prior_capacity": prior_capacity,
+                    })
+                if dynamic_state.state is not BudgetState.NORMAL or context_result.dropped:
+                    trace.record("CONTEXT_COMPACTED", {
+                        "stage": "planner",
+                        "context_state": dynamic_state.state.value,
+                        "budget_tokens": context_result.budget_tokens,
+                        "used_tokens": context_result.used_tokens,
+                        "dropped_count": len(context_result.dropped),
+                        "selected_count": len(context_result.selected),
+                        "eviction_count": context_result.eviction_count,
+                        "rehydrated_evidence_count": context_result.breakdown.get(
+                            "rehydrated_item_count", 0
+                        ),
+                    })
                 trace.record("CONTEXT_BUILT", {
                     "stage": "planner", "budget_chars": context_result.budget_chars,
                     "used_chars": context_result.used_chars,
@@ -1288,8 +1602,25 @@ class DiagnosisHarness:
                     "diagnostic_context_chars": len(context_result.text),
                     "control_state_chars": len(control_prefix),
                     "planner_context_chars": len(context),
+                    "budget_tokens": context_result.budget_tokens,
+                    "used_tokens": context_result.used_tokens,
+                    "context_state": dynamic_state.state.value,
+                    "input_hard_capacity": dynamic_state.input_hard_capacity,
+                    "prior_capacity": prior_capacity,
                 })
+                rehydrated = [
+                    item for item in context_result.selected
+                    if str(item.get("projection_reason", "")).startswith("rehydrated_")
+                ]
+                if rehydrated:
+                    trace.record("OBSERVATION_REHYDRATED", {
+                        "stage": "planner",
+                        "count": len(rehydrated),
+                        "evidence_ids": [item.get("id") for item in rehydrated],
+                        "reason": "active_context_projection",
+                    })
                 planner_call_context = context
+                prompt_budget_retry = False
                 while True:
                     trace.record("PLANNER_CALL_STARTED", {
                         "step": state.step + 1,
@@ -1304,10 +1635,34 @@ class DiagnosisHarness:
                             planner.propose,
                             state, planner_call_context,
                             logical_timeout_seconds=planner_timeout,
+                            prompt_budget=dynamic_budget,
                             hard_timeout_seconds=planner_timeout,
                             state_source=planner,
-                            state_attributes=("last_prompt_breakdown",),
+                            state_attributes=("last_prompt_breakdown", "last_prompt_breakdowns"),
                         )
+                        break
+                    except PromptBudgetExceeded as exc:
+                        # Admission happens before the agent can render its
+                        # complete provider payload. This was a local
+                        # compaction attempt, not an LLM call.
+                        llm_calls = max(0, llm_calls - 1)
+                        planner_calls = max(0, planner_calls - 1)
+                        prompt_compaction_attempts += 1
+                        decision = exc.decision
+                        trace.record("CONTEXT_PRESSURE", {
+                            "stage": "planner",
+                            "context_state": decision.state.value,
+                            "reason": decision.reason,
+                            "estimated_prompt_tokens": decision.estimated_prompt_tokens,
+                            "input_hard_capacity": decision.input_hard_capacity,
+                            "breakdown": decision.breakdown,
+                            "compaction_applied": True,
+                        })
+                        if prompt_compaction_attempts > 2:
+                            raise RuntimeError(
+                                "hard prompt capacity remains exceeded after bounded context compaction"
+                            ) from exc
+                        prompt_budget_retry = True
                         break
                     except LLMDeadlineExceeded as exc:
                         trace.record("PLANNER_CALL_TIMEOUT", {
@@ -1358,7 +1713,7 @@ class DiagnosisHarness:
                             "planner_metadata": planner_metadata or {},
                         })
                         raise PlannerContractExhausted(exc) from exc
-                    except Exception as exc:
+                    except PromptBudgetExceeded as exc:
                         planner_failure = {
                             "step": state.step + 1,
                             "error_type": type(exc).__name__, "message": str(exc),
@@ -1368,10 +1723,26 @@ class DiagnosisHarness:
                             planner_failure["planner_metadata"] = planner_metadata
                         trace.record("PLANNER_CALL_FAILED", planner_failure)
                         raise
-                add_usage(result)
+                    except Exception as exc:
+                        planner_failure = {
+                            "step": state.step + 1,
+                            "error_type": type(exc).__name__, "message": str(exc),
+                        }
+                        trace.record("PLANNER_CALL_FAILED", planner_failure)
+                        raise
+                if prompt_budget_retry:
+                    # Re-enter the outer loop so ContextManager can compact
+                    # L2/L3 while preserving Critical State and Evidence.
+                    continue
+                add_usage(
+                    result, stage="planner",
+                    prompt_breakdown=getattr(planner, "last_prompt_breakdown", None),
+                )
+                dynamic_budget.clear_context_state_override()
                 trace.record("PLANNER_CALL_COMPLETED", {
                     "step": state.step + 1,
                     "prompt_breakdown": dict(planner.last_prompt_breakdown),
+                    "prompt_breakdowns": list(getattr(planner, "last_prompt_breakdowns", ()) or ()),
                     "usage": dict(result.response.usage or {}),
                 })
                 state.step += 1
@@ -1658,6 +2029,26 @@ class DiagnosisHarness:
                             trace.record("EVIDENCE_ADDED", item)
                     else:
                         trace.record("REFLECTION_TRIGGER", {"reason": "no_progress", "step": state.step})
+                    progress_after_action = progress_marker()
+                    dynamic_progress = progress_made(
+                        progress_before_action, progress_after_action,
+                    )
+                    dynamic_state_after_action = dynamic_budget.decision(
+                        "post_tool_progress",
+                        tokens_used=prompt_tokens,
+                        llm_calls_used=llm_calls,
+                        cost_used=run_cost,
+                    )
+                    trace.record("DYNAMIC_PROGRESS_CHECK", {
+                        "step": state.step,
+                        "tool": call.name,
+                        "progress": dynamic_progress,
+                        "context_state": dynamic_state_after_action.state.value,
+                        "evidence_count": len(progress_after_action.evidence_ids),
+                        "open_obligation_count": len(progress_after_action.open_obligations),
+                        "blocking_contradiction_count": len(progress_after_action.blocking_contradictions),
+                        "component_count": len(progress_after_action.components),
+                    })
                     loop_guard.observe_semantic_progress(
                         state,
                         evidence_ids=(item.evidence_id for item in evidence_memory.pinned),
@@ -1765,8 +2156,41 @@ class DiagnosisHarness:
                                 "last_usage", "last_schema_repaired", "last_repair_attempted",
                                 "last_deterministic_normalized", "last_schema_error", "last_call_count",
                                 "last_attempts", "last_failure_type",
+                                "last_prompt_breakdown",
+                                "last_prompt_breakdowns",
                             ),
+                            prompt_budget=dynamic_budget,
                         )
+                    except PromptBudgetExceeded as exc:
+                        # Review is the terminal semantic gate. If even its
+                        # complete payload cannot fit, stop fail-closed as
+                        # INCONCLUSIVE; never invoke the provider with an
+                        # over-capacity prompt.
+                        llm_calls = max(0, llm_calls - 1)
+                        review_calls = max(0, review_calls - 1)
+                        dynamic_budget.set_run_usage(
+                            tokens_used=prompt_tokens + completion_tokens,
+                            llm_calls_used=llm_calls,
+                            cost_used=run_cost,
+                        )
+                        review_usage_accounted = True
+                        trace.record("CONTEXT_PRESSURE", {
+                            "stage": "review",
+                            "context_state": exc.decision.state.value,
+                            "reason": exc.decision.reason,
+                            "estimated_prompt_tokens": exc.decision.estimated_prompt_tokens,
+                            "input_hard_capacity": exc.decision.input_hard_capacity,
+                            "breakdown": exc.decision.breakdown,
+                            "compaction_applied": False,
+                        })
+                        trace.record("TERMINAL_RESERVE_PROTECTED", {
+                            "stage": "review",
+                            "reason": "final Review prompt cannot fit physical input capacity",
+                        })
+                        status = "INCONCLUSIVE"
+                        termination_reason = "review_prompt_capacity_exceeded"
+                        error_type, error_message = type(exc).__name__, str(exc)
+                        break
                     except Exception as exc:
                         materialize_review_attempts(
                             reviewer, review_attempt_state.value,
@@ -1775,7 +2199,10 @@ class DiagnosisHarness:
                             terminal_error=exc,
                         )
                         account_review_attempts(reviewer)
-                        add_usage(reviewer)
+                        add_usage(
+                            reviewer, stage="review",
+                            prompt_breakdown=getattr(reviewer, "last_prompt_breakdown", None),
+                        )
                         review_usage_accounted = True
                         record_review_trace(
                             round_number=review_rounds,
@@ -1788,7 +2215,10 @@ class DiagnosisHarness:
                         )
                         raise
                     account_review_attempts(reviewer)
-                    add_usage(reviewer)
+                    add_usage(
+                        reviewer, stage="review",
+                        prompt_breakdown=getattr(reviewer, "last_prompt_breakdown", None),
+                    )
                     review_usage_accounted = True
                     record_review_trace(
                         round_number=review_rounds,
@@ -1842,7 +2272,10 @@ class DiagnosisHarness:
                 except ReviewSchemaError as exc:
                     if not review_usage_accounted:
                         account_review_attempts(reviewer)
-                        add_usage(reviewer)
+                        add_usage(
+                            reviewer, stage="review",
+                            prompt_breakdown=getattr(reviewer, "last_prompt_breakdown", None),
+                        )
                     trace.record("REVIEW_ERROR", {
                         "round": review_rounds, "error_type": type(exc).__name__,
                         "message": str(exc), "validation_error": reviewer.last_schema_error,
@@ -2064,6 +2497,7 @@ class DiagnosisHarness:
             metrics=IncidentMetrics(
                 steps=state.step, tool_calls=state.tool_calls, prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens, total_tokens=prompt_tokens + completion_tokens,
+                cost=run_cost if cost_measured else None,
                 llm_calls=llm_calls,
                 planner_calls=planner_calls,
                 review_calls=review_calls,
@@ -2101,6 +2535,8 @@ class DiagnosisHarness:
         return (
             " ".join(candidate.component.split()).casefold(),
             " ".join(candidate.fault.split()).casefold(),
+            " ".join(candidate.fault_code.split()).casefold(),
+            " ".join(candidate.fault_explanation.split()).casefold(),
             " ".join(candidate.mechanism.split()).casefold(),
             tuple(sorted(set(candidate.evidence_ids))),
         )
@@ -2113,6 +2549,8 @@ class DiagnosisHarness:
             normalize(hypothesis.evidence_gap),
             normalize(hypothesis.component),
             normalize(hypothesis.fault),
+            normalize(hypothesis.fault_code),
+            normalize(hypothesis.fault_explanation),
             normalize(hypothesis.mechanism),
             tuple(sorted(set(hypothesis.supporting_evidence_ids))),
             tuple(sorted(set(hypothesis.contradicting_evidence_ids))),
@@ -2130,6 +2568,8 @@ class DiagnosisHarness:
         return (
             normalize(hypothesis.component),
             normalize(hypothesis.fault),
+            normalize(hypothesis.fault_code),
+            normalize(hypothesis.fault_explanation),
             normalize(hypothesis.mechanism_category or hypothesis.mechanism),
         )
 
@@ -2173,6 +2613,33 @@ class DiagnosisHarness:
         if baseline_hypothesis is None:
             return True
         return cls._hypothesis_semantic_fingerprint(baseline_hypothesis) != cls._hypothesis_semantic_fingerprint(current_hypothesis)
+
+    @staticmethod
+    def _bound_prior_context(prior_context, token_budget: int | None, estimator) -> Any | None:
+        """Project Prior into the available L3 slice without touching Evidence."""
+        if prior_context is None or token_budget is None:
+            return prior_context
+        remaining = max(0, int(token_budget))
+        selected = []
+        for candidate in prior_context.candidates:
+            size = max(0, int(estimator(candidate.content)))
+            if size > remaining:
+                continue
+            selected.append(candidate)
+            remaining -= size
+            if remaining <= 0:
+                break
+        packed_chars = sum(len(item.content) for item in selected)
+        return prior_context.model_copy(update={
+            "candidates": tuple(selected),
+            "source_types": tuple(dict.fromkeys(item.source_type for item in selected)),
+            "provenance": tuple({
+                (item.provenance.source, item.provenance.source_id, item.provenance.path): item.provenance
+                for item in selected
+            }.values()),
+            "packed_chars": packed_chars,
+            "packed_tokens": max(0, sum(int(estimator(item.content)) for item in selected)),
+        })
 
     @staticmethod
     def _failure_category(exc: Exception) -> str:
@@ -2320,6 +2787,8 @@ class DiagnosisHarness:
         return RootCauseCandidate(
             component=hypothesis.component,
             fault=hypothesis.fault,
+            fault_code=hypothesis.fault_code,
+            fault_explanation=hypothesis.fault_explanation,
             mechanism=hypothesis.mechanism,
             evidence_ids=hypothesis.supporting_evidence_ids,
             confidence=0.7,
@@ -2370,6 +2839,8 @@ class DiagnosisHarness:
             # These are the only final root-cause fields used by Runtime.
             component=hypothesis.component,
             fault=hypothesis.fault,
+            fault_code=hypothesis.fault_code,
+            fault_explanation=hypothesis.fault_explanation,
             mechanism=hypothesis.mechanism,
             evidence_ids=supporting,
             confidence=float(proposal.get("confidence", 0.7)),
@@ -2412,7 +2883,10 @@ def _provider_process_worker(send_connection, method, args, kwargs,
         send_connection.send(("ok", result, state))
     except BaseException as exc:
         state = {name: getattr(state_source, name) for name in state_attributes}
-        send_connection.send(("error", type(exc).__name__, str(exc), state))
+        send_connection.send((
+            "error", type(exc).__name__, str(exc), state,
+            getattr(exc, "metadata", None),
+        ))
     finally:
         send_connection.close()
 
@@ -2448,7 +2922,9 @@ def _call_in_terminable_process(method, args, kwargs, timeout_seconds: float,
         for name, value in state.items():
             setattr(state_source, name, value)
         return result
-    _, error_type, message, state = packet
+    _, error_type, message, state, metadata = (
+        (*packet, None) if len(packet) == 4 else packet
+    )
     for name, value in state.items():
         setattr(state_source, name, value)
     if error_type == "LLMDeadlineExceeded":
@@ -2461,6 +2937,22 @@ def _call_in_terminable_process(method, args, kwargs, timeout_seconds: float,
         raise ReflectionContractExhausted(message)
     if error_type == "ReviewSchemaError":
         raise ReviewSchemaError(message)
+    if error_type == "PromptBudgetExceeded":
+        from debug_assistant.harness.dynamic_budget import PromptBudgetDecision
+        metadata = metadata if isinstance(metadata, dict) else {}
+        decision = PromptBudgetDecision(
+            stage=str(metadata.get("stage", "unknown")),
+            estimated_prompt_tokens=int(metadata.get("estimated_prompt_tokens", 0) or 0),
+            input_hard_capacity=metadata.get("input_hard_capacity"),
+            state=BudgetState(str(metadata.get("state", "HARD_PRESSURE"))),
+            remaining_run_tokens=0,
+            terminal_reserve_tokens=0,
+            terminal_reserve_llm_calls=0,
+            breakdown=dict(metadata.get("breakdown") or {}),
+            compaction_required=True,
+            reason="prompt is at the physical input boundary",
+        )
+        raise PromptBudgetExceeded(decision)
     raise RuntimeError(f"provider child failed with {error_type}: {message}")
 
 

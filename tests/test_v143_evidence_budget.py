@@ -134,7 +134,7 @@ class _StageGuardLLM:
                     'confidence':.2,'hypothesis_changed':False}
         self.plan_calls+=1
         return {'kind':'tool','skill':'repository_exploration','reason':'read source','confidence':.6,
-                'tool':'read_file','arguments':{'path':'a.py','start_line':1,'end_line':5},
+                'tool':'read_file','arguments':{'path':'a.py','start_line':1,'line_count':5},
                 'expected_evidence':'source','information_need':'inspect source'}
 
 

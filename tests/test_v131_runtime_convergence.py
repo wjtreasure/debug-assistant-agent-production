@@ -24,9 +24,9 @@ class ConvergenceLLM:
                     'evidence_ids':list(dict.fromkeys(ids))[:1],'confidence':.9}
         self.planner_n+=1
         if self.planner_n==1:
-            return {'kind':'tool','skill':'repository_exploration','reason':'read target','tool':'read_file','arguments':{'path':'a.py','start_line':1,'end_line':20},'expected_evidence':'source','information_need':'inspect boundary source','confidence':.9}
+            return {'kind':'tool','skill':'repository_exploration','reason':'read target','tool':'read_file','arguments':{'path':'a.py','start_line':1,'line_count':20},'expected_evidence':'source','information_need':'inspect boundary source','confidence':.9}
         # Keep asking for already-covered source with changing nonessential intents. Rehydration + reflection should converge before the mock can run forever.
-        return {'kind':'tool','skill':'hypothesis_validation','reason':'optional confirmation','tool':'read_file','arguments':{'path':'a.py','start_line':5,'end_line':10},
+        return {'kind':'tool','skill':'hypothesis_validation','reason':'optional confirmation','tool':'read_file','arguments':{'path':'a.py','start_line':5,'line_count':6},
                 'expected_evidence':'same source','information_need':f'optional check {self.planner_n}','confidence':.8}
 
 def test_runtime_force_finalizes_after_stable_no_progress(monkeypatch,tmp_path):

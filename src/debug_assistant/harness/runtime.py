@@ -6,6 +6,7 @@ from debug_assistant.models import AgentState, ActionKind, TaskSpec, RuntimeStag
 from debug_assistant.llm.factory import build_llm
 from debug_assistant.llm.base import LLMError, LLMDeadlineExceeded, LLMTransportTimeout
 from debug_assistant.tools.registry import ToolRegistry
+from debug_assistant.tools.repository import REPOSITORY_SOURCE_MAX_LINES
 from debug_assistant.repository.index import RepositoryIndex, IndexDeadlineExceeded
 from debug_assistant.repository.safe_fs import SafeRepositoryFS
 from debug_assistant.repository.paths import ResolutionMode, RepositoryPathError
@@ -758,7 +759,7 @@ class AgentHarness:
             def add(relation,row,path,start,end,code,resolution_kind='exact'):
                 if not path or not start or not end or not code:return
                 rows.append(ToolObservation('read_file',True,code,{
-                    'path':path,'start_line':int(start),'end_line':int(end),'requested_end_line':int(end),'truncated':False,'retryable':False,
+                    'path':path,'start_line':int(start),'end_line':int(end),'requested_line_count':int(end)-int(start)+1,'truncated':False,'retryable':False,
                     'provenance':{'parent_tool':'inspect_symbol_context','parent_observation_id':parent_obs.observation_id,'relation':relation,'symbol':row.get('symbol') or row.get('qualified_name') or row.get('name'),'resolution_kind':resolution_kind}
                 }))
             d=data.get('definition') or {}
@@ -842,9 +843,11 @@ class AgentHarness:
             nonlocal last_redundant_key, force_reflect
             if not flags.observation_reuse:
                 return False
-            path=arguments.get('path'); start=arguments.get('start_line'); end=arguments.get('end_line')
-            if not path or not isinstance(start,int) or not isinstance(end,int):
+            path=arguments.get('path'); start=arguments.get('start_line'); line_count=arguments.get('line_count')
+            if (not path or not isinstance(start,int) or not isinstance(line_count,int)
+                    or line_count < 1 or line_count > REPOSITORY_SOURCE_MAX_LINES):
                 return False
+            end=start+line_count-1
             try:
                 resolved=tools.path_resolver.resolve_file(path,mode=ResolutionMode.READ_TOLERANT)
                 if resolved.strategy != 'exact_relative' or resolved.relative_path != path:
@@ -866,7 +869,7 @@ class AgentHarness:
                 state.redundant_request_count+=1
                 streak=controller.note_redundant() if controller is not None else 1
                 trace.record('REDUNDANT_CONTEXT_REQUEST',{
-                    'requested':{'path':path,'start_line':start,'end_line':end},
+                    'requested':{'path':path,'start_line':start,'line_count':line_count},
                     'covered_by':observation.observation_id,'information_need':need,
                     'redundant_request_streak':streak,
                     'message':'requested source is already fully visible; reason from current context',
@@ -884,7 +887,7 @@ class AgentHarness:
                 if controller is not None:
                     controller.note_nonredundant_action()
                 payload={
-                    'requested':{'path':path,'start_line':start,'end_line':end},
+                    'requested':{'path':path,'start_line':start,'line_count':line_count},
                     'reused_observation_id':observation.observation_id,
                     'original_coverage':{'start_line':hit.start_line,'end_line':hit.end_line},
                     'information_need':need,'information_need_satisfied':True,

@@ -13,7 +13,10 @@ def test_render_exposes_read_file_schema(tmp_path):
     text=ToolRegistry(tmp_path).render()
     assert 'read_file' in text
     assert 'start_line' in text
-    assert 'end_line' in text
+    assert 'line_count' in text
+    params=ToolRegistry(tmp_path).get('read_file').spec.json_schema()['properties']
+    assert 'end_line' not in params
+    assert params['line_count']['maximum']==200
     assert 'cost=light' in text
 
 
@@ -21,7 +24,7 @@ def test_read_file_output_is_bounded(tmp_path):
     p=tmp_path/'a.py'
     p.write_text('\n'.join(str(i) for i in range(1,401)))
     tool=ToolRegistry(tmp_path).get('read_file')
-    obs=tool.execute(path='a.py',start_line=1,end_line=200)
+    obs=tool.execute(path='a.py',start_line=1,line_count=200)
     assert obs.ok
     assert obs.metadata['end_line']==200
     assert len(obs.content.splitlines())==200

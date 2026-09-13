@@ -34,7 +34,7 @@ def _ev(eid, path, obs_id, start=1, end=20, summary="source"):
 
 
 def test_detect_tool_action_is_conservative():
-    assert detect_tool_action('<read_file path="a.py" start_line="1" end_line="20" />') == "xml_tool_action"
+    assert detect_tool_action('<read_file path="a.py" start_line="1" line_count="20" />') == "xml_tool_action"
     assert detect_tool_action('tool_call: {"name":"read_file"}') == "tool_call_marker"
     assert detect_tool_action({"kind":"tool","skill":"x","tool":"grep","arguments":{}}) == "agent_action_object"
     # Natural prose mentioning tool names must not be rejected.
@@ -83,7 +83,7 @@ def test_reporter_tool_action_is_explicit_contract_violation():
     class ToolLikeLLM:
         def __init__(self): self.calls=[]; self.last_raw_content=None
         def complete_json(self,system,user,model=None):
-            self.last_raw_content='<read_file path="a.py" start_line="1" end_line="20" />'
+            self.last_raw_content='<read_file path="a.py" start_line="1" line_count="20" />'
             raise RuntimeError('not json')
     reporter=Reporter(ToolLikeLLM(),compact_prompt=True)
     try:
@@ -134,10 +134,10 @@ class _ColdReporterE2ELLm:
                  'arguments':{'query':'_do_load|_invoke_field_validators','glob':'*.py','max_results':20},'expected_evidence':'locations','information_need':'find load path'}
         elif self.planner_n == 2:
             obj={'kind':'tool','skill':'hypothesis_validation','reason':'read schema','confidence':.9,'tool':'read_file',
-                 'arguments':{'path':'src/marshmallow/schema.py','start_line':1,'end_line':80},'expected_evidence':'_do_load source','information_need':'inspect _do_load'}
+                 'arguments':{'path':'src/marshmallow/schema.py','start_line':1,'line_count':80},'expected_evidence':'_do_load source','information_need':'inspect _do_load'}
         else:
             obj={'kind':'tool','skill':'hypothesis_validation','reason':'read unmarshal','confidence':.9,'tool':'read_file',
-                 'arguments':{'path':'src/marshmallow/marshalling.py','start_line':1,'end_line':40},'expected_evidence':'unmarshal error path','information_need':'inspect unmarshal'}
+                 'arguments':{'path':'src/marshmallow/marshalling.py','start_line':1,'line_count':40},'expected_evidence':'unmarshal error path','information_need':'inspect unmarshal'}
         self.last_raw_content=json.dumps(obj)
         return obj
 

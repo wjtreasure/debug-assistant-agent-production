@@ -17,6 +17,14 @@ class ModelConfig:
     critic_model: str = ""
     timeout: float = 60.0
     temperature: float = 0.0
+    # Optional provider-advertised physical limits.  ``None`` preserves the
+    # legacy char-budget fallback for adapters that do not expose a model
+    # capability snapshot.
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+    tokenizer: str = "char4"
+    reserved_output_tokens: int = 0
+    protocol_safety_reserve_tokens: int = 0
 
 @dataclass(slots=True)
 class ContextConfig:
@@ -54,6 +62,11 @@ class HarnessConfig:
     max_context_chars: int = 50_000
     max_llm_calls: int = 40
     max_total_tokens: int = 180_000
+    max_cost_per_incident: float | None = None
+    terminal_reserve_tokens: int = 0
+    terminal_reserve_llm_calls: int = 3
+    context_pressure_ratio: float = 0.75
+    hard_pressure_ratio: float = 0.95
     max_wall_time_seconds: int = 900
     finalization_reserve_seconds: int = 90
     planner_start_guard_seconds: int = 60
@@ -116,6 +129,11 @@ class AppConfig:
                 critic_model=get("DEBUG_AGENT_CRITIC_MODEL", ""),
                 timeout=float(get("DEBUG_AGENT_TIMEOUT", "60")),
                 temperature=float(get("DEBUG_AGENT_TEMPERATURE", "0")),
+                context_window=(int(get("DEBUG_AGENT_CONTEXT_WINDOW", "0")) or None),
+                max_output_tokens=(int(get("DEBUG_AGENT_MAX_OUTPUT_TOKENS", "0")) or None),
+                tokenizer=get("DEBUG_AGENT_TOKENIZER", "char4"),
+                reserved_output_tokens=int(get("DEBUG_AGENT_RESERVED_OUTPUT_TOKENS", "0")),
+                protocol_safety_reserve_tokens=int(get("DEBUG_AGENT_PROTOCOL_SAFETY_RESERVE_TOKENS", "0")),
             ),
             harness=HarnessConfig(
                 max_steps=int(get("DEBUG_AGENT_MAX_STEPS", "20")),
@@ -123,6 +141,13 @@ class AppConfig:
                 max_context_chars=int(get("DEBUG_AGENT_MAX_CONTEXT_CHARS", "50000")),
                 max_llm_calls=int(get('DEBUG_AGENT_MAX_LLM_CALLS','40')),
                 max_total_tokens=int(get('DEBUG_AGENT_MAX_TOTAL_TOKENS','180000')),
+                max_cost_per_incident=(
+                    float(get('DEBUG_AGENT_MAX_COST_PER_INCIDENT', '0')) or None
+                ),
+                terminal_reserve_tokens=int(get('DEBUG_AGENT_TERMINAL_RESERVE_TOKENS','0')),
+                terminal_reserve_llm_calls=int(get('DEBUG_AGENT_TERMINAL_RESERVE_LLM_CALLS','3')),
+                context_pressure_ratio=float(get('DEBUG_AGENT_CONTEXT_PRESSURE_RATIO','0.75')),
+                hard_pressure_ratio=float(get('DEBUG_AGENT_HARD_PRESSURE_RATIO','0.95')),
                 max_wall_time_seconds=int(get('DEBUG_AGENT_MAX_WALL_TIME_SECONDS','900')),
                 finalization_reserve_seconds=int(get('DEBUG_AGENT_FINALIZATION_RESERVE_SECONDS','90')),
                 planner_start_guard_seconds=int(get('DEBUG_AGENT_PLANNER_START_GUARD_SECONDS','60')),

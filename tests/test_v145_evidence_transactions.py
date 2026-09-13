@@ -199,7 +199,7 @@ class _LifecycleLLM:
         self.planner_n+=1
         if self.planner_n==1:
             return {'kind':'tool','skill':'repository_exploration','reason':'read foo','confidence':.8,'tool':'read_file',
-                    'arguments':{'path':'a.py','start_line':1,'end_line':10},'expected_evidence':'foo source','information_need':'inspect foo behavior',
+                    'arguments':{'path':'a.py','start_line':1,'line_count':10},'expected_evidence':'foo source','information_need':'inspect foo behavior',
                     'information_need_structured':{'target':'foo behavior','question_type':'behavior','evidence_goal':'read foo source'}}
         return {'kind':'finish','skill':'hypothesis_validation','reason':'done','confidence':.9,'tool':None,'arguments':{},'expected_evidence':'','information_need':''}
 

@@ -86,10 +86,13 @@ def _pack_candidates(query: KnowledgeQuery, candidates: Iterable[KnowledgeCandid
     used = 0
     for candidate in candidates:
         size = len(candidate.content)
-        if selected and used + size > budget:
+        # token_budget is a ceiling, not a fill target.  Preserve candidate
+        # boundaries and skip an item that cannot fit rather than truncating a
+        # prior into misleading partial content.
+        if size > budget - used:
             continue
         selected.append(candidate)
-        used += min(size, budget)
+        used += size
         if len(selected) >= query.top_k:
             break
     return tuple(selected)

@@ -136,6 +136,7 @@ class KnowledgeRetrievalDiagnostics(BaseModel):
     token_budget: int | None = Field(default=None, ge=1)
     packed_candidates: int | None = Field(default=None, ge=0)
     dropped_candidates: int | None = Field(default=None, ge=0)
+    packing_stop_reason: str = ""
 
 
 class KnowledgeRetrievalResult(BaseModel):

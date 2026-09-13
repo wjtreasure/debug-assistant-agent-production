@@ -82,6 +82,8 @@ class NativeSkillSelection:
     mechanism_category: str = ""
     verification_obligations: tuple[VerificationObligation, ...] = ()
     contradictions: tuple[Contradiction, ...] = ()
+    candidate_fault_code: str = ""
+    candidate_fault_explanation: str = ""
     # Optional provider metadata is useful when valid, but it must not make a
     # valid tool request unusable merely because an older/model-specific
     # provider serialized that additive block imperfectly.  The warning is
@@ -117,9 +119,10 @@ class NativeToolPlanner:
     def __init__(self, llm, tools, model: str = ""):
         self.llm, self.tools, self.model = llm, tools, model
         self.last_prompt_breakdown = {}
+        self.last_prompt_breakdowns: list[dict[str, Any]] = []
 
     def propose(self, state: AgentState, context: str, *, logical_timeout_seconds=None,
-                on_attempt_started=None) -> NativePlannerResult:
+                on_attempt_started=None, prompt_budget=None) -> NativePlannerResult:
         if not getattr(getattr(self.llm, "capabilities", ProviderCapabilities()), "tool_calling", False):
             raise PlannerContractError("provider does not support native tool calling",
                                        validation_errors=["tool_calling=false"])
@@ -162,9 +165,15 @@ class NativeToolPlanner:
                 "name; when the exact name is unknown, omit name or list first, then use the returned exact name. "
                 "When TOOL_BUDGET_REMAINING is zero, do not request another observation tool; use "
                 "finalize_diagnosis if the existing evidence supports a component and mechanism. "
+                "For read_file, always provide start_line plus line_count; line_count is the number "
+                "of requested lines, inclusive of start_line, and must be between 1 and 200. Never "
+                "provide end_line for read_file. "
                 "Use finalize_diagnosis only when the cited evidence supports both component and causal mechanism. "
                 "At finalize_diagnosis, component/fault/mechanism/evidence_ids are compatibility projections; "
                 "the Runtime freezes the already validated current Hypothesis as the Candidate core. "
+                "When known, keep candidate_fault_code as a lowercase snake_case taxonomy identifier and "
+                "candidate_fault_explanation as the evidence-grounded natural-language explanation; never "
+                "guess a taxonomy code solely to satisfy a field. "
                 "Use claim_evidence_mapping and causal_chain_summary to explain that frozen diagnosis, and "
                 "keep their Evidence IDs within the Hypothesis supporting Evidence. "
                 "If a bound application source workspace is available and runtime evidence leaves an implementation gap, "
@@ -188,6 +197,19 @@ class NativeToolPlanner:
             schemas = [_with_incident_skill_controls(schema) for schema in schemas]
         self.last_prompt_breakdown = {"system_chars": len(system), "context_chars": len(user),
                                       "tool_schema_count": len(schemas)}
+        self.last_prompt_breakdowns = []
+        if prompt_budget is not None:
+            decision = prompt_budget.check_prompt(
+                "planner", system, user, tools=schemas,
+                breakdown={"incident": context},
+            )
+            self.last_prompt_breakdown.update({
+                "estimated_prompt_tokens": decision.estimated_prompt_tokens,
+                "input_hard_capacity": decision.input_hard_capacity,
+                "budget_state": decision.state.value,
+                "token_breakdown": dict(decision.breakdown),
+            })
+            self.last_prompt_breakdowns.append(dict(self.last_prompt_breakdown))
         method = getattr(self.llm, "complete_with_tools", None)
         if method is None:
             raise PlannerContractError("provider has no complete_with_tools API")
@@ -251,6 +273,8 @@ class NativeToolPlanner:
                 remaining_need = control["remaining_evidence_need"]
                 source_mechanism_status = control.get("source_mechanism_status") or "unknown"
                 mechanism_category = control["mechanism_category"] or ""
+                fault_code = control.get("candidate_fault_code") or ""
+                fault_explanation = control.get("candidate_fault_explanation") or ""
                 raw_obligations = control["verification_obligations"]
                 raw_contradictions = control["contradictions"]
                 if skill not in INCIDENT_SKILLS:
@@ -270,6 +294,13 @@ class NativeToolPlanner:
                         "incident hypothesis completion fields must be strings",
                         error_type="malformed_hypothesis_completion",
                         validation_errors=["candidate_component", "candidate_fault", "candidate_mechanism", "remaining_evidence_need"],
+                        output={"tool": call.name},
+                    )
+                if not all(isinstance(value, str) for value in (fault_code, fault_explanation)):
+                    raise NativePlannerContractError(
+                        "structured fault fields must be strings",
+                        error_type="malformed_hypothesis_completion",
+                        validation_errors=["candidate_fault_code", "candidate_fault_explanation"],
                         output={"tool": call.name},
                     )
                 if not all(isinstance(value, list) and all(isinstance(item, str) for item in value)
@@ -362,6 +393,7 @@ class NativeToolPlanner:
                     sufficiency, remaining_need.strip(), source_mechanism_status,
                     mechanism_category.strip(),
                     obligations, structured_contradictions,
+                    fault_code.strip(), fault_explanation.strip(),
                     reasoning_metadata_warnings,
                     reasoning_metadata_normalizations,
                     reasoning_metadata_drops,
@@ -547,11 +579,15 @@ def _parse_optional_reasoning_items(raw, *, field_name: str, model_type) -> Opti
     )
 
 
-_INCIDENT_SKILL_CONTROL_FIELDS = (
+_INCIDENT_REQUIRED_CONTROL_FIELDS = (
     "skill", "skill_reason", "current_hypothesis", "evidence_gap",
     "candidate_component", "candidate_fault", "candidate_mechanism",
     "supporting_evidence_ids", "contradicting_evidence_ids",
     "required_evidence_gaps", "evidence_sufficiency", "remaining_evidence_need",
+)
+
+_INCIDENT_SKILL_CONTROL_FIELDS = _INCIDENT_REQUIRED_CONTROL_FIELDS + (
+    "candidate_fault_code", "candidate_fault_explanation",
     "source_mechanism_status", "mechanism_category", "verification_obligations", "contradictions",
 )
 
@@ -568,7 +604,9 @@ def _with_incident_skill_controls(schema: dict[str, Any]) -> dict[str, Any]:
         "current_hypothesis": {"type": "string", "minLength": 1, "description": "Current falsifiable hypothesis before the action."},
         "evidence_gap": {"type": "string", "minLength": 1, "description": "Specific missing evidence this action should obtain."},
         "candidate_component": {"type": "string", "description": "Current root-cause component, or empty when unknown."},
-        "candidate_fault": {"type": "string", "description": "Current fault classification in natural language, or empty when unknown."},
+        "candidate_fault": {"type": "string", "description": "Compatibility natural-language fault projection, or empty when unknown."},
+        "candidate_fault_code": {"type": "string", "description": "Structured lowercase snake_case fault taxonomy code, when known; do not invent one."},
+        "candidate_fault_explanation": {"type": "string", "description": "Evidence-grounded natural-language explanation of the fault, separate from the taxonomy code."},
         "candidate_mechanism": {"type": "string", "description": "Current causal mechanism, or empty when unknown."},
         "supporting_evidence_ids": {"type": "array", "items": {"type": "string", "pattern": "^ev-"}, "description": "Existing ev-* Evidence IDs supporting the current root cause. Include every fact needed to substantiate the component and causal mechanism because Final Review cannot see uncited evidence."},
         "contradicting_evidence_ids": {"type": "array", "items": {"type": "string", "pattern": "^ev-"}, "description": "Existing ev-* Evidence IDs that critically contradict the current root cause."},
@@ -603,7 +641,7 @@ def _with_incident_skill_controls(schema: dict[str, Any]) -> dict[str, Any]:
     # ``mechanism_category`` is an optional descriptive projection just like
     # the two nested metadata blocks.  The canonical causal fields are the
     # candidate component/fault/mechanism strings above.
-    required_controls = _INCIDENT_SKILL_CONTROL_FIELDS[:-3]
+    required_controls = _INCIDENT_REQUIRED_CONTROL_FIELDS
     parameters["required"] = required + [name for name in required_controls if name not in required]
     return enriched
 
@@ -791,7 +829,7 @@ def _validate_repair_patch(primary: Any, repaired: Any) -> tuple[dict[str, Any],
     merged.update(patch)
     return merged, None
 
-SYSTEM="""You are the planner inside a read-only software debugging agent. Diagnose the issue; never propose edits, patches, write commands, package installation, network side effects, or repository mutation. Every conclusion must be grounded in repository evidence. Choose one next action, not a workflow plan. You may choose kind="parallel" only for 2-4 independent read-only tool calls that serve the same information need; child arguments must not depend on sibling results. Prefer falsification over confirmation. Do not repeat equivalent calls. High confidence does not grant permission. Tool argument names and constraints are strict: use only fields shown in the tool catalog. For read_file, start_line/end_line are inclusive and a request may contain at most 200 lines, so end_line - start_line + 1 <= 200. Context IDs are optional hints: only reference IDs that appear in CONTEXT_CATALOG.
+SYSTEM="""You are the planner inside a read-only software debugging agent. Diagnose the issue; never propose edits, patches, write commands, package installation, network side effects, or repository mutation. Every conclusion must be grounded in repository evidence. Choose one next action, not a workflow plan. You may choose kind="parallel" only for 2-4 independent read-only tool calls that serve the same information need; child arguments must not depend on sibling results. Prefer falsification over confirmation. Do not repeat equivalent calls. High confidence does not grant permission. Tool argument names and constraints are strict: use only fields shown in the tool catalog. For read_file, use start_line plus line_count, where line_count is an integer from 1 through 200. line_count is the number of lines to read, so do not calculate or provide end_line. Context IDs are optional hints: only reference IDs that appear in CONTEXT_CATALOG.
 
 When another tool call is necessary, describe the unresolved question in both information_need and information_need_structured when possible. Keep structured fields semantically stable across paraphrases. Generic examples:
 - Exact-symbol issue: target="Parser.visit_unknown", question_type="location", evidence_goal="locate unknown-node dispatch implementation".
@@ -800,7 +838,8 @@ Do not copy example targets when they are unrelated to the current issue. Reposi
 
 class Planner:
     def __init__(self,llm,tools,model='',compact_prompt=False,skill_library=None,max_parallel_actions=4): self.llm=llm; self.tools=tools; self.model=model; self.compact_prompt=compact_prompt; self.last_prompt_breakdown={}; self.last_action_normalization=None; self.last_repair_rejection_reason=None; self.skill_library=skill_library or SkillLibrary(); self.max_parallel_actions=max(2,int(max_parallel_actions))
-    def propose(self,state:AgentState,context:str,logical_timeout_seconds:float|None=None) -> ActionProposal:
+    def propose(self,state:AgentState,context:str,logical_timeout_seconds:float|None=None,
+                prompt_budget=None) -> ActionProposal:
         contract=(render_contract_compact(AgentActionContract,"AGENT_ACTION_SCHEMA") if self.compact_prompt else render_contract(AgentActionContract,"AGENT_ACTION_SCHEMA"))
         skills=render_skill_catalog(compact=self.compact_prompt)
         catalog=_runtime_catalog(self.tools)
@@ -827,6 +866,17 @@ class Planner:
                    "INVALID: parallel with one child; skill=general; tool=noop; parallel child=git_log when absent from PARALLEL_ALLOWED_TOOLS.")
         user+=f"\n{catalog_text}\n\n{examples}\n\nTOOLS (strict schemas; suggested skill/tool affinity is guidance, not permission):\n{tools_text}\n\n{contract}\n{instruction}"
         self.last_prompt_breakdown={'system_chars':len(SYSTEM),'context_chars':len(context),'skill_catalog_chars':len(skills),'tool_catalog_chars':len(tools_text),'runtime_catalog_chars':len(catalog_text),'active_skill_chars':len(active_skill),'contract_chars':len(contract),'instruction_chars':len(instruction),'valid_skill_count':len(catalog['skills']),'valid_tool_count':len(catalog['tools']),'parallel_tool_count':len(catalog['parallel_tools']),'question_type_count':len(catalog['question_types'])}
+        if prompt_budget is not None:
+            decision = prompt_budget.check_prompt(
+                "planner", SYSTEM, user,
+                breakdown={"incident": context, "tools": tools_text},
+            )
+            self.last_prompt_breakdown.update({
+                "estimated_prompt_tokens": decision.estimated_prompt_tokens,
+                "input_hard_capacity": decision.input_hard_capacity,
+                "budget_state": decision.state.value,
+                "token_breakdown": dict(decision.breakdown),
+            })
         call_started=time.monotonic()
         data=complete_json_compat(self.llm,SYSTEM,user,model=self.model or None,logical_timeout_seconds=logical_timeout_seconds)
         self.last_action_normalization=None
@@ -853,6 +903,19 @@ repaired without changing intent, return {{"repair_failed": "structural intent c
                 raise PlannerContractError(f'planner contract validation failed: {details}',validation_errors=details,output=data) from exc
             repair_user=json.dumps({'validation_errors':details,'kind':self._safe_scalar(data,'kind'),'tool':self._safe_scalar(data,'tool'),'skill':self._safe_scalar(data,'skill'),'arguments_type':type(data.get('arguments')).__name__ if isinstance(data,dict) else type(data).__name__,'actions_type':type(data.get('actions')).__name__ if isinstance(data,dict) else None,'actions_count':len(data.get('actions')) if isinstance(data,dict) and isinstance(data.get('actions'),list) else None},ensure_ascii=False)
             try:
+                if prompt_budget is not None:
+                    repair_decision = prompt_budget.check_prompt(
+                        "planner", repair_schema, repair_user,
+                        breakdown={"incident": repair_user},
+                    )
+                    repair_breakdown = {
+                        "stage": "planner_schema_repair",
+                        "estimated_prompt_tokens": repair_decision.estimated_prompt_tokens,
+                        "input_hard_capacity": repair_decision.input_hard_capacity,
+                        "budget_state": repair_decision.state.value,
+                        "token_breakdown": dict(repair_decision.breakdown),
+                    }
+                    self.last_prompt_breakdowns.append(repair_breakdown)
                 repaired=complete_json_compat(self.llm,repair_schema,repair_user,model=self.model or None,logical_timeout_seconds=remaining)
                 merged, rejection = _validate_repair_patch(data, repaired)
                 if rejection:

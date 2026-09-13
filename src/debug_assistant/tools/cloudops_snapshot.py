@@ -88,6 +88,20 @@ class FinalizeDiagnosisArgs(ToolArgs):
             "fault from the finalized Incident Hypothesis."
         ),
     )
+    fault_code: str = Field(
+        default="",
+        description=(
+            "Structured lowercase snake_case fault taxonomy projection. Runtime "
+            "uses the already validated Incident Hypothesis as the authority."
+        ),
+    )
+    fault_explanation: str = Field(
+        default="",
+        description=(
+            "Evidence-grounded explanation of the fault. Runtime uses the "
+            "already validated Incident Hypothesis as the authority."
+        ),
+    )
     mechanism: str = Field(
         min_length=1,
         description=(

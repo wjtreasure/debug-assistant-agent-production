@@ -20,7 +20,7 @@ class RecoveryLLM:
         self.planner_n+=1
         if self.planner_n==1:
             return {'kind':'tool','skill':'repository_exploration','reason':'read target','tool':'read_file',
-                    'arguments':{'path':'a.py','start_line':1,'end_line':20},'expected_evidence':'source',
+                    'arguments':{'path':'a.py','start_line':1,'line_count':20},'expected_evidence':'source',
                     'information_need':'inspect boundary source','confidence':.9}
         return {'kind':'finish','skill':'hypothesis_validation','reason':'enough grounded evidence','tool':None,'arguments':{},
                 'expected_evidence':'','information_need':'','confidence':.9}
@@ -65,7 +65,7 @@ class NeverFinishLLM(RecoveryLLM):
             return super().complete_json(system,user,model)
         self.planner_n+=1
         return {'kind':'tool','skill':'repository_exploration','reason':'keep reading','tool':'read_file',
-                'arguments':{'path':'a.py','start_line':1,'end_line':20},'expected_evidence':'source',
+                'arguments':{'path':'a.py','start_line':1,'line_count':20},'expected_evidence':'source',
                 'information_need':'inspect boundary source','confidence':.7}
 
 def test_repeated_reflection_timeouts_do_not_loop_forever(monkeypatch,tmp_path):

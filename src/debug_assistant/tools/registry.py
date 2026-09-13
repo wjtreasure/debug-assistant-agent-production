@@ -5,7 +5,7 @@ from pydantic import ValidationError
 from debug_assistant.contracts import compact_validation_error
 from .repository import (
     RepoTreeTool, GrepTool, ReadFileTool, SymbolSearchTool, GitLogTool,
-    GitShowTool, DiscoverTestsTool, REPOSITORY_SOURCE_MAX_LINES,
+    GitShowTool, DiscoverTestsTool,
 )
 from .indexed import CodeSearchTool,IndexedSymbolSearchTool,InspectSymbolContextTool
 from debug_assistant.repository.safe_fs import SafeRepositoryFS
@@ -62,32 +62,11 @@ class ToolRegistry:
     def repair_arguments(self,name:str,args:dict[str,Any],error:dict[str,Any] | None=None):
         """Apply only deterministic, semantics-preserving mechanical repairs.
 
-        V1.3.2.2 intentionally keeps this tiny. For read_file, an inclusive range
-        wider than the repository source bound is clamped to that bound. Ambiguous
-        path/name/type errors are never guessed or repaired here.
+        V1.3.2.2 intentionally keeps this tiny. ``read_file`` already exposes a
+        bounded ``line_count`` field, so there is no inclusive-range arithmetic to
+        repair here. Ambiguous path/name/type errors are never guessed or repaired.
         """
-        if name != 'read_file' or not isinstance(args,dict):
-            return None,None
-        if (error or {}).get('error_type') != 'schema_validation':
-            return None,None
-        try:
-            start=int(args.get('start_line',1))
-            end=int(args.get('end_line',REPOSITORY_SOURCE_MAX_LINES))
-        except (TypeError,ValueError):
-            return None,None
-        if start < 1 or end < start or (end-start+1) <= REPOSITORY_SOURCE_MAX_LINES:
-            return None,None
-        repaired=dict(args)
-        repaired['start_line']=start
-        repaired['end_line']=start+REPOSITORY_SOURCE_MAX_LINES-1
-        return repaired,{
-            'tool':'read_file',
-            'reason':'inclusive_range_exceeds_repository_source_bound',
-            'original_arguments':dict(args),
-            'repaired_arguments':dict(repaired),
-            'requested_line_count':end-start+1,
-            'repaired_line_count':REPOSITORY_SOURCE_MAX_LINES,
-        }
+        return None,None
 
     def render(self, compact: bool=False):
         blocks=[]

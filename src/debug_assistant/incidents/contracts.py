@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import re
 from typing import Annotated, Any, Literal
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 
 # Evidence IDs are a runtime-owned namespace.  The pattern is deliberately
@@ -9,6 +10,36 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 # present in the current EvidenceMemory.  This type only prevents model output
 # from smuggling observation IDs or arbitrary strings into semantic contracts.
 EvidenceId = Annotated[str, StringConstraints(pattern=r"^ev-")]
+
+
+_FAULT_CODE_PATTERN = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*")
+
+
+def _migrate_fault_fields(value: Any) -> Any:
+    """Populate the new fault projections without changing old payloads.
+
+    ``fault`` was historically a single natural-language field.  It remains
+    accepted and serialized as a compatibility projection; new producers may
+    provide the structured code and the explanatory text independently.
+    """
+    if not isinstance(value, dict):
+        return value
+    result = dict(value)
+    legacy = str(result.get("fault") or "").strip()
+    code = str(result.get("fault_code") or "").strip()
+    explanation = str(result.get("fault_explanation") or "").strip()
+    if legacy and not code and _FAULT_CODE_PATTERN.fullmatch(legacy):
+        result["fault_code"] = legacy
+        code = legacy
+    if legacy and not explanation:
+        result["fault_explanation"] = legacy
+        explanation = legacy
+    if (code or explanation) and not legacy:
+        # Keep the old public attribute meaningful for callers that still use
+        # ``candidate.fault``.  The structured fields remain authoritative for
+        # new evaluation.
+        result["fault"] = code or explanation
+    return result
 
 
 ObligationStatus = Literal[
@@ -142,6 +173,8 @@ class IncidentHypothesis(BaseModel):
     status: Literal["open", "supported", "rejected"] = "open"
     component: str = ""
     fault: str = ""
+    fault_code: str = ""
+    fault_explanation: str = ""
     mechanism: str = ""
     supporting_evidence_ids: tuple[str, ...] = ()
     contradicting_evidence_ids: tuple[str, ...] = ()
@@ -155,6 +188,11 @@ class IncidentHypothesis(BaseModel):
     verification_obligations: tuple[VerificationObligation, ...] = ()
     contradictions: tuple[Contradiction, ...] = ()
     stable_rounds: int = Field(default=0, ge=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_fault_contract(cls, value: Any) -> Any:
+        return _migrate_fault_fields(value)
 
     def required_gap_projection(self) -> tuple[str, ...]:
         """Derive the legacy gap view from obligations when they are present."""
@@ -277,12 +315,33 @@ class IncidentHypothesis(BaseModel):
 class RootCauseCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     component: str = Field(min_length=1)
+    # ``fault`` is retained for old run.json readers and old Providers.  New
+    # Candidate payloads should use the structured pair below.
     fault: str = Field(min_length=1)
+    fault_code: str = ""
+    fault_explanation: str = ""
     mechanism: str = Field(min_length=1)
     evidence_ids: tuple[EvidenceId, ...] = Field(min_length=2)
     confidence: float = Field(ge=0.0, le=1.0)
     claim_evidence_mapping: tuple[ClaimEvidenceMapping, ...] = ()
     causal_chain_summary: tuple[CausalChainLink, ...] = ()
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_fault_contract(cls, value: Any) -> Any:
+        return _migrate_fault_fields(value)
+
+    @model_validator(mode="after")
+    def validate_fault_code(self) -> "RootCauseCandidate":
+        if self.fault_code and not _FAULT_CODE_PATTERN.fullmatch(self.fault_code):
+            raise ValueError(
+                "fault_code must be a lowercase snake_case taxonomy identifier"
+            )
+        if not (self.fault_code.strip() or self.fault_explanation.strip()):
+            raise ValueError(
+                "Candidate requires fault_code or fault_explanation"
+            )
+        return self
 
 
 class ReviewDecision(BaseModel):
@@ -304,6 +363,7 @@ class IncidentMetrics(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    cost: float | None = None
     llm_calls: int = 0
     planner_calls: int = 0
     review_calls: int = 0

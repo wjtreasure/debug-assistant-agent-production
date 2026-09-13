@@ -39,7 +39,7 @@ class ReporterFailLLM:
                     'tool':'grep','arguments':{'query':'needle','glob':'*.py','max_results':20},'expected_evidence':'match'}
         if self.n == 2:
             return {'kind':'tool','skill':'hypothesis_validation','reason':'read','confidence':.9,
-                    'tool':'read_file','arguments':{'path':'a.py','start_line':1,'end_line':20},'expected_evidence':'source'}
+                    'tool':'read_file','arguments':{'path':'a.py','start_line':1,'line_count':20},'expected_evidence':'source'}
         return {'kind':'finish','skill':'report_synthesis','reason':'done','confidence':.9,'tool':None,'arguments':{},'expected_evidence':''}
 
 

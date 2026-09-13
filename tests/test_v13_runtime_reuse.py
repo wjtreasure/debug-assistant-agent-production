@@ -18,9 +18,9 @@ class ReuseLLM:
         if self.planner_n==1:
             return {'kind':'tool','skill':'repository_exploration','reason':'find','tool':'grep','arguments':{'query':'needle','glob':'*.py','max_results':20},'expected_evidence':'candidate','confidence':.8}
         if self.planner_n==2:
-            return {'kind':'tool','skill':'hypothesis_validation','reason':'read full','tool':'read_file','arguments':{'path':'a.py','start_line':1,'end_line':20},'expected_evidence':'source','information_need':'inspect source','confidence':.9}
+            return {'kind':'tool','skill':'hypothesis_validation','reason':'read full','tool':'read_file','arguments':{'path':'a.py','start_line':1,'line_count':20},'expected_evidence':'source','information_need':'inspect source','confidence':.9}
         if self.planner_n==3:
-            return {'kind':'tool','skill':'hypothesis_validation','reason':'recheck subset','tool':'read_file','arguments':{'path':'./a.py','start_line':5,'end_line':10},'expected_evidence':'subset','information_need':'inspect source','confidence':.9}
+            return {'kind':'tool','skill':'hypothesis_validation','reason':'recheck subset','tool':'read_file','arguments':{'path':'./a.py','start_line':5,'line_count':6},'expected_evidence':'subset','information_need':'inspect source','confidence':.9}
         return {'kind':'finish','skill':'report_synthesis','reason':'done','tool':None,'arguments':{},'confidence':.9}
 
 

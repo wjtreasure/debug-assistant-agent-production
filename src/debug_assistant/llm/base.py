@@ -2,6 +2,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
+import math
 import inspect
 import json
 import re
@@ -42,6 +43,86 @@ class LLMToolArgumentsError(LLMOutputError):
         super().__init__(message)
 
 
+def estimate_tokens_char4(text: str) -> int:
+    """Conservative, provider-neutral fallback when no tokenizer is exposed."""
+    if not text:
+        return 0
+    return max(1, math.ceil(len(str(text)) / 4))
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCapability:
+    """Physical model limits and token-estimation capability.
+
+    Feature negotiation remains in :class:`ProviderCapabilities`.  This
+    object describes the model's context boundary and is intentionally
+    provider/model agnostic so the runtime can use the same budget policy for
+    OpenAI-compatible, mock, or future adapters.
+    """
+
+    provider: str = ""
+    model: str = ""
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+    tokenizer: str = "char4"
+    token_estimator: Callable[[str], int] | None = field(
+        default=None, compare=False, repr=False
+    )
+    reserved_output_tokens: int = 0
+    protocol_safety_reserve_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        if self.context_window is not None and int(self.context_window) <= 0:
+            raise ValueError("context_window must be positive when configured")
+        if self.max_output_tokens is not None and int(self.max_output_tokens) <= 0:
+            raise ValueError("max_output_tokens must be positive when configured")
+        if self.reserved_output_tokens < 0 or self.protocol_safety_reserve_tokens < 0:
+            raise ValueError("model token reserves must be non-negative")
+
+    @property
+    def context_window_tokens(self) -> int | None:
+        """Compatibility spelling used by configuration and benchmark code."""
+        return self.context_window
+
+    @property
+    def input_hard_capacity(self) -> int | None:
+        if self.context_window is None:
+            return None
+        output_reserve = self.reserved_output_tokens
+        if output_reserve <= 0 and self.max_output_tokens is not None:
+            output_reserve = self.max_output_tokens
+        return max(
+            0,
+            int(self.context_window)
+            - max(0, int(output_reserve))
+            - max(0, int(self.protocol_safety_reserve_tokens)),
+        )
+
+    def estimate_tokens(self, text: str) -> int:
+        estimator = self.token_estimator or estimate_tokens_char4
+        try:
+            return max(0, int(estimator(text)))
+        except (TypeError, ValueError):
+            return estimate_tokens_char4(text)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "model": self.model,
+            "context_window": self.context_window,
+            "max_output_tokens": self.max_output_tokens,
+            "tokenizer": self.tokenizer,
+            "reserved_output_tokens": self.reserved_output_tokens,
+            "protocol_safety_reserve_tokens": self.protocol_safety_reserve_tokens,
+            "input_hard_capacity": self.input_hard_capacity,
+        }
+
+
+# Singular spelling used by the Dynamic Budget specification.  Keep the
+# existing plural feature-capability type below for backward compatibility.
+ProviderCapability = ModelCapability
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderCapabilities:
     """Capabilities negotiated by a provider adapter, never inferred by the agent."""
@@ -50,6 +131,30 @@ class ProviderCapabilities:
     json_schema: bool = False
     tool_calling: bool = False
     parallel_tool_calls: bool = False
+    # Optional physical-limit fields are additive. Existing providers that do
+    # not advertise a model window continue to use the legacy context fallback.
+    provider: str = ""
+    model: str = ""
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+    tokenizer: str = "char4"
+    token_estimator: Callable[[str], int] | None = field(
+        default=None, compare=False, repr=False
+    )
+    reserved_output_tokens: int = 0
+    protocol_safety_reserve_tokens: int = 0
+
+    def model_capability(self) -> ModelCapability:
+        return ModelCapability(
+            provider=self.provider,
+            model=self.model,
+            context_window=self.context_window,
+            max_output_tokens=self.max_output_tokens,
+            tokenizer=self.tokenizer,
+            token_estimator=self.token_estimator,
+            reserved_output_tokens=self.reserved_output_tokens,
+            protocol_safety_reserve_tokens=self.protocol_safety_reserve_tokens,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +180,7 @@ class LLMResponse:
 
 class LLMClient(ABC):
     capabilities = ProviderCapabilities()
+    model_capability = ModelCapability()
 
     @abstractmethod
     def complete_json(

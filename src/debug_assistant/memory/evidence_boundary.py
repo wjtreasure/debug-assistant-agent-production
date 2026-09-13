@@ -41,14 +41,16 @@ def is_canonical_source_evidence(
         path = str(metadata.get("path") or "").strip()
         start = metadata.get("start_line")
         end = metadata.get("end_line")
-        requested_end = metadata.get("requested_end_line", end)
+        requested_count = metadata.get("requested_line_count")
         if not path or not isinstance(start, int) or not isinstance(end, int):
             return False
-        if not isinstance(requested_end, int):
+        if requested_count is None:
+            requested_count = end - start + 1
+        if not isinstance(requested_count, int):
             return False
-        if start < 1 or end < start or requested_end < start:
+        if start < 1 or end < start or requested_count < 1:
             return False
-        if end - start + 1 > _MAX_SOURCE_LINES or requested_end - start + 1 > _MAX_SOURCE_LINES:
+        if end - start + 1 > _MAX_SOURCE_LINES or requested_count > _MAX_SOURCE_LINES:
             return False
         if evidence_memory is not None and evidence is not None:
             canonical = evidence_memory.evidence_for_observation(observation.observation_id)

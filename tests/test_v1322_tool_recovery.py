@@ -7,7 +7,7 @@ from debug_assistant.models import TaskSpec
 from debug_assistant.harness.convergence import ConvergenceController, ConvergenceMode
 
 
-class RepairLLM:
+class BoundedReadLLM:
     def __init__(self):
         self.calls=[]; self.planner_n=0; self.last_raw_content=None
     def _usage(self,system,user):
@@ -31,25 +31,25 @@ class RepairLLM:
             self.last_raw_content=json.dumps(obj); return obj
         self.planner_n += 1
         obj={'kind':'tool','skill':'hypothesis_validation','reason':'inspect exact region','confidence':.9,'tool':'read_file',
-             'arguments':{'path':'a.py','start_line':200,'end_line':400},'expected_evidence':'target implementation',
+             'arguments':{'path':'a.py','start_line':200,'line_count':200},'expected_evidence':'target implementation',
              'information_need':'inspect implementation around line 300'}
         self.last_raw_content=json.dumps(obj); return obj
 
 
-def test_runtime_repairs_201_line_read_without_invalid_route(monkeypatch,tmp_path):
+def test_runtime_accepts_bounded_line_count_read_without_invalid_route(monkeypatch,tmp_path):
     repo=tmp_path/'repo'; repo.mkdir(); (repo/'a.py').write_text('\n'.join(f'line_{i}' for i in range(1,500)),encoding='utf-8')
     cfg=AppConfig(); cfg.model.provider='mock'; cfg.harness.build_task_index=False; cfg.harness.trace_dir=str(tmp_path/'traces'); cfg.harness.reflect_every=2; cfg.harness.max_steps=6
-    fake=RepairLLM(); monkeypatch.setattr('debug_assistant.harness.runtime.build_llm',lambda c: fake)
+    fake=BoundedReadLLM(); monkeypatch.setattr('debug_assistant.harness.runtime.build_llm',lambda c: fake)
     r=AgentHarness(cfg).run(TaskSpec('repair','boundary failure',str(repo)))
     assert r['state']['status']=='success'
     assert r['state']['invalid_routes']==0
     assert r['state']['tool_calls']==1
     events=[json.loads(x) for x in Path(r['trace']['trace_path']).read_text().splitlines()]
     repair=[e for e in events if e['type']=='ACTION_ARGUMENT_REPAIRED']
-    assert repair and repair[0]['payload']['original_arguments']['end_line']==400
-    assert repair[0]['payload']['repaired_arguments']['end_line']==399
+    assert not repair
     obs=[e for e in events if e['type']=='TOOL_OBSERVATION'][0]['payload']
     assert obs['metadata']['start_line']==200 and obs['metadata']['end_line']==399
+    assert obs['metadata']['requested_line_count']==200
 
 
 def test_budget_critical_does_not_recover_from_reflection_after_rejection_only():

@@ -282,9 +282,10 @@ class IncidentReflectionAgent:
         self.last_metadata_drops: list[str] = []
         self.last_metadata_warnings: list[str] = []
         self.last_prompt_breakdown: dict = {}
+        self.last_prompt_breakdowns: list[dict] = []
 
     def reflect(self, snapshot: dict, *, logical_timeout_seconds: float | None = None,
-                on_attempt_started=None) -> ReflectionFeedback:
+                on_attempt_started=None, prompt_budget=None) -> ReflectionFeedback:
         from debug_assistant.contracts import compact_validation_error, render_contract
         self.last_usage = {}
         self.last_call_count = 0
@@ -294,6 +295,7 @@ class IncidentReflectionAgent:
         self.last_normalization_actions = []
         self.last_metadata_drops = []
         self.last_metadata_warnings = []
+        self.last_prompt_breakdowns = []
         contract = render_contract(ReflectionFeedback, "INCIDENT_REFLECTION_SCHEMA")
         user = (
             "STRUCTURED_REFLECTION_INPUT:\n"
@@ -306,6 +308,17 @@ class IncidentReflectionAgent:
             "context_chars": len(user),
             "raw_history_included": False,
         }
+        if prompt_budget is not None:
+            decision = prompt_budget.check_prompt(
+                "reflection", self._SYSTEM, user,
+                breakdown={"observation": user},
+            )
+            self.last_prompt_breakdown.update({
+                "estimated_prompt_tokens": decision.estimated_prompt_tokens,
+                "input_hard_capacity": decision.input_hard_capacity,
+                "budget_state": decision.state.value,
+                "token_breakdown": dict(decision.breakdown),
+            })
         logical_deadline = (
             None if logical_timeout_seconds is None
             else time.monotonic() + max(0.0, float(logical_timeout_seconds))
@@ -322,6 +335,17 @@ class IncidentReflectionAgent:
             return remaining
 
         def complete_feedback(system: str, prompt: str):
+            if prompt_budget is not None:
+                decision = prompt_budget.check_prompt(
+                    "reflection", system, prompt,
+                    breakdown={"observation": prompt},
+                )
+                self.last_prompt_breakdown.update({
+                    "last_estimated_prompt_tokens": decision.estimated_prompt_tokens,
+                    "last_budget_state": decision.state.value,
+                    "last_token_breakdown": dict(decision.breakdown),
+                })
+                self.last_prompt_breakdowns.append(dict(self.last_prompt_breakdown))
             timeout = remaining_timeout()
             if hasattr(self.llm, "complete_json"):
                 return complete_json_compat(

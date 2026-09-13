@@ -19,7 +19,7 @@ class KnowledgeRetrievalArgs(ToolArgs):
     repo_commit: str | None = None
     requested_sources: tuple[KnowledgeSource, ...] = ()
     top_k: int = Field(default=5, ge=1, le=20)
-    token_budget: int = Field(default=1200, ge=1, le=10_000)
+    token_budget: int = Field(default=1200, ge=1, le=100_000)
 
 
 class KnowledgeRetrievalTool(Tool):
@@ -35,13 +35,17 @@ class KnowledgeRetrievalTool(Tool):
         output_limit=16000,
     )
 
-    def __init__(self, coordinator: KnowledgeCoordinator, incident_id: str) -> None:
+    def __init__(self, coordinator: KnowledgeCoordinator, incident_id: str, *, max_token_budget: int | None = None) -> None:
         self.coordinator = coordinator
         self.incident_id = incident_id
+        self.max_token_budget = None if max_token_budget is None else max(1, int(max_token_budget))
         self.last_prior_context = None
         self.last_result = None
 
     def execute(self, **kwargs: Any) -> ToolObservation:
+        if self.max_token_budget is not None:
+            requested = int(kwargs.get("token_budget", self.max_token_budget))
+            kwargs["token_budget"] = max(1, min(requested, self.max_token_budget))
         query = KnowledgeQuery(incident_id=self.incident_id, **kwargs)
         result = self.coordinator.retrieve(query)
         context = self.coordinator.prior_context(query, result=result)

@@ -22,7 +22,7 @@ def test_run_deadline_is_monotonic_and_clamps_timeout():
 def test_read_file_rejects_start_beyond_eof(tmp_path):
     path = tmp_path / 'one.py'
     path.write_text('x = 1\n')
-    obs = ReadFileTool(tmp_path).execute('one.py', 99, 100)
+    obs = ReadFileTool(tmp_path).execute('one.py', start_line=99, line_count=2)
     assert obs.ok is False
     assert obs.error_type == 'range_out_of_bounds'
     assert obs.metadata['actual_line_count'] == 1
@@ -104,7 +104,7 @@ def test_parallel_cardinality_is_not_silently_changed(count, valid):
 
 
 def test_normalization_preserves_child_tool_and_arguments_exactly():
-    child = {'tool': 'read_file', 'arguments': {'path': 'a.py', 'start_line': 2, 'end_line': 4}}
+    child = {'tool': 'read_file', 'arguments': {'path': 'a.py', 'start_line': 2, 'line_count': 3}}
     normalized, _ = normalize_planner_action({'kind': 'parallel', 'tool': None, 'arguments': {}, 'actions': [child]})
     assert normalized['tool'] == child['tool']
     assert normalized['arguments'] == child['arguments']

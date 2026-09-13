@@ -94,7 +94,7 @@ def test_action_policy_converge_allows_only_scoped_repo_tree():
 
 
 def test_action_policy_budget_critical_blocks_new_tool():
-    policy=ActionPolicy(); action=ActionProposal(ActionKind.TOOL,'x','read',tool='read_file',arguments={'path':'a.py','start_line':1,'end_line':2})
+    policy=ActionPolicy(); action=ActionProposal(ActionKind.TOOL,'x','read',tool='read_file',arguments={'path':'a.py','start_line':1,'line_count':2})
     d=policy.evaluate(action,budget_phase='verify_only',convergence_mode='budget_critical',evidence=[_source_evidence()])
     assert d.allowed is False and d.hard_block is True
 
@@ -181,7 +181,7 @@ def test_runtime_reserve_finishes_after_current_tool_and_starts_no_new_tool(monk
             self.plans+=1
             if self.plans==1:
                 return {'kind':'tool','skill':'repository_exploration','reason':'read source','confidence':.6,
-                        'tool':'read_file','arguments':{'path':'a.py','start_line':1,'end_line':5},
+                        'tool':'read_file','arguments':{'path':'a.py','start_line':1,'line_count':5},
                         'expected_evidence':'source','information_need':'inspect source'}
             time.sleep(1.1)
             return {'kind':'tool','skill':'repository_exploration','reason':'would start another tool','confidence':.5,

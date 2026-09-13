@@ -35,6 +35,8 @@ class ContextItem:
     lifecycle: Literal["active", "cold"] = "active"
     pinned: bool = False
     last_used_step: int = 0
+    # Explicit active-context layer used by Dynamic Budget telemetry.
+    context_level: Literal["L0", "L1", "L2", "L3"] = "L2"
 
 
 @dataclass(slots=True)
@@ -54,3 +56,6 @@ class ContextBuildResult:
     eviction_count: int = 0
     projection_count: int = 0
     display_coverage: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
+    budget_tokens: int | None = None
+    used_tokens: int = 0
+    token_estimator: str = "char4"

@@ -4,6 +4,7 @@ from debug_assistant.context.models import ContextItem, ContextBuildResult, Cont
 from debug_assistant.context.indexes import DisplayCoverageIndex, KnownContextIndex, merge_ranges
 from debug_assistant.context.packing import line_safe_truncate
 from debug_assistant.context.projection import CodeProjectionPolicy
+from debug_assistant.llm.base import estimate_tokens_char4
 
 
 def _terms(value) -> set[str]:
@@ -103,17 +104,24 @@ class ContextManager:
         compact=(f"[{context_id}] kind={evidence.kind} source={evidence.source} location={title}"
                  if evidence is not None else
                  f"tool={obs.tool} ok={obs.ok} error_type={obs.error_type or 'none'} metadata={_model_metadata(meta)}")
+        level = (
+            "L1" if evidence is not None and reason in {
+                "hypothesis_support", "contradiction_source", "observation_reused",
+            } else "L1" if evidence is not None else "L3" if lifecycle == "cold" else "L2"
+        )
         return ContextItem(context_id,source_kind,title,compact,display,len(display),priority,step,
-                           obs.observation_id,meta,lifecycle,pinned,step if lifecycle=='active' else 0)
+                           obs.observation_id,meta,lifecycle,pinned,step if lifecycle=='active' else 0,
+                           level)
 
     def _ev_item(self, ev, step: int, priority: int, reason: str, lifecycle:str='active', pinned:bool=False) -> ContextItem:
         loc=ev.file or ev.target or ev.source
         if ev.source_start_line is not None and ev.source_end_line is not None:
             loc=f"{loc}:{ev.source_start_line}-{ev.source_end_line}"
         compact=f"[{ev.evidence_id}] {ev.kind} {loc}: {ev.summary}"
+        level = "L1" if reason in {"hypothesis_support", "contradiction", "contradiction_source"} else "L3" if lifecycle == "cold" else "L2"
         return ContextItem(ev.evidence_id,"evidence",loc,compact,ev.excerpt,len(ev.excerpt),priority,step,
                            ev.raw_observation_id,{"selection_reason":reason},lifecycle,pinned,
-                           step if lifecycle=='active' else 0)
+                           step if lifecycle=='active' else 0, level)
 
     def catalog(self, state, memory, observation_store) -> list[ContextItem]:
         # Rebuild before item rendering so search observations can be superseded at hit/range level.
@@ -203,13 +211,26 @@ class ContextManager:
             rehydrate_requested=obs.observation_id in self._rehydrate_requests,
         )
 
-    def build(self, state, memory, observation_store, *, max_context_chars: int, max_steps=None,
-              max_tool_calls=None, requested_ids=None,
+    def build(self, state, memory, observation_store, *, max_context_chars: int | None = None,
+              max_context_tokens: int | None = None, token_estimator=None,
+              max_steps=None, max_tool_calls=None, requested_ids=None,
               include_agent_control_state: bool=True,
-              external_context_chars: int=0) -> ContextBuildResult:
+              external_context_chars: int=0, pressure_state: str = "NORMAL") -> ContextBuildResult:
         if external_context_chars < 0:
             raise ValueError("external_context_chars must be non-negative")
-        diagnostic_budget=max(0,max_context_chars-external_context_chars)
+        if max_context_chars is None and max_context_tokens is None:
+            raise ValueError("one of max_context_chars or max_context_tokens is required")
+        estimator = token_estimator or estimate_tokens_char4
+        total_token_budget = max(1, int(max_context_tokens)) if max_context_tokens is not None else None
+        external_tokens = max(0, int(estimator("x" * external_context_chars)))
+        if total_token_budget is not None:
+            diagnostic_token_budget = max(0, total_token_budget - external_tokens)
+            diagnostic_budget = diagnostic_token_budget * 4
+            budget_chars = diagnostic_budget + external_context_chars
+        else:
+            budget_chars = int(max_context_chars)
+            diagnostic_budget=max(0,budget_chars-external_context_chars)
+            diagnostic_token_budget = None
         requested_ids=list(requested_ids or []) if self.enable_model_selection else []
         # Evidence-aware projection: compact Evidence excerpts may truthfully represent only
         # the beginning of a larger read_file observation. If a truncated read is currently
@@ -266,6 +287,10 @@ class ContextManager:
                 cold_count+=1
                 dropped.append({'id':x.context_id,'reason':'cold','chars':x.chars,'kind':x.source_kind})
                 continue
+            if pressure_state == "HARD_PRESSURE" and x.context_level in {"L2", "L3"} and not x.pinned and x.context_id not in requested:
+                cold_count += 1
+                dropped.append({'id':x.context_id,'reason':'hard_pressure','chars':x.chars,'kind':x.source_kind})
+                continue
             active_count+=1
             boost=-15 if x.context_id in requested else 0
             ranked.append((x.priority+boost,0 if x.pinned else 1,-x.last_used_step,x.context_id,x))
@@ -315,7 +340,7 @@ class ContextManager:
             rendered.append(content)
             meta={'id':x.context_id,'reason':('model_requested' if x.context_id in requested else x.metadata.get('selection_reason','priority')),
                   'chars':len(content),'kind':x.source_kind,'lifecycle':'active','pinned':x.pinned,
-                  'citable':x.source_kind == 'evidence'}
+                  'citable':x.source_kind == 'evidence','context_level':x.context_level}
             if x.raw_observation_id:
                 meta['provenance_observation_id']=x.raw_observation_id
             if projection:
@@ -334,6 +359,32 @@ class ContextManager:
                 issue2=issue[:reduced]
                 fixed=fixed.replace(issue,issue2,1)
                 text=f"{fixed}{known_section}\nWORKING_CONTEXT:\n{working}"
+        scaffolding=f"\nWORKING_CONTEXT:\n{working}"
+        # Character packing is the compatibility fast path.  A physical model
+        # capability is authoritative, so apply the token bound after the full
+        # diagnostic text has been rendered as well.
+        if diagnostic_token_budget is not None:
+            def total_tokens(value: str) -> int:
+                return max(0, int(estimator(value))) + external_tokens
+            while selected_meta and total_tokens(text) > total_token_budget:
+                removable = next(
+                    (index for index in range(len(selected_meta) - 1, -1, -1)
+                     if not selected_meta[index].get('pinned')),
+                    None,
+                )
+                if removable is None:
+                    break
+                dropped_id = selected_meta[removable]['id']
+                selected_meta.pop(removable)
+                rendered.pop(removable)
+                dropped.append({'id': dropped_id, 'reason': 'token_budget', 'chars': 0})
+                working = '\n\n'.join(rendered) or '(no active working context yet)'
+                text = f"{fixed}{known_section}\nWORKING_CONTEXT:\n{working}"
+                scaffolding = f"\nWORKING_CONTEXT:\n{working}"
+            if total_tokens(text) > total_token_budget and known_section:
+                known_allow = max(0, diagnostic_budget - len(fixed) - len(scaffolding))
+                known_section, _ = line_safe_truncate(known_section, known_allow)
+                text = f"{fixed}{known_section}{scaffolding}"
         if len(text)>diagnostic_budget:
             # Last-resort: drop selected items from the end; never blind-slice a source projection.
             while selected_meta and len(text)>diagnostic_budget:
@@ -411,8 +462,21 @@ class ContextManager:
             ),
             'manager_control_state_truncated':int(control_state_truncated),
         }
+        diagnostic_tokens = max(0, int(estimator(text)))
+        breakdown.update({
+            'diagnostic_context_tokens': diagnostic_tokens,
+            'external_context_tokens': external_tokens,
+            'total_context_tokens': diagnostic_tokens + external_tokens,
+            'budget_tokens': total_token_budget if total_token_budget is not None else 0,
+        })
         display=self.display_coverage.export()
         projection_count=sum(1 for m in selected_meta if m.get('projection_id'))
         self._rehydrate_requests.clear()
-        return ContextBuildResult(text,max_context_chars,len(text)+external_context_chars,len(items),len(selected_meta),selected_meta,dropped,invalid,breakdown,
-                                  len(known_section),active_count,cold_count,evicted,projection_count,display)
+        return ContextBuildResult(
+            text, budget_chars, len(text) + external_context_chars, len(items),
+            len(selected_meta), selected_meta, dropped, invalid, breakdown,
+            len(known_section), active_count, cold_count, evicted, projection_count,
+            display, total_token_budget, diagnostic_tokens + external_tokens,
+            getattr(getattr(self.cfg, "tokenizer", None), "name", "char4")
+            if not callable(token_estimator) else "custom",
+        )

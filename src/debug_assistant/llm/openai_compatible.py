@@ -20,6 +20,7 @@ from .base import (
     extract_json,
     parse_tool_calls,
     ProviderCapabilities,
+    ModelCapability,
 )
 
 
@@ -45,6 +46,7 @@ class OpenAICompatibleClient(LLMClient):
         max_attempts: int = 3,
         min_retry_budget: float = 5.0,
         capabilities: ProviderCapabilities | None = None,
+        model_capability: ModelCapability | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -55,8 +57,21 @@ class OpenAICompatibleClient(LLMClient):
         self.max_attempts = max(1, int(max_attempts))
         self.min_retry_budget = max(0.0, float(min_retry_budget))
         self.capabilities = capabilities or ProviderCapabilities(
-            json_object=True, json_schema=False, tool_calling=True, parallel_tool_calls=True
+            json_object=True, json_schema=False, tool_calling=True, parallel_tool_calls=True,
+            provider="openai_compatible", model=default_model,
         )
+        self.model_capability = model_capability or self.capabilities.model_capability()
+        if not self.model_capability.provider:
+            self.model_capability = ModelCapability(
+                provider="openai_compatible",
+                model=self.model_capability.model or default_model,
+                context_window=self.model_capability.context_window,
+                max_output_tokens=self.model_capability.max_output_tokens,
+                tokenizer=self.model_capability.tokenizer,
+                token_estimator=self.model_capability.token_estimator,
+                reserved_output_tokens=self.model_capability.reserved_output_tokens,
+                protocol_safety_reserve_tokens=self.model_capability.protocol_safety_reserve_tokens,
+            )
         self.calls: list[dict[str, Any]] = []
         self.events: list[dict[str, Any]] = []
         self.last_raw_content = None
@@ -97,6 +112,8 @@ class OpenAICompatibleClient(LLMClient):
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "temperature": self.temperature,
         }
+        if self.model_capability.max_output_tokens is not None:
+            base_payload["max_tokens"] = int(self.model_capability.max_output_tokens)
         if tools:
             base_payload["tools"] = tools
             base_payload["tool_choice"] = "auto"

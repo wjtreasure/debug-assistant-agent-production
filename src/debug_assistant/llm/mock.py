@@ -1,15 +1,20 @@
 from __future__ import annotations
 from typing import Any, Iterable
 import json
-from .base import LLMClient, LLMResponse, LLMToolCall, ProviderCapabilities
+from .base import LLMClient, LLMResponse, LLMToolCall, ProviderCapabilities, ModelCapability
 
 class MockLLMClient(LLMClient):
     """Deterministic smoke-test provider. Production diagnosis must use a real model."""
     def __init__(self, *, tool_calls: Iterable[LLMToolCall | dict[str, Any]] | None = None,
                  tool_calling: bool = False, responses: Iterable[Any] | None = None,
-                 native_responses: Iterable[LLMResponse | dict[str, Any]] | None = None):
+                 native_responses: Iterable[LLMResponse | dict[str, Any]] | None = None,
+                 model_capability: ModelCapability | None = None):
         self.n=0; self.calls=[]; self.last_raw_content=None; self.last_usage={}
-        self.capabilities=ProviderCapabilities(tool_calling=tool_calling, parallel_tool_calls=tool_calling)
+        self.capabilities=ProviderCapabilities(
+            tool_calling=tool_calling, parallel_tool_calls=tool_calling,
+            provider="mock", model="mock",
+        )
+        self.model_capability = model_capability or self.capabilities.model_capability()
         self._tool_calls=list(tool_calls or []); self._responses=list(responses or [])
         self._native_responses=list(native_responses or [])
     def complete_json(self, system: str, user: str, *, model: str | None=None, logical_timeout_seconds: float | None=None) -> dict[str, Any]:
@@ -39,7 +44,7 @@ class MockLLMClient(LLMClient):
                     "tool":"grep","arguments":{"query":"parse_value|boundary|invalid","glob":"*.py","max_results":20},"expected_evidence":"candidate implementation"}
         if self.n == 2:
             return {"kind":"tool","skill":"hypothesis_validation","reason":"read candidate source","confidence":0.9,
-                    "tool":"read_file","arguments":{"path":"src/parser.py","start_line":1,"end_line":120},"expected_evidence":"implementation details"}
+                    "tool":"read_file","arguments":{"path":"src/parser.py","start_line":1,"line_count":120},"expected_evidence":"implementation details"}
         return {"kind":"finish","skill":"report_synthesis","reason":"enough evidence for smoke test","confidence":0.75,"tool":None,"arguments":{},"expected_evidence":""}
 
     def complete_with_tools(self, system: str, user: str, *, tools: list[dict[str, Any]],

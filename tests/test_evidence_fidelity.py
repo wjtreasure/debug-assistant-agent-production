@@ -9,7 +9,7 @@ def _read_obs(name: str, start: int, end: int, marker: str = ''):
     content='\n'.join(f"{i:5d} | value_{i} {marker}" for i in range(start,end+1))
     return ToolObservation(
         'read_file',True,content,
-        {'path':name,'start_line':start,'end_line':end,'requested_end_line':end,'truncated':False}
+        {'path':name,'start_line':start,'end_line':end,'requested_line_count':end-start+1,'truncated':False}
     )
 
 

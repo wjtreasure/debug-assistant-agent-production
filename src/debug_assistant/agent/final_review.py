@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from typing import Any
 
 from pydantic import ValidationError
 
@@ -178,13 +179,15 @@ class FinalReviewAgent:
         self.last_normalization_actions: list[str] = []
         self.last_metadata_drops: list[str] = []
         self.last_metadata_warnings: list[str] = []
+        self.last_prompt_breakdown: dict[str, Any] = {}
+        self.last_prompt_breakdowns: list[dict[str, Any]] = []
 
     def review(self, candidate: RootCauseCandidate, evidence: tuple[IncidentEvidence, ...],
                *, blocking_contradictions: tuple[dict, ...] = (),
                source_mechanism_context: dict | None = None,
                open_critical_obligations: tuple[dict, ...] = (),
                logical_timeout_seconds: float | None = None,
-               on_attempt_started=None) -> ReviewDecision:
+               on_attempt_started=None, prompt_budget=None) -> ReviewDecision:
         cited = set(candidate.evidence_ids)
         payload = {
             "candidate": candidate.model_dump(),
@@ -214,6 +217,7 @@ class FinalReviewAgent:
         self.last_normalization_actions = []
         self.last_metadata_drops = []
         self.last_metadata_warnings = []
+        self.last_prompt_breakdowns = []
 
         logical_deadline = None
         if logical_timeout_seconds is not None:
@@ -225,6 +229,18 @@ class FinalReviewAgent:
             return max(0.0, logical_deadline - time.monotonic())
 
         def call_stage(stage: str, system: str, user: str):
+            if prompt_budget is not None:
+                budget_decision = prompt_budget.check_prompt(
+                    "review", system, user,
+                    breakdown={"evidence": user},
+                )
+                self.last_prompt_breakdown = {
+                    "estimated_prompt_tokens": budget_decision.estimated_prompt_tokens,
+                    "input_hard_capacity": budget_decision.input_hard_capacity,
+                    "budget_state": budget_decision.state.value,
+                    "token_breakdown": dict(budget_decision.breakdown),
+                }
+                self.last_prompt_breakdowns.append(dict(self.last_prompt_breakdown))
             timeout = remaining_timeout()
             if timeout is not None and timeout <= 0:
                 raise LLMDeadlineExceeded(

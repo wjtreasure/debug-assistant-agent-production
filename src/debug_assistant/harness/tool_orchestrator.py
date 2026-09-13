@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Iterable
 
 from debug_assistant.models import ToolObservation
+from debug_assistant.tools.repository import REPOSITORY_SOURCE_MAX_LINES
 from debug_assistant.tools.registry import PARALLEL_ALLOWED_TOOLS
 from .tool_executor import execute_with_retry
 from .retry import RetryPolicy
@@ -64,28 +65,30 @@ class ToolOrchestrator:
         self.max_tool_calls = None if max_tool_calls is None else max(0, int(max_tool_calls))
         # Runtime callers may request a bounded source context around a short
         # read. The original range remains in metadata for auditability; only
-        # the execution range is widened, never beyond the tool's 200-line cap.
+        # the execution range is widened, never beyond the repository source cap.
         self.read_context_padding = max(0, int(read_context_padding))
 
     @staticmethod
     def _split_read_file(call: RequestedToolCall) -> list[ExpandedToolCall]:
         args = dict(call.arguments or {})
         try:
-            start, end = int(args.get("start_line", 1)), int(args.get("end_line", 200))
+            start = int(args.get("start_line", 1))
+            line_count = int(args.get("line_count", REPOSITORY_SOURCE_MAX_LINES))
         except (TypeError, ValueError):
             # Keep malformed values intact so the normal Pydantic boundary returns
             # a structured schema error instead of the expander crashing.
             return [ExpandedToolCall(call, args)]
-        if start < 1 or end < start:
+        if start < 1 or line_count < 1:
             return [ExpandedToolCall(call, args)]
-        requested = {"path": args.get("path"), "start_line": start, "end_line": end}
+        requested = {"path": args.get("path"), "start_line": start, "line_count": line_count}
         out = []
-        for chunk_start in range(start, end + 1, 200):
-            chunk_end = min(end, chunk_start + 199)
-            chunk_args = dict(args, start_line=chunk_start, end_line=chunk_end)
+        for offset in range(0, line_count, REPOSITORY_SOURCE_MAX_LINES):
+            chunk_start = start + offset
+            chunk_count = min(REPOSITORY_SOURCE_MAX_LINES, line_count - offset)
+            chunk_args = dict(args, start_line=chunk_start, line_count=chunk_count)
             out.append(ExpandedToolCall(
                 call, chunk_args, requested_range=requested,
-                expanded_range={"start_line": chunk_start, "end_line": chunk_end},
+                expanded_range={"start_line": chunk_start, "line_count": chunk_count},
             ))
         return out
 
@@ -94,15 +97,18 @@ class ToolOrchestrator:
             return call
         args = dict(call.arguments or {})
         try:
-            start, end = int(args.get("start_line", 1)), int(args.get("end_line", 200))
+            start = int(args.get("start_line", 1))
+            line_count = int(args.get("line_count", REPOSITORY_SOURCE_MAX_LINES))
         except (TypeError, ValueError):
             return call
-        if start < 1 or end < start or end - start + 1 >= 200:
+        if start < 1 or line_count < 1 or line_count >= REPOSITORY_SOURCE_MAX_LINES:
             return call
-        padding = min(self.read_context_padding, max(0, (200 - (end - start + 1)) // 2))
+        padding = min(self.read_context_padding, max(0, (REPOSITORY_SOURCE_MAX_LINES - line_count) // 2))
         if padding <= 0:
             return call
-        widened = dict(args, start_line=max(1, start - padding), end_line=end + padding)
+        widened_start = max(1, start - padding)
+        widened_end = start + line_count - 1 + padding
+        widened = dict(args, start_line=widened_start, line_count=widened_end - widened_start + 1)
         return RequestedToolCall(
             id=call.id, name=call.name, arguments=widened,
             information_need_id=call.information_need_id, obligation_ids=call.obligation_ids,
@@ -126,7 +132,7 @@ class ToolOrchestrator:
                         requested = {
                             "path": original.get("path"),
                             "start_line": int(original.get("start_line", 1)),
-                            "end_line": int(original.get("end_line", 200)),
+                            "line_count": int(original.get("line_count", REPOSITORY_SOURCE_MAX_LINES)),
                         }
                     except (TypeError, ValueError):
                         requested = None

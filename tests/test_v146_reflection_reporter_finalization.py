@@ -124,7 +124,7 @@ class ReflectionReporterFaultLLM:
         if self.planner_calls <= 2:
             return {"kind": "tool", "skill": "repository_exploration",
                     "reason": "read source", "confidence": 0.8,
-                    "tool": "read_file", "arguments": {"path": "a.py", "start_line": 1, "end_line": 3},
+                    "tool": "read_file", "arguments": {"path": "a.py", "start_line": 1, "line_count": 3},
                     "expected_evidence": "source"}
         return {"kind": "finish", "skill": "report_synthesis", "reason": "finish",
                 "confidence": 0.8, "tool": None, "arguments": {}}

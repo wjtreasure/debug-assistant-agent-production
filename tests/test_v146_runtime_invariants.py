@@ -128,7 +128,7 @@ def test_parallel_dependency_is_rejected_not_silently_rewritten(tmp_path):
     action=ActionProposal(
         kind=ActionKind.PARALLEL, skill='repository_exploration', reason='independent reads',
         actions=[
-            {'action_id':'a0','tool':'read_file','arguments':{'path':'a.py','start_line':1,'end_line':1}},
+            {'action_id':'a0','tool':'read_file','arguments':{'path':'a.py','start_line':1,'line_count':1}},
             {'action_id':'a1','tool':'grep','arguments':{'query':'{{result_of_action_0}}','glob':'*.py'}},
         ],
     )
@@ -268,7 +268,7 @@ def test_parallel_semantic_code_search_is_rejected_as_not_bounded_local(tmp_path
     try:
         action=ActionProposal(kind=ActionKind.PARALLEL,skill='repository_exploration',reason='bad parallel network search',actions=[
             {'tool':'code_search','arguments':{'query':'concept','mode':'semantic','max_results':5}},
-            {'tool':'read_file','arguments':{'path':'m.py','start_line':1,'end_line':1}},
+            {'tool':'read_file','arguments':{'path':'m.py','start_line':1,'line_count':1}},
         ])
         gd=RouterGuard(registry).validate(action,AgentState(TaskSpec('t','issue',str(repo))))
         assert gd.ok is False

@@ -139,12 +139,12 @@ class HybridRouter:
 
 
 class KnowledgeQueryBuilder:
-    def __init__(self, *, max_queries: int = 3, top_k: int = 5, token_budget: int = 1200) -> None:
+    def __init__(self, *, max_queries: int = 3, top_k: int = 5, token_budget: int | None = 1200) -> None:
         self.max_queries = max(1, int(max_queries))
         self.top_k = max(1, min(100, int(top_k)))
-        self.token_budget = max(1, int(token_budget))
+        self.token_budget = None if token_budget is None else max(1, int(token_budget))
 
-    def build(self, case: Any, entities: IncidentEntities, decision: RouterDecision, *, evidence_gap: str = "") -> tuple[KnowledgeQuery, ...]:
+    def build(self, case: Any, entities: IncidentEntities, decision: RouterDecision, *, evidence_gap: str = "", token_budget: int | None = None) -> tuple[KnowledgeQuery, ...]:
         if not decision.knowledge_needed or not decision.requested_knowledge_sources:
             return ()
         parts = [str(getattr(case, "summary", "") or "").strip()]
@@ -161,7 +161,8 @@ class KnowledgeQueryBuilder:
             service=entities.service, module=entities.module, fault_type=None,
             software_version=entities.version, repo_commit=None,
             requested_sources=decision.requested_knowledge_sources,
-            top_k=self.top_k, token_budget=self.token_budget,
+            top_k=self.top_k,
+            token_budget=max(1, int(token_budget if token_budget is not None else self.token_budget or 1)),
         )
         return (query,)
 
@@ -257,14 +258,18 @@ class KnowledgeCoordinator:
         packed = []
         budget = query.token_budget * 4
         used = 0
+        stop_reason = "candidates_exhausted"
         for candidate in ordered:
             remaining = budget - used
             if remaining <= 0:
+                stop_reason = "token_ceiling"
                 break
-            content = candidate.content[:remaining]
-            packed.append(candidate.model_copy(update={"content": content}))
-            used += len(content)
+            if len(candidate.content) > remaining:
+                continue
+            packed.append(candidate)
+            used += len(candidate.content)
             if len(packed) >= query.top_k:
+                stop_reason = "top_k_reached"
                 break
         diagnostics = KnowledgeRetrievalDiagnostics(
             requested_sources=tuple(requested), effective_sources=tuple(dict.fromkeys(effective)),
@@ -276,6 +281,7 @@ class KnowledgeCoordinator:
             diversity_applied=len({item.source_type for item in packed}) > 1,
             token_budget=query.token_budget, packed_candidates=len(packed),
             dropped_candidates=max(0, len(ordered) - len(packed)),
+            packing_stop_reason=stop_reason,
         )
         return KnowledgeRetrievalResult(candidates=tuple(packed), diagnostics=diagnostics)
 

@@ -68,9 +68,9 @@ def test_native_planner_unknown_tool_fails_closed(tmp_path):
 
 def test_orchestrator_splits_read_file_and_preserves_metadata(tmp_path):
     orchestrator = ToolOrchestrator(ToolRegistry(tmp_path), max_tool_calls=4)
-    plan = orchestrator.build_plan([RequestedToolCall("r", "read_file", {"path": "a.py", "start_line": 200, "end_line": 460}, "N1", ("O1",))])
-    assert [(x.arguments["start_line"], x.arguments["end_line"]) for x in plan.calls] == [(200, 399), (400, 460)]
-    assert all(x.requested_range["end_line"] == 460 for x in plan.calls)
+    plan = orchestrator.build_plan([RequestedToolCall("r", "read_file", {"path": "a.py", "start_line": 200, "line_count": 261}, "N1", ("O1",))])
+    assert [(x.arguments["start_line"], x.arguments["line_count"]) for x in plan.calls] == [(200, 200), (400, 61)]
+    assert all(x.requested_range["line_count"] == 261 for x in plan.calls)
     assert all(x.request.information_need_id == "N1" and x.request.obligation_ids == ("O1",) for x in plan.calls)
 
 
@@ -78,19 +78,19 @@ def test_orchestrator_can_pad_short_source_reads_without_changing_requested_rang
     orchestrator = ToolOrchestrator(ToolRegistry(tmp_path), max_tool_calls=4,
                                     read_context_padding=60)
     plan = orchestrator.build_plan([
-        RequestedToolCall("r", "read_file", {"path": "a.py", "start_line": 300, "end_line": 360})
+        RequestedToolCall("r", "read_file", {"path": "a.py", "start_line": 300, "line_count": 61})
     ])
     assert len(plan.calls) == 1
     call = plan.calls[0]
-    assert (call.arguments["start_line"], call.arguments["end_line"]) == (240, 420)
-    assert call.requested_range == {"path": "a.py", "start_line": 300, "end_line": 360}
+    assert (call.arguments["start_line"], call.arguments["line_count"]) == (240, 181)
+    assert call.requested_range == {"path": "a.py", "start_line": 300, "line_count": 61}
 
 
 def test_orchestrator_execution_keeps_split_linkage_on_each_observation(tmp_path):
     (tmp_path / "a.py").write_text("value = 1\n" * 401, encoding="utf-8")
     orchestrator = ToolOrchestrator(ToolRegistry(tmp_path), max_tool_calls=3)
     plan = orchestrator.build_plan([
-        RequestedToolCall("r", "read_file", {"path": "a.py", "start_line": 1, "end_line": 401}, "N1", ("O1",))
+        RequestedToolCall("r", "read_file", {"path": "a.py", "start_line": 1, "line_count": 401}, "N1", ("O1",))
     ])
     observations = orchestrator.execute(plan)
     assert len(observations) == 3
@@ -118,7 +118,7 @@ def test_orchestrator_unknown_tool_and_expansion_budget_fail_closed(tmp_path):
     assert unknown.value.error_type == "unknown_tool"
     with pytest.raises(ToolPlanningError) as budget:
         ToolOrchestrator(registry, max_tool_calls=1).build_plan([
-            RequestedToolCall("x", "read_file", {"path": "a.py", "start_line": 1, "end_line": 201})
+            RequestedToolCall("x", "read_file", {"path": "a.py", "start_line": 1, "line_count": 201})
         ])
     assert budget.value.error_type == "tool_budget_preflight"
 
@@ -189,7 +189,7 @@ def test_native_runtime_enters_orchestrator_without_parallel_json(monkeypatch, t
                                 on_attempt_started=None):
             self._usage(system, user)
             self.native_calls += 1
-            calls = () if self.native_calls > 1 else (LLMToolCall("r1", "read_file", {"path": "a.py", "start_line": 1, "end_line": 3}),)
+            calls = () if self.native_calls > 1 else (LLMToolCall("r1", "read_file", {"path": "a.py", "start_line": 1, "line_count": 3}),)
             return LLMResponse(
                 content="I'll inspect the file." if calls else None,
                 tool_calls=calls, usage=self.calls[-1]
@@ -248,9 +248,9 @@ def test_native_runtime_reuses_covered_reads_through_context_manager(monkeypatch
         def complete_with_tools(self, system, user, *, tools, **kwargs):
             self.native_calls += 1
             if self.native_calls == 1:
-                calls = (LLMToolCall("r1", "read_file", {"path": "a.py", "start_line": 1, "end_line": 20}),)
+                calls = (LLMToolCall("r1", "read_file", {"path": "a.py", "start_line": 1, "line_count": 20}),)
             elif self.native_calls == 2:
-                calls = (LLMToolCall("r2", "read_file", {"path": "./a.py", "start_line": 5, "end_line": 10}),)
+                calls = (LLMToolCall("r2", "read_file", {"path": "./a.py", "start_line": 5, "line_count": 6}),)
             else:
                 calls = ()
             return LLMResponse(content="inspect", tool_calls=calls, usage=self._usage())

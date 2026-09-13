@@ -63,7 +63,7 @@ def test_ambiguous_basename_is_not_silently_guessed(tmp_path):
 
 def test_ambiguous_read_is_structured_tool_observation_not_exception(tmp_path):
     repo=_repo(tmp_path); (repo/'src').mkdir(); (repo/'src/parser.py').write_text('x=1'); (repo/'tests/parser.py').write_text('x=2')
-    obs=ReadFileTool(repo).execute('parser.py',1,5)
+    obs=ReadFileTool(repo).execute('parser.py',start_line=1,line_count=5)
     assert obs.ok is False and obs.error_type=='ambiguous_path'
     assert obs.metadata['planner_retryable'] is True
     assert obs.metadata['retryable'] is False  # do not retry the same deterministic call
@@ -115,7 +115,7 @@ def test_read_resolver_rejects_symlink_escape(tmp_path):
         link.symlink_to(outside)
     except OSError:
         return
-    obs=ReadFileTool(repo).execute('secret.py',1,5)
+    obs=ReadFileTool(repo).execute('secret.py',start_line=1,line_count=5)
     assert obs.ok is False and obs.error_type=='path_rejected'
     assert 'SECRET=1' not in obs.content
 
@@ -142,11 +142,11 @@ def test_runtime_ambiguous_path_returns_to_planner_without_reflection(monkeypatc
             self.n+=1
             if self.n==1:
                 return {'kind':'tool','skill':'repository_exploration','reason':'read parser','tool':'read_file',
-                        'arguments':{'path':'parser.py','start_line':1,'end_line':5},'expected_evidence':'source',
+                        'arguments':{'path':'parser.py','start_line':1,'line_count':5},'expected_evidence':'source',
                         'information_need':'inspect parser','confidence':.5}
             if self.n==2:
                 return {'kind':'tool','skill':'repository_exploration','reason':'choose source parser','tool':'read_file',
-                        'arguments':{'path':'src/parser.py','start_line':1,'end_line':5},'expected_evidence':'source',
+                        'arguments':{'path':'src/parser.py','start_line':1,'line_count':5},'expected_evidence':'source',
                         'information_need':'inspect source parser','confidence':.7}
             return {'kind':'finish','skill':'report_synthesis','reason':'enough','tool':None,'arguments':{},'confidence':.7}
 

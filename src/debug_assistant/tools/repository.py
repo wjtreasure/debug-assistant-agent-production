@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import ast, json, os, re, subprocess, time
-from pydantic import Field, model_validator
+from pydantic import Field
 
 from .base import Tool, ToolSpec, ToolArgs
 from debug_assistant.models import ToolObservation
@@ -45,16 +45,7 @@ class GrepArgs(ToolArgs):
 class ReadFileArgs(ToolArgs):
     path: str = Field(min_length=1)
     start_line: int = Field(default=1, ge=1)
-    end_line: int = Field(default=REPOSITORY_SOURCE_MAX_LINES, ge=1)
-    @model_validator(mode='after')
-    def check_range(self):
-        if self.start_line > self.end_line:
-            raise ValueError('start_line must be <= end_line')
-        if self.end_line - self.start_line + 1 > REPOSITORY_SOURCE_MAX_LINES:
-            raise ValueError(
-                f'read_file may request at most {REPOSITORY_SOURCE_MAX_LINES} lines per call'
-            )
-        return self
+    line_count: int = Field(default=REPOSITORY_SOURCE_MAX_LINES, ge=1, le=REPOSITORY_SOURCE_MAX_LINES)
 
 class SymbolSearchArgs(ToolArgs):
     query: str = Field(min_length=1)
@@ -246,12 +237,12 @@ class GrepTool(_RepositoryTool):
 class ReadFileTool(_RepositoryTool):
     spec=ToolSpec(
         'read_file',
-        f'Read source lines with stable line numbers. Repository paths are canonicalized; unique read-only suffix/basename recovery is allowed, ambiguity is returned as a structured tool error. start_line/end_line are inclusive and at most {REPOSITORY_SOURCE_MAX_LINES} lines.',
+        f'Read source lines with stable line numbers. Repository paths are canonicalized; unique read-only suffix/basename recovery is allowed, ambiguity is returned as a structured tool error. Use start_line and line_count; line_count is at most {REPOSITORY_SOURCE_MAX_LINES}.',
         ReadFileArgs,'repository_read','light','none',16000)
     def __init__(self, root, *, fs=None, resolver=None, matcher=None):
         self._init_paths(root,fs=fs,resolver=resolver,matcher=matcher)
         self._failed_paths=set()
-    def execute(self,path,start_line=1,end_line=REPOSITORY_SOURCE_MAX_LINES):
+    def execute(self,path,start_line=1,line_count=REPOSITORY_SOURCE_MAX_LINES):
         t=time.time()
         try:
             normalized=normalize_path_syntax(path)
@@ -262,17 +253,27 @@ class ReadFileTool(_RepositoryTool):
                             planner_retryable=False,cached=True)
             resolved=self.resolver.resolve_file(path,mode=ResolutionMode.READ_TOLERANT)
             lines=self.fs.read_text(resolved.relative_path).splitlines()
-            s=max(1,int(start_line)); requested_end=int(end_line)
+            s=max(1,int(start_line)); requested_count=int(line_count)
+            if requested_count < 1 or requested_count > REPOSITORY_SOURCE_MAX_LINES:
+                return _obs(
+                    self.spec.name, t, False,
+                    f'line_count must be between 1 and {REPOSITORY_SOURCE_MAX_LINES}',
+                    error_type='invalid_line_count',
+                    requested_start_line=s, requested_line_count=requested_count,
+                    path=resolved.relative_path,
+                )
+            requested_end=s+requested_count-1
             if s > len(lines):
                 return _obs(self.spec.name,t,False,
                             f'start_line {s} is beyond end of file',
                             error_type='range_out_of_bounds',actual_line_count=len(lines),
-                            requested_start_line=s,requested_end_line=requested_end,
+                            requested_start_line=s,requested_line_count=requested_count,
                             path=resolved.relative_path)
             e=min(len(lines),requested_end,s+REPOSITORY_SOURCE_MAX_LINES-1)
             text='\n'.join(f"{i:5d} | {lines[i-1]}" for i in range(s,e+1))
-            return _obs(self.spec.name,t,True,text,path=resolved.relative_path,start_line=s,end_line=e,requested_end_line=requested_end,
-                        requested_start_line=s,actual_start_line=s,actual_end_line=e,
+            return _obs(self.spec.name,t,True,text,path=resolved.relative_path,start_line=s,end_line=e,
+                        requested_start_line=s,requested_line_count=requested_count,
+                        actual_start_line=s,actual_end_line=e,
                         clamped=e<requested_end,truncated=e<min(len(lines),requested_end),path_resolution=resolved.metadata(str(path)))
         except PathNotFoundError as e:
             self._failed_paths.add(normalized)

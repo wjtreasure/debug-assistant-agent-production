@@ -28,17 +28,24 @@ def test_tool_schema_canonicalizes_defaults(tmp_path):
     a=ActionProposal(ActionKind.TOOL,'repository_exploration','read',0.7,'read_file',{'path':'x'})
     d=g.validate(a,s)
     assert d.ok
-    assert d.canonical_arguments=={'path':'x','start_line':1,'end_line':200}
+    assert d.canonical_arguments=={'path':'x','start_line':1,'line_count':200}
 
 
-def test_read_file_repairs_more_than_200_lines_deterministically(tmp_path):
+def test_read_file_uses_explicit_bounded_line_count(tmp_path):
     g=RouterGuard(ToolRegistry(tmp_path)); s=state(tmp_path)
-    a=ActionProposal(ActionKind.TOOL,'repository_exploration','read too much',0.7,'read_file',{'path':'x','start_line':200,'end_line':400})
+    a=ActionProposal(ActionKind.TOOL,'repository_exploration','read bounded range',0.7,'read_file',{'path':'x','start_line':200,'line_count':200})
     d=g.validate(a,s)
     assert d.ok
-    assert d.canonical_arguments == {'path':'x','start_line':200,'end_line':399}
-    assert d.repair['requested_line_count'] == 201
-    assert d.repair['repaired_line_count'] == 200
+    assert d.canonical_arguments == {'path':'x','start_line':200,'line_count':200}
+    assert d.repair is None
+
+
+def test_read_file_rejects_line_count_over_200(tmp_path):
+    g=RouterGuard(ToolRegistry(tmp_path)); s=state(tmp_path)
+    a=ActionProposal(ActionKind.TOOL,'repository_exploration','read too much',0.7,'read_file',{'path':'x','start_line':200,'line_count':201})
+    d=g.validate(a,s)
+    assert not d.ok
+    assert d.error['error_type']=='schema_validation'
 
 
 def test_read_file_does_not_repair_ambiguous_invalid_arguments(tmp_path):

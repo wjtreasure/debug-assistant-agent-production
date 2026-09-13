@@ -478,7 +478,11 @@ class DomainKnowledgeRetriever:
                 continue
             content = candidate.content
             if len(content) > remaining:
-                content = content[:remaining].rsplit("\n", 1)[0] or content[:remaining]
+                # The caller owns a token ceiling.  Do not fill it with a
+                # chopped parent section; retain complete high-value parents
+                # and let the next query/turn retrieve another slice.
+                dropped += 1
+                continue
             packed.append(candidate.model_copy(update={"content": content}))
             used += len(content)
             if len(packed) >= query.top_k:
@@ -551,6 +555,7 @@ class DomainKnowledgeRetriever:
             diversity_applied=len({self._source_key(item) for item in deduped}) > 1,
             token_budget=query.token_budget, packed_candidates=len(packed),
             dropped_candidates=dropped,
+            packing_stop_reason=("top_k_reached" if len(packed) >= query.top_k else "candidates_exhausted_or_ceiling"),
         )
         return KnowledgeRetrievalResult(candidates=tuple(packed), diagnostics=diagnostics)
 
