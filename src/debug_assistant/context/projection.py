@@ -110,6 +110,20 @@ class IncidentProjectionPolicy:
         "return", "error", "exception", "for ", "while ", "go ", "grpc",
         "rpc", "context.", "time.", "latency", "timeout", "port",
     )
+    _MAX_PROJECTED_CHARS = {
+        "LOG": 3600,
+        "ALERT": 3000,
+        "METRIC": 3200,
+        "CODE": 5200,
+        "CODE_SEARCH": 2600,
+        "CODE_INDEX": 2600,
+        "POD": 4200,
+        "DEPLOYMENT": 4200,
+        "EVENT": 3600,
+        "CONFIG": 4200,
+        "SERVICE": 3200,
+        "ENDPOINT": 3200,
+    }
 
     def project(self, obs, item: ContextItem, step: int, *, requests=(), rehydrate_requested=False):
         kind = str((obs.metadata or {}).get("context_kind") or "OBSERVATION").upper()
@@ -182,5 +196,37 @@ class IncidentProjectionPolicy:
 
         if not selected:
             return content
-        projected = "\n".join(lines[index] for index in sorted(selected))
+        projected_lines = [lines[index] for index in sorted(selected)]
+        # Do not let a large event table or repeated log block turn a compact
+        # Evidence object back into an 11k-character prompt item. Raw content
+        # remains immutable in ObservationStore; this is only model projection.
+        if kind in {"LOG", "METRIC"}:
+            deduped = []
+            previous = None
+            for line in projected_lines:
+                if line == previous and line.strip():
+                    continue
+                deduped.append(line)
+                previous = line
+            projected_lines = deduped
+        max_chars = self._MAX_PROJECTED_CHARS.get(kind, 4000)
+        projected = "\n".join(projected_lines)
+        if len(projected) > max_chars:
+            # Keep both the structural header and the newest/terminal signal.
+            head_budget = max(200, int(max_chars * 0.58))
+            tail_budget = max(200, max_chars - head_budget - 80)
+            head, tail = [], []
+            used = 0
+            for line in projected_lines:
+                if used + len(line) + 1 > head_budget:
+                    break
+                head.append(line)
+                used += len(line) + 1
+            used = 0
+            for line in reversed(projected_lines):
+                if used + len(line) + 1 > tail_budget:
+                    break
+                tail.append(line)
+                used += len(line) + 1
+            projected = "\n".join(head + ["... [projection_middle_omitted] ..."] + list(reversed(tail)))
         return f"[incident projection kind={kind}]\n{projected}"

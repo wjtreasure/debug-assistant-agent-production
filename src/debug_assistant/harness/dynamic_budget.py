@@ -8,7 +8,7 @@ The ContextManager remains responsible for selecting content; this controller
 only supplies the physical ceiling, pressure state, and continuation signal.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 import json
 import math
@@ -60,6 +60,18 @@ class PromptBudgetExceeded(RuntimeError):
             f"{decision.stage} prompt estimated at "
             f"{decision.estimated_prompt_tokens} tokens exceeds input hard capacity "
             f"{decision.input_hard_capacity}"
+        )
+
+
+class RunBudgetAdmissionExceeded(PromptBudgetExceeded):
+    """Raised before a provider request cannot preserve the run terminal reserve."""
+
+    def __init__(self, decision: PromptBudgetDecision):
+        super().__init__(decision)
+        self.metadata["kind"] = "run_budget_admission"
+        self.metadata["remaining_run_tokens"] = decision.remaining_run_tokens
+        self.metadata["required_run_tokens"] = decision.breakdown.get(
+            "required_run_tokens", 0
         )
 
 
@@ -290,6 +302,50 @@ class DynamicBudgetController:
         if result.input_hard_capacity is not None and estimate > result.input_hard_capacity:
             self.context_state_override = BudgetState.HARD_PRESSURE
             raise PromptBudgetExceeded(result)
+        # A prompt can fit the model's context window while still consuming
+        # the run's finalization reserve.  Reject the provider call before it
+        # starts when the estimated prompt plus declared completion reserve
+        # would leave no room for the terminal path.
+        completion_reserve = max(
+            int(self.capability.reserved_output_tokens),
+            int(self.capability.max_output_tokens or 0),
+        )
+        remaining_calls = max(0, self.max_llm_calls - int(llm_calls_used))
+        required_run_tokens = (
+            estimate + completion_reserve + self.terminal_reserve_tokens
+        )
+        if (
+            required_run_tokens > result.remaining_run_tokens
+            or (
+                self.terminal_reserve_seconds > 0
+                and self.max_wall_time_seconds - (time.time() - self.started_at)
+                <= self.terminal_reserve_seconds
+            )
+        ):
+            reason = "pre-call run budget admission would consume terminal reserve"
+            if (
+                self.terminal_reserve_seconds > 0
+                and self.max_wall_time_seconds - (time.time() - self.started_at)
+                <= self.terminal_reserve_seconds
+            ):
+                reason = "pre-call wall-clock admission would consume terminal reserve"
+            admission = replace(
+                result,
+                state=BudgetState.HARD_PRESSURE,
+                reason=reason,
+                breakdown={
+                    **result.breakdown,
+                    "estimated_prompt_tokens": estimate,
+                    "reserved_output_tokens": completion_reserve,
+                    "terminal_reserve_tokens": self.terminal_reserve_tokens,
+                    "required_run_tokens": required_run_tokens,
+                    "remaining_run_tokens": result.remaining_run_tokens,
+                    "remaining_llm_calls": remaining_calls,
+                },
+                compaction_required=True,
+            )
+            self.last_decision = admission
+            raise RunBudgetAdmissionExceeded(admission)
         return result
 
     def force_context_state(self, state: BudgetState) -> None:

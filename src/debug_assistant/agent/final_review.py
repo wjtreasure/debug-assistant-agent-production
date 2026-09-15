@@ -7,6 +7,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from debug_assistant.contracts import compact_validation_error
+from debug_assistant.harness.dynamic_budget import PromptBudgetExceeded
 from debug_assistant.incidents.contracts import IncidentEvidence, ReviewDecision, RootCauseCandidate
 from debug_assistant.llm.base import LLMDeadlineExceeded, complete_json_compat
 
@@ -16,7 +17,8 @@ claim-evidence mapping, causal chain summary, cited Evidence, source-mechanism c
 critical obligations, and open blocking contradictions.
 Do not re-diagnose, call tools, propose a replacement root cause, or modify the hypothesis.
 Return exactly: decision (PASS or REJECT), unsupported_claims, missing_evidence,
-contradictions, causal_chain_valid, causal_gaps, suggested_investigation, and reason.
+blocking_contradictions, recoverability {recoverable, unrecoverable},
+targeted_followup, causal_chain_valid, causal_gaps, and reason.
 PASS only when the cited Evidence supports both the named component and causal mechanism and
 the structured causal chain is coherent. Claim specificity and certainty must not exceed what
 the cited Evidence directly establishes: do not turn a symptom into an implementation cause,
@@ -33,8 +35,9 @@ or the mechanism is already source-backed. When a finding category is empty, ret
 _REPAIR_SYSTEM = """Repair only the JSON shape of a Final Review Agent response.
 Do not re-diagnose, add evidence, change the substantive decision, or propose a replacement root cause.
 Return exactly these fields and types: decision string (PASS or REJECT); unsupported_claims,
-missing_evidence, contradictions, and causal_gaps as arrays of strings; causal_chain_valid as a boolean;
-suggested_investigation and reason as strings.
+missing_evidence, blocking_contradictions, contradictions, and causal_gaps as arrays of strings;
+recoverability as an object with recoverable and unrecoverable booleans; causal_chain_valid as a boolean;
+targeted_followup, suggested_investigation, and reason as strings.
 When a finding category has no finding, use an empty array []; put any explanation in reason.
 This is the only repair attempt."""
 
@@ -47,6 +50,7 @@ _REVIEW_FINDING_FIELDS = (
     "unsupported_claims",
     "missing_evidence",
     "contradictions",
+    "blocking_contradictions",
     "causal_gaps",
 )
 
@@ -62,6 +66,35 @@ def _normalize_review_payload(data, *, actions=None, drops=None, warnings=None):
     if not isinstance(data, dict):
         return data
     normalized = dict(data)
+    if "decision" not in normalized:
+        for alias in ("outcome", "status"):
+            if alias in normalized:
+                normalized["decision"] = normalized.pop(alias)
+                break
+    decision = str(normalized.get("decision") or "").strip().upper()
+    normalized["decision"] = {
+        "ACCEPT": "PASS", "ACCEPTED": "PASS", "PASS": "PASS",
+        "REJECTED": "REJECT", "FAIL": "REJECT", "FAILED": "REJECT",
+    }.get(decision, normalized.get("decision"))
+    decision = str(normalized.get("decision") or "").strip().upper()
+    if "blocking_contradictions" not in normalized and "contradictions" in normalized:
+        normalized["blocking_contradictions"] = normalized["contradictions"]
+    if "contradictions" not in normalized and "blocking_contradictions" in normalized:
+        normalized["contradictions"] = normalized["blocking_contradictions"]
+    if "targeted_followup" not in normalized and "suggested_investigation" in normalized:
+        normalized["targeted_followup"] = normalized["suggested_investigation"]
+    if "suggested_investigation" not in normalized and "targeted_followup" in normalized:
+        normalized["suggested_investigation"] = normalized["targeted_followup"]
+    if "recoverability" not in normalized:
+        followup = normalized.get("targeted_followup") or normalized.get("suggested_investigation")
+        normalized["recoverability"] = {
+            "recoverable": decision != "PASS" and bool(
+                normalized.get("missing_evidence")
+                or normalized.get("blocking_contradictions")
+                or followup
+            ),
+            "unrecoverable": False,
+        }
     known_fields = set(ReviewDecision.model_fields)
     extra_fields = sorted(set(normalized) - known_fields)
     for field in extra_fields:
@@ -75,7 +108,11 @@ def _normalize_review_payload(data, *, actions=None, drops=None, warnings=None):
             warnings.append("top_level:ignored_unknown_fields:" + ",".join(extra_fields))
     for field in _REVIEW_FINDING_FIELDS:
         value = normalized.get(field)
-        if isinstance(value, str):
+        if value is None:
+            normalized[field] = []
+            if actions is not None:
+                actions.append(f"{field}:null_to_empty_array")
+        elif isinstance(value, str):
             normalized[field] = [value]
             if actions is not None:
                 actions.append(f"{field}:scalar_to_singleton_array")
@@ -83,7 +120,7 @@ def _normalize_review_payload(data, *, actions=None, drops=None, warnings=None):
             normalized[field] = list(value)
             if actions is not None:
                 actions.append(f"{field}:tuple_to_array")
-    for field in ("suggested_investigation", "reason"):
+    for field in ("suggested_investigation", "targeted_followup", "reason"):
         value = normalized.get(field)
         if isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value):
             normalized[field] = "\n".join(value)
@@ -104,6 +141,7 @@ def _meaningful_findings(values, *, category: str) -> tuple[str, ...]:
         "unsupported_claims": ("no unsupported claim", "no unsupported claims"),
         "missing_evidence": ("no missing evidence", "no additional evidence"),
         "contradictions": ("no contradiction", "no contradictions"),
+        "blocking_contradictions": ("no blocking contradiction", "no blocking contradictions"),
     }[category]
     meaningful: list[str] = []
     for value in values:
@@ -145,6 +183,9 @@ def enforce_review_consistency(decision: ReviewDecision) -> ReviewDecision:
         "contradictions": _meaningful_findings(
             decision.contradictions, category="contradictions",
         ),
+        "blocking_contradictions": _meaningful_findings(
+            decision.blocking_contradictions, category="blocking_contradictions",
+        ),
     })
     if cleaned.decision != "PASS":
         return cleaned
@@ -152,6 +193,7 @@ def enforce_review_consistency(decision: ReviewDecision) -> ReviewDecision:
         cleaned.unsupported_claims
         + cleaned.missing_evidence
         + cleaned.contradictions
+        + cleaned.blocking_contradictions
     )
     if not findings and cleaned.causal_chain_valid and not cleaned.causal_gaps:
         return cleaned
@@ -281,9 +323,71 @@ class FinalReviewAgent:
             })
             return result
 
-        raw = call_stage(
-            "first_pass", _SYSTEM, json.dumps(payload, ensure_ascii=False),
-        )
+        try:
+            raw = call_stage(
+                "first_pass", _SYSTEM, json.dumps(payload, ensure_ascii=False),
+            )
+        except LLMDeadlineExceeded:
+            raise
+        except PromptBudgetExceeded:
+            # Admission failures are deterministic run/context boundaries,
+            # not malformed provider payloads. Do not spend the bounded
+            # schema-repair slot or relabel the failure as ReviewSchemaError.
+            raise
+        except Exception as first_exception:
+            # Invalid JSON is a bounded schema-repair case, not an unbounded
+            # provider retry. Keep the failed first attempt visible and give
+            # the same one repair slot used for typed validation failures.
+            self._add_usage()
+            self.last_repair_attempted = True
+            self.last_schema_error = (
+                f"first-pass provider payload error: {type(first_exception).__name__}: "
+                f"{first_exception}"
+            )
+            repair_payload = {
+                "invalid_response": str(first_exception),
+                "validation_errors": [self.last_schema_error],
+            }
+            try:
+                raw_repaired = call_stage(
+                    "schema_repair", _REPAIR_SYSTEM,
+                    json.dumps(repair_payload, ensure_ascii=False),
+                )
+            except LLMDeadlineExceeded:
+                raise
+            except PromptBudgetExceeded:
+                raise
+            except Exception as repair_exception:
+                self.last_schema_error += (
+                    f"\nRepair provider payload error: {type(repair_exception).__name__}: "
+                    f"{repair_exception}"
+                )
+                raise ReviewSchemaError(
+                    "Final Review provider payload remained invalid after one schema repair"
+                ) from repair_exception
+            self._add_usage()
+            repaired = _normalize_review_payload(
+                raw_repaired,
+                actions=self.last_normalization_actions,
+                drops=self.last_metadata_drops,
+                warnings=self.last_metadata_warnings,
+            )
+            try:
+                decision = ReviewDecision.model_validate(repaired)
+            except ValidationError as repair_error:
+                self.last_attempts[-1].update({
+                    "status": "schema_invalid",
+                    "failure_type": "schema_validation",
+                })
+                self.last_schema_error += "\nRepair validation error: " + json.dumps(
+                    compact_validation_error(repair_error), ensure_ascii=False,
+                )
+                raise ReviewSchemaError(
+                    "Final Review schema repair failed"
+                ) from repair_error
+            self.last_schema_repaired = True
+            self.last_deterministic_normalized = repaired != raw_repaired
+            return decision
         self._add_usage()
         normalized = _normalize_review_payload(
             raw,

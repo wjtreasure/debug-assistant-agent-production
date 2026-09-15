@@ -57,18 +57,20 @@ class EvidenceMemory:
     def add_observation(self, obs: ToolObservation, *, evidence_id: str | None = None,
                         kind: str | None = None, source: str | None = None,
                         summary: str | None = None, excerpt: str | None = None,
-                        target: str | None = None, tags: list[str] | None = None):
+                        target: str | None = None, tags: list[str] | None = None,
+                        enforce_admission: bool = True,
+                        deduplicate: bool = True):
         if not obs.ok or not obs.content.strip():
             return None
         # A captured query can be available while returning an empty collection
         # (for example, no error logs). Preserve that raw Observation, but do not
         # promote the absence of records into a citable causal fact.
-        if (obs.metadata or {}).get('semantic_negative') is True:
+        if enforce_admission and (obs.metadata or {}).get('semantic_negative') is True:
             return None
         # Retrieval results are candidate locations, not causal evidence. They must be
         # verified by a source-reading observation before entering the evidence ledger.
         information_source = (obs.metadata or {}).get('information_source')
-        if information_source in {
+        if enforce_admission and information_source in {
             'candidate_retrieval', 'prior', 'knowledge_candidate',
             'incident_memory', 'domain_rag', 'static_kg',
         }:
@@ -76,11 +78,11 @@ class EvidenceMemory:
         # Even if a legacy/custom symbol tool labels its bounded preview as
         # source_read, symbol lookup is still discovery.  Only read_file is the
         # canonical source-verification observation.
-        if obs.tool == 'symbol_search':
+        if enforce_admission and obs.tool == 'symbol_search':
             return None
         meta = obs.metadata or {}
         key=sha1((obs.tool+'|'+obs.content).encode('utf-8','ignore')).hexdigest()[:12]
-        if key in self._seen:
+        if deduplicate and key in self._seen:
             existing = self._evidence_by_fingerprint.get(key)
             if existing is not None:
                 self._evidence_by_observation_id[obs.observation_id] = existing

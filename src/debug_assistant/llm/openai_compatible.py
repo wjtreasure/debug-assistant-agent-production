@@ -24,6 +24,32 @@ from .base import (
 )
 
 
+def _safe_raw_message(message: dict) -> dict:
+    """Preserve the native contract without persisting hidden reasoning."""
+    safe: dict[str, Any] = {
+        "content": message.get("content") if isinstance(message.get("content"), str) else None,
+    }
+    raw_calls = message.get("tool_calls") or []
+    if isinstance(raw_calls, list):
+        calls = []
+        for index, row in enumerate(raw_calls):
+            if not isinstance(row, dict):
+                calls.append({"index": index, "type": type(row).__name__})
+                continue
+            function = row.get("function") if isinstance(row.get("function"), dict) else {}
+            calls.append({
+                "id": str(row.get("id") or f"tool-call-{index + 1}"),
+                "type": row.get("type", "function"),
+                "function": {
+                    "name": function.get("name"),
+                    # Keep exact argument serialization for format debugging.
+                    "arguments": function.get("arguments"),
+                },
+            })
+        safe["tool_calls"] = calls
+    return safe
+
+
 class OpenAICompatibleClient(LLMClient):
     """OpenAI-compatible JSON client with a total logical-call deadline.
 
@@ -54,6 +80,7 @@ class OpenAICompatibleClient(LLMClient):
         self.timeout = max(0.01, float(timeout))
         self.temperature = temperature
         self.async_transport = async_transport
+        self.last_raw_output: dict[str, Any] = {}
         self.max_attempts = max(1, int(max_attempts))
         self.min_retry_budget = max(0.0, float(min_retry_budget))
         self.capabilities = capabilities or ProviderCapabilities(
@@ -224,8 +251,12 @@ class OpenAICompatibleClient(LLMClient):
                             error.error_type = "provider_contract_mismatch"
                             raise error
                         content = raw_content or ""
-                        tool_calls = parse_tool_calls(message)
+                        # Set this before parsing tool arguments so a malformed
+                        # native response still leaves provider-visible audit
+                        # material for the Planner boundary.
+                        self.last_raw_output = _safe_raw_message(message)
                         self.last_raw_content = content
+                        tool_calls = parse_tool_calls(message)
                         self.last_usage = dict(usage)
                         prompt_details = usage.get("prompt_tokens_details") or {}
                         completion_details = usage.get("completion_tokens_details") or {}
@@ -254,7 +285,7 @@ class OpenAICompatibleClient(LLMClient):
                         parsed = extract_json(content) if content.strip() and tools is None else None
                         self.last_response = LLMResponse(
                             content=content, structured=parsed, tool_calls=tool_calls,
-                            usage=dict(usage),
+                            usage=dict(usage), raw_output=_safe_raw_message(message),
                         )
                         self._event(
                             "LLM_ATTEMPT_FINISHED",

@@ -295,6 +295,7 @@ class IncidentReliabilityQuality(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     timeout: bool
     schema_repair_count: int
+    contract_repair_count: int
     contract_failure: bool
     inconclusive: bool
     terminal_status: str
@@ -339,6 +340,17 @@ class IncidentEvalResult(BaseModel):
     run_status: str
     candidate_present: bool
     candidate_accepted: bool
+    # Diagnosis quality is measured before the independent Review gate.
+    candidate_component_correct: bool
+    candidate_fault_correct: bool
+    candidate_mechanism_correct: bool | None = None
+    candidate_evidence_coverage: float
+    # Final quality is measured only after Review accepts the candidate.
+    review_status: str
+    final_component_correct: bool
+    final_fault_correct: bool
+    final_mechanism_correct: bool | None = None
+    strict_rca: bool
     component_correct: bool
     fault_correct: bool
     fault_code_correct: bool
@@ -355,6 +367,7 @@ class IncidentEvalResult(BaseModel):
     evidence_supported: bool
     evidence_validity: float
     required_evidence_coverage: float
+    action_required_evidence_group_progress: tuple[dict[str, Any], ...] = ()
     unsupported_claim_rate: float
     key_evidence_coverage: float
     repeated_tool_calls: int
@@ -364,6 +377,7 @@ class IncidentEvalResult(BaseModel):
     review_result: str
     timeout: bool
     schema_repair_count: int
+    contract_repair_count: int
     contract_failure: bool
     inconclusive: bool
     steps: int
@@ -424,14 +438,80 @@ class IncidentEvaluator:
             canonicalize_component(truth.component),
             *(canonicalize_component(value) for value in truth.component_aliases),
         }
-        candidate_present = run.candidate is not None
+        provisional_candidate = run.candidate
+        candidate_present = provisional_candidate is not None
         candidate_accepted = run.status == "PASS" and candidate_present
         candidate = run.candidate if candidate_accepted else None
         candidate_component = canonicalize_component(candidate.component) if candidate else ""
         component_correct = bool(candidate and candidate_component in accepted_components)
+        provisional_component = canonicalize_component(provisional_candidate.component) if provisional_candidate else ""
+        candidate_component_correct = bool(
+            provisional_candidate and provisional_component in accepted_components
+        )
 
         candidate_fault_code, candidate_explanation, legacy_fault_schema = _candidate_fault_projection(candidate)
+        provisional_fault_code, provisional_explanation, _ = _candidate_fault_projection(
+            provisional_candidate
+        )
         truth_fault_code = truth.canonical_fault_code
+        def fault_code_matches(item, projected_code: str) -> bool:
+            if item:
+                if item.fault_code.strip():
+                    # Structured codes are exact taxonomy identifiers. Aliases
+                    # and free-text phrase matching never participate here.
+                    return canonicalize_fault_code(projected_code) == truth_fault_code
+                return canonicalize_fault(
+                    projected_code, truth_fault_code, truth.fault_aliases,
+                ) == truth_fault_code
+            return False
+
+        fault_code_correct = fault_code_matches(candidate, candidate_fault_code)
+        candidate_fault_correct = fault_code_matches(
+            provisional_candidate, provisional_fault_code,
+        )
+
+        explanation_rubric = truth.fault_explanation_rubric
+        candidate_explanation_grade = self._grade(
+            provisional_explanation if provisional_candidate else "",
+            truth.fault_explanation or truth.fault,
+            explanation_rubric,
+            field="fault_explanation",
+        )
+        explanation_grade = self._grade(
+            candidate_explanation if candidate else "",
+            truth.fault_explanation or truth.fault,
+            explanation_rubric,
+            field="fault_explanation",
+        )
+        explanation_score = explanation_grade.score
+
+        candidate_mechanism_evaluated = False
+        candidate_mechanism_correct: bool | None = None
+        if truth.mechanism_rubric.available:
+            candidate_mechanism_grade = self._grade(
+                provisional_candidate.mechanism if provisional_candidate else "",
+                truth.mechanism or "",
+                truth.mechanism_rubric,
+                field="mechanism",
+            )
+            candidate_mechanism_evaluated = candidate_mechanism_grade.status == "AVAILABLE"
+            candidate_mechanism_correct = (
+                candidate_mechanism_grade.score == 2
+                if candidate_mechanism_evaluated else None
+            )
+        elif _mechanism_is_deterministically_evaluable(truth):
+            candidate_mechanism_evaluated = True
+            candidate_mechanism_correct = bool(
+                provisional_candidate
+                and canonicalize_mechanism(
+                    provisional_candidate.mechanism,
+                    truth.mechanism or "",
+                    truth.mechanism_aliases,
+                ) == canonicalize_free_text(truth.mechanism or "")
+            )
+
+        # Final mechanism/fault values below deliberately continue to use only
+        # the Review-accepted candidate, preserving the historical final gate.
         if candidate:
             if candidate.fault_code.strip():
                 # Structured codes are exact taxonomy identifiers.  Aliases and
@@ -450,15 +530,6 @@ class IncidentEvaluator:
                 )
         else:
             fault_code_correct = False
-
-        explanation_rubric = truth.fault_explanation_rubric
-        explanation_grade = self._grade(
-            candidate_explanation if candidate else "",
-            truth.fault_explanation or truth.fault,
-            explanation_rubric,
-            field="fault_explanation",
-        )
-        explanation_score = explanation_grade.score
 
         mechanism_grade: SemanticGrade | None = None
         mechanism_score: int | None = None
@@ -525,6 +596,9 @@ class IncidentEvaluator:
         inconclusive = run.status == "INCONCLUSIVE"
         trace_events = _load_trace_events(run)
         trajectory_metrics = _trajectory_metrics(run, trace_events)
+        action_group_progress = _action_required_evidence_group_progress(
+            run.actions, groups, observed,
+        )
 
         # This is the new outcome gate.  ``root_cause_correct`` below remains
         # the historical compatibility metric and is deliberately less strict.
@@ -552,6 +626,15 @@ class IncidentEvaluator:
             run_status=run.status,
             candidate_present=candidate_present,
             candidate_accepted=candidate_accepted,
+            candidate_component_correct=candidate_component_correct,
+            candidate_fault_correct=candidate_fault_correct,
+            candidate_mechanism_correct=candidate_mechanism_correct,
+            candidate_evidence_coverage=required_coverage,
+            review_status=review_outcome,
+            final_component_correct=component_correct,
+            final_fault_correct=fault_code_correct,
+            final_mechanism_correct=mechanism_correct,
+            strict_rca=strict_task_success,
             component_correct=component_correct,
             fault_correct=fault_code_correct,
             fault_code_correct=fault_code_correct,
@@ -568,6 +651,7 @@ class IncidentEvaluator:
             evidence_supported=evidence_supported,
             evidence_validity=evidence_validity,
             required_evidence_coverage=required_coverage,
+            action_required_evidence_group_progress=action_group_progress,
             unsupported_claim_rate=unsupported_claim_rate,
             key_evidence_coverage=required_coverage,
             repeated_tool_calls=duplicate_tool_calls_executed,
@@ -577,6 +661,7 @@ class IncidentEvaluator:
             review_result=review_outcome,
             timeout=timeout,
             schema_repair_count=run.metrics.schema_repair_count,
+            contract_repair_count=run.metrics.contract_repair_count,
             contract_failure=contract_failure,
             inconclusive=inconclusive,
             steps=run.metrics.steps,
@@ -628,6 +713,7 @@ class IncidentEvaluator:
             reliability=IncidentReliabilityQuality(
                 timeout=timeout,
                 schema_repair_count=run.metrics.schema_repair_count,
+                contract_repair_count=run.metrics.contract_repair_count,
                 contract_failure=contract_failure,
                 inconclusive=inconclusive,
                 terminal_status=run.status,
@@ -871,6 +957,48 @@ def _claim_support_counts(candidate, valid_cited_ids: set[str]) -> tuple[int, in
     return len(rows), supported
 
 
+def _action_required_evidence_group_progress(
+    actions: tuple[dict[str, Any], ...],
+    groups: tuple[EvidenceGroup, ...],
+    evidence: tuple[Any, ...],
+) -> tuple[dict[str, Any], ...]:
+    """Attach Gold-only required-group progress after a run has finished.
+
+    The Runtime cannot use these groups while planning because they belong to
+    the evaluator boundary. This post-run projection makes the paired audit
+    explain *which* action earned a required group, without feeding Gold back
+    into the Agent.
+    """
+    by_observation: dict[str, list[Any]] = {}
+    for item in evidence:
+        observation_id = str(getattr(item, "observation_id", "") or "")
+        if observation_id:
+            by_observation.setdefault(observation_id, []).append(item)
+    cumulative: list[Any] = []
+    previous: tuple[bool, ...] = tuple(False for _ in groups)
+    rows: list[dict[str, Any]] = []
+    for action in actions:
+        cumulative.extend(by_observation.get(str(action.get("observation_id") or ""), ()))
+        current = tuple(_evidence_group_satisfied(group, tuple(cumulative)) for group in groups)
+        newly_satisfied = [
+            group.name for group, before, after in zip(groups, previous, current)
+            if not before and after
+        ]
+        rows.append({
+            "step": action.get("step"),
+            "tool": action.get("tool"),
+            "action_class": action.get("action_class", "unknown"),
+            "groups_satisfied": sum(current),
+            "groups_total": len(groups),
+            "newly_satisfied_groups": newly_satisfied,
+            "groups": {
+                group.name: satisfied for group, satisfied in zip(groups, current)
+            },
+        })
+        previous = current
+    return tuple(rows)
+
+
 def _trajectory_metrics(run: IncidentRunResult, trace_events: tuple[dict, ...]) -> dict[str, Any]:
     hypothesis = run.hypotheses[-1] if run.hypotheses else None
     obligations = tuple(hypothesis.verification_obligations) if hypothesis else ()
@@ -945,4 +1073,11 @@ def _run_timed_out(run: IncidentRunResult) -> bool:
 
 def _run_contract_failed(run: IncidentRunResult) -> bool:
     text = " ".join((run.error_type, run.metrics.termination_reason, run.failure_category)).casefold()
-    return "contract" in text or "schema" in text
+    if "contract" in text or "schema" in text:
+        return True
+    # Tool contract exhaustion can be normalized to a generic runtime error by
+    # older artifacts. The immutable trace remains the authoritative fallback.
+    return any(
+        "contract" in str(event.get("type", "")).casefold()
+        for event in _load_trace_events(run)
+    )

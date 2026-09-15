@@ -4,7 +4,7 @@ import json
 import time
 import inspect
 from dataclasses import dataclass
-from typing import Any, get_args
+from typing import Any, Iterable, get_args
 from pydantic import ValidationError
 from debug_assistant.models import ActionProposal, ActionKind, AgentState
 from debug_assistant.contracts import (AgentActionContract, PlannerIntent, QuestionType, compact_validation_error,
@@ -17,6 +17,14 @@ from debug_assistant.tools.registry import PARALLEL_ALLOWED_TOOLS
 from debug_assistant.incidents.contracts import (
     Contradiction, SourceMechanismStatus, VerificationObligation,
 )
+from debug_assistant.agent.output_normalization import (
+    INCIDENT_REQUIRED_CONTROL_FIELDS,
+    INCIDENT_SKILL_CONTROL_FIELDS,
+    IncidentLLMOutputNormalizer,
+)
+
+
+INCIDENT_ENVELOPE_TOOL = "diagnosis_action"
 
 
 class PlannerContractError(ValueError):
@@ -35,6 +43,16 @@ class PlannerContractError(ValueError):
         }
         if repair_rejection_reason:
             self.metadata['repair_rejection_reason'] = repair_rejection_reason
+        if isinstance(output, dict):
+            # Contract artifacts are intentionally limited to provider-visible
+            # JSON and validation state. Hidden reasoning is never copied here.
+            for key in (
+                "raw_output", "parsed_output", "normalized_output",
+                "validation_error", "repair_prompt", "repair_output",
+                "repair_result",
+            ):
+                if key in output:
+                    self.metadata[key] = output[key]
         super().__init__(message)
 
 
@@ -56,7 +74,7 @@ class PlannerContractExhausted(PlannerContractError):
 
     def __init__(self, cause: PlannerContractError):
         super().__init__(
-            "planner structured contract remained invalid after one bounded retry",
+            "planner structured contract remained invalid after bounded retry",
             validation_errors=list(getattr(cause, "metadata", {}).get("validation_errors", ())),
         )
         self.metadata.update(getattr(cause, "metadata", {}))
@@ -92,6 +110,9 @@ class NativeSkillSelection:
     reasoning_metadata_warnings: tuple[str, ...] = ()
     reasoning_metadata_normalizations: tuple[str, ...] = ()
     reasoning_metadata_drops: tuple[str, ...] = ()
+    compatibility_normalizations: tuple[str, ...] = ()
+    obligation_id: str = ""
+    expected_information_gain: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,16 +134,39 @@ class NativePlannerResult:
     intent: PlannerIntent | None = None
     assistant_text: str | None = None
     skill_selections: tuple[NativeSkillSelection, ...] = ()
+    tool_call_audits: tuple[dict[str, Any], ...] = ()
 
 
 class NativeToolPlanner:
-    def __init__(self, llm, tools, model: str = ""):
+    def __init__(self, llm, tools, model: str = "", *, planner_state_envelope: bool = False):
         self.llm, self.tools, self.model = llm, tools, model
+        # Opt-in optimized protocol. The direct-call protocol remains available
+        # for old providers and compatibility tests.
+        self.planner_state_envelope = bool(planner_state_envelope)
         self.last_prompt_breakdown = {}
         self.last_prompt_breakdowns: list[dict[str, Any]] = []
 
+    @staticmethod
+    def _contract_output(response: LLMResponse, context: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Build bounded, auditable diagnostics for a Planner contract error."""
+        output = dict(context or {})
+        raw_output = getattr(response, "raw_output", None)
+        if isinstance(raw_output, dict):
+            output["raw_output"] = copy.deepcopy(raw_output)
+        elif raw_output:
+            output["raw_output"] = str(raw_output)[:12000]
+        structured = getattr(response, "structured", None)
+        if structured is not None:
+            try:
+                json.dumps(structured, ensure_ascii=False)
+                output["parsed_output"] = copy.deepcopy(structured)
+            except (TypeError, ValueError):
+                output["parsed_output"] = str(structured)[:12000]
+        return output
+
     def propose(self, state: AgentState, context: str, *, logical_timeout_seconds=None,
-                on_attempt_started=None, prompt_budget=None) -> NativePlannerResult:
+                on_attempt_started=None, prompt_budget=None,
+                visible_tool_names: Iterable[str] | None = None) -> NativePlannerResult:
         if not getattr(getattr(self.llm, "capabilities", ProviderCapabilities()), "tool_calling", False):
             raise PlannerContractError("provider does not support native tool calling",
                                        validation_errors=["tool_calling=false"])
@@ -191,10 +235,36 @@ class NativeToolPlanner:
                 "code_investigation before finalization.\n\n"
                 + render_skill_catalog(skills=INCIDENT_SKILLS)
             )
-        user = f"{context}\n\nCURRENT_GOAL: {state.task.issue}\n"
-        schemas = self.tools.function_schemas()
-        if incident_mode:
-            schemas = [_with_incident_skill_controls(schema) for schema in schemas]
+        try:
+            schemas = self.tools.function_schemas(visible_tools=visible_tool_names)
+        except TypeError:
+            # Generic repository registries predate stage-aware incident
+            # exposure. Keep them compatible and apply no accidental filter.
+            schemas = self.tools.function_schemas()
+        if visible_tool_names is not None and not hasattr(self.tools, "function_schemas"):
+            visible = {str(name) for name in visible_tool_names}
+            schemas = [
+                schema for schema in schemas
+                if schema.get("function", {}).get("name") in visible
+            ]
+        actual_schemas = schemas
+        contract_catalog = ""
+        if incident_mode and self.planner_state_envelope:
+            contract_catalog = _render_incident_tool_contract_catalog(actual_schemas)
+            schemas = [_build_incident_envelope_schema(actual_schemas)]
+        elif incident_mode:
+            schemas = [
+                _compact_incident_provider_schema(_with_incident_skill_controls(schema))
+                for schema in schemas
+            ]
+        if incident_mode and self.planner_state_envelope:
+            user = (
+                f"{context}\n\nPLANNER_TOOL_CONTRACTS (live executable argument names; "
+                f"Runtime remains authoritative):\n{contract_catalog}\n\n"
+                f"CURRENT_GOAL: {state.task.issue}\n"
+            )
+        else:
+            user = f"{context}\n\nCURRENT_GOAL: {state.task.issue}\n"
         self.last_prompt_breakdown = {"system_chars": len(system), "context_chars": len(user),
                                       "tool_schema_count": len(schemas)}
         self.last_prompt_breakdowns = []
@@ -229,14 +299,38 @@ class NativeToolPlanner:
             raise NativePlannerContractError(
                 str(exc), error_type=getattr(exc, "error_type", "provider_contract_mismatch"),
                 validation_errors=[getattr(exc, "error_type", "provider_contract_mismatch")],
+                output={
+                    "raw_output": copy.deepcopy(getattr(self.llm, "last_raw_output", {})),
+                    "validation_error": str(exc),
+                },
                 index=getattr(exc, "index", None), tool=getattr(exc, "tool", None),
             ) from exc
         if not isinstance(response, LLMResponse):
             raise NativePlannerContractError(
                 "provider returned a non-typed native response",
                 error_type="provider_contract_mismatch",
+                output={"validation_error": "response_type=" + type(response).__name__},
+            )
+
+        current_normalized_output: dict[str, Any] = {}
+
+        def contract_error(message: str, *, error_type: str,
+                           validation_errors=None, output=None, index=None,
+                           tool=None):
+            context = dict(output or {})
+            if current_normalized_output:
+                context.setdefault("normalized_output", copy.deepcopy(current_normalized_output))
+            context.setdefault("validation_error", message)
+            return NativePlannerContractError(
+                message, error_type=error_type, validation_errors=validation_errors,
+                output=self._contract_output(response, context), index=index, tool=tool,
             )
         names = {spec.name for spec in self.tools.specs()}
+        allowed_tool_fields = {
+            spec.name: tuple(spec.args_model.model_fields)
+            for spec in self.tools.specs()
+        }
+        output_normalizer = IncidentLLMOutputNormalizer(allowed_tool_fields)
         known_evidence_ids = {
             str(getattr(item, "evidence_id", ""))
             for item in getattr(state, "evidence", ())
@@ -244,21 +338,57 @@ class NativeToolPlanner:
         }
         sanitized_calls = []
         selections = []
+        tool_call_audits: list[dict[str, Any]] = []
         for call in response.tool_calls:
             if not isinstance(call, LLMToolCall) or not isinstance(call.arguments, dict):
-                raise NativePlannerContractError(
+                raise contract_error(
                     "provider returned a malformed native tool call",
                     error_type="malformed_tool_call",
                     validation_errors=["malformed_tool_call"],
                 )
-            if call.name not in names:
-                raise NativePlannerContractError(
-                    f"unknown tool: {call.name}", error_type="unknown_tool",
+            provider_tool_name = call.name
+            call_name = call.name
+            call_arguments = dict(call.arguments)
+            current_normalized_output = {}
+            protocol_mode = "direct"
+            if incident_mode and self.planner_state_envelope and call.name == INCIDENT_ENVELOPE_TOOL:
+                protocol_mode = "envelope"
+                envelope_result = output_normalizer.normalize_envelope(call.arguments)
+                envelope = envelope_result.arguments
+                call_name = envelope.pop("tool_name", "")
+                executable_arguments = envelope.pop("arguments", None)
+                if not isinstance(call_name, str) or not call_name:
+                    raise contract_error(
+                        "diagnosis_action is missing tool_name",
+                        error_type="missing_executable_tool",
+                        validation_errors=["tool_name"], output={"tool": call.name},
+                    )
+                if not isinstance(executable_arguments, dict):
+                    raise contract_error(
+                        "diagnosis_action.arguments must be an object",
+                        error_type="malformed_executable_arguments",
+                        validation_errors=["arguments"], output={"tool": call.name},
+                    )
+                # Planner controls live at the envelope level and never become
+                # part of the executable Tool's Pydantic argument model.
+                call_arguments = {**executable_arguments, **envelope}
+                current_normalized_output = dict(call_arguments)
+            elif incident_mode and self.planner_state_envelope and call.name in names:
+                protocol_mode = "legacy_direct_compat"
+            if call_name not in names:
+                raise contract_error(
+                    f"unknown tool: {call_name}", error_type="unknown_tool",
                     validation_errors=["unknown_tool"], output={"tool": call.name},
                 )
             if incident_mode:
-                args = dict(call.arguments)
-                control = {key: args.pop(key, None) for key in _INCIDENT_SKILL_CONTROL_FIELDS}
+                normalized = output_normalizer.normalize_tool_arguments(
+                    call_name, call_arguments,
+                )
+                args = normalized.arguments
+                current_normalized_output = dict(args)
+                raw_arguments = dict(call_arguments)
+                compatibility_normalizations = normalized.actions
+                control = {key: args.pop(key, None) for key in INCIDENT_SKILL_CONTROL_FIELDS}
                 skill = control["skill"]
                 reason = control["skill_reason"]
                 hypothesis = control["current_hypothesis"]
@@ -271,6 +401,8 @@ class NativeToolPlanner:
                 required_gaps = control["required_evidence_gaps"]
                 sufficiency = control["evidence_sufficiency"]
                 remaining_need = control["remaining_evidence_need"]
+                obligation_id = control.get("obligation_id") or ""
+                expected_information_gain = control.get("expected_information_gain") or ""
                 source_mechanism_status = control.get("source_mechanism_status") or "unknown"
                 mechanism_category = control["mechanism_category"] or ""
                 fault_code = control.get("candidate_fault_code") or ""
@@ -278,26 +410,26 @@ class NativeToolPlanner:
                 raw_obligations = control["verification_obligations"]
                 raw_contradictions = control["contradictions"]
                 if skill not in INCIDENT_SKILLS:
-                    raise NativePlannerContractError(
+                    raise contract_error(
                         f"unknown skill: {skill}", error_type="unknown_skill",
                         validation_errors=["unknown_skill"], output={"tool": call.name},
                     )
                 if not all(isinstance(value, str) and value.strip() for value in (reason, hypothesis, evidence_gap)):
-                    raise NativePlannerContractError(
+                    raise contract_error(
                         "incident tool call is missing skill decision context",
                         error_type="missing_skill_context",
                         validation_errors=["skill_reason", "current_hypothesis", "evidence_gap"],
                         output={"tool": call.name},
                     )
                 if not all(isinstance(value, str) for value in (component, fault, mechanism, remaining_need)):
-                    raise NativePlannerContractError(
+                    raise contract_error(
                         "incident hypothesis completion fields must be strings",
                         error_type="malformed_hypothesis_completion",
                         validation_errors=["candidate_component", "candidate_fault", "candidate_mechanism", "remaining_evidence_need"],
                         output={"tool": call.name},
                     )
                 if not all(isinstance(value, str) for value in (fault_code, fault_explanation)):
-                    raise NativePlannerContractError(
+                    raise contract_error(
                         "structured fault fields must be strings",
                         error_type="malformed_hypothesis_completion",
                         validation_errors=["candidate_fault_code", "candidate_fault_explanation"],
@@ -305,14 +437,14 @@ class NativeToolPlanner:
                     )
                 if not all(isinstance(value, list) and all(isinstance(item, str) for item in value)
                            for value in (supporting, contradicting, required_gaps)):
-                    raise NativePlannerContractError(
+                    raise contract_error(
                         "incident evidence linkage fields must be string arrays",
                         error_type="malformed_hypothesis_completion",
                         validation_errors=["supporting_evidence_ids", "contradicting_evidence_ids", "required_evidence_gaps"],
                         output={"tool": call.name},
                     )
                 if not isinstance(mechanism_category, str):
-                    raise NativePlannerContractError(
+                    raise contract_error(
                         "mechanism_category must be a string",
                         error_type="malformed_hypothesis_completion",
                         validation_errors=["mechanism_category"], output={"tool": call.name},
@@ -320,7 +452,7 @@ class NativeToolPlanner:
                 if source_mechanism_status not in {
                     "unknown", "gap", "sufficient", "not_applicable", "blocked",
                 }:
-                    raise NativePlannerContractError(
+                    raise contract_error(
                         "invalid source_mechanism_status",
                         error_type="malformed_hypothesis_completion",
                         validation_errors=["source_mechanism_status"], output={"tool": call.name},
@@ -360,7 +492,7 @@ class NativeToolPlanner:
                     or evidence_id not in known_evidence_ids
                 ]
                 if invalid_structured_ids:
-                    raise NativePlannerContractError(
+                    raise contract_error(
                         "structured incident metadata may cite only ev-* Evidence IDs that are present",
                         error_type="invalid_evidence_id_contract",
                         validation_errors=["verification_obligations", "contradictions"],
@@ -371,19 +503,38 @@ class NativeToolPlanner:
                     if not item.startswith("ev-") or item not in known_evidence_ids
                 ]
                 if invalid_evidence_ids:
-                    raise NativePlannerContractError(
+                    raise contract_error(
                         "incident hypotheses may cite only ev-* Evidence IDs that are present",
                         error_type="invalid_evidence_id_contract",
                         validation_errors=["supporting_evidence_ids", "contradicting_evidence_ids"],
                         output={"tool": call.name},
                     )
                 if sufficiency not in {"insufficient", "sufficient"}:
-                    raise NativePlannerContractError(
+                    raise contract_error(
                         "invalid evidence_sufficiency",
                         error_type="malformed_hypothesis_completion",
                         validation_errors=["evidence_sufficiency"], output={"tool": call.name},
                     )
-                sanitized_calls.append(LLMToolCall(call.id, call.name, args))
+                sanitized_calls.append(LLMToolCall(call.id, call_name, args))
+                tool_call_audits.append({
+                    "call_id": call.id,
+                    "tool": call_name,
+                    "provider_tool": provider_tool_name,
+                    "protocol_mode": protocol_mode,
+                    "raw_arguments": dict(call.arguments),
+                    "executable_arguments": raw_arguments,
+                    "normalized_arguments": dict(args),
+                    "normalization_actions": list(normalized.actions),
+                    "dropped_fields": list(normalized.dropped_fields),
+                    "envelope_normalization_actions": list(
+                        envelope_result.actions if protocol_mode == "envelope" else ()
+                    ),
+                    "envelope_dropped_fields": list(
+                        envelope_result.dropped_fields if protocol_mode == "envelope" else ()
+                    ),
+                    "allowed_argument_fields": sorted(allowed_tool_fields.get(call_name, ())),
+                    "status": "normalized_pending_runtime_validation",
+                })
                 selections.append(NativeSkillSelection(
                     call.id, skill, reason.strip(), hypothesis.strip(), evidence_gap.strip(),
                     component.strip(), fault.strip(), mechanism.strip(),
@@ -397,9 +548,21 @@ class NativeToolPlanner:
                     reasoning_metadata_warnings,
                     reasoning_metadata_normalizations,
                     reasoning_metadata_drops,
+                    compatibility_normalizations,
+                    obligation_id.strip(), expected_information_gain.strip(),
                 ))
             else:
                 sanitized_calls.append(call)
+                tool_call_audits.append({
+                    "call_id": call.id,
+                    "tool": call.name,
+                    "raw_arguments": dict(call.arguments),
+                    "normalized_arguments": dict(call.arguments),
+                    "normalization_actions": [],
+                    "dropped_fields": [],
+                    "allowed_argument_fields": sorted(allowed_tool_fields.get(call.name, ())),
+                    "status": "pending_runtime_validation",
+                })
         metadata = response.structured if isinstance(response.structured, dict) else {}
         assistant_text = response.content.strip() if isinstance(response.content, str) else ""
         raw_intent = {
@@ -432,6 +595,7 @@ class NativeToolPlanner:
             intent=intent,
             assistant_text=assistant_text or None,
             skill_selections=tuple(selections),
+            tool_call_audits=tuple(tool_call_audits),
         )
 
 
@@ -579,17 +743,74 @@ def _parse_optional_reasoning_items(raw, *, field_name: str, model_type) -> Opti
     )
 
 
-_INCIDENT_REQUIRED_CONTROL_FIELDS = (
-    "skill", "skill_reason", "current_hypothesis", "evidence_gap",
-    "candidate_component", "candidate_fault", "candidate_mechanism",
-    "supporting_evidence_ids", "contradicting_evidence_ids",
-    "required_evidence_gaps", "evidence_sufficiency", "remaining_evidence_need",
-)
+def _render_incident_tool_contract_catalog(schemas: Iterable[dict[str, Any]]) -> str:
+    """Render a compact live catalog for the single Planner envelope.
 
-_INCIDENT_SKILL_CONTROL_FIELDS = _INCIDENT_REQUIRED_CONTROL_FIELDS + (
-    "candidate_fault_code", "candidate_fault_explanation",
-    "source_mechanism_status", "mechanism_category", "verification_obligations", "contradictions",
-)
+    The catalog gives the model enough argument names to form ``arguments``;
+    the actual Pydantic ToolSpec remains the authority at execution time.
+    """
+    rows = []
+    for schema in schemas:
+        function = schema.get("function", {})
+        name = str(function.get("name") or "")
+        parameters = function.get("parameters") or {}
+        properties = parameters.get("properties") or {}
+        required = parameters.get("required") or []
+        if not name:
+            continue
+        fields = []
+        for field, spec in properties.items():
+            kind = spec.get("type", "value") if isinstance(spec, dict) else "value"
+            suffix = "!" if field in required else ""
+            fields.append(f"{field}:{kind}{suffix}")
+        rows.append(f"- {name}: " + ", ".join(fields))
+    return "\n".join(rows) or "(no executable tools exposed)"
+
+
+def _build_incident_envelope_schema(schemas: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Build one native function carrying Planner state once per call.
+
+    Directly enriching every executable Tool duplicated the same 12 required
+    and 6 optional control fields 16 times. The envelope keeps native Tool
+    Calling while making the Runtime unwrap and validate the selected Tool.
+    """
+    actual = list(schemas)
+    names = [
+        str(schema.get("function", {}).get("name"))
+        for schema in actual
+        if schema.get("function", {}).get("name")
+    ]
+    control_source = _with_incident_skill_controls({
+        "type": "function",
+        "function": {"name": INCIDENT_ENVELOPE_TOOL, "parameters": {"type": "object", "properties": {}}},
+    })
+    control_properties = control_source["function"]["parameters"]["properties"]
+    properties = {
+        "tool_name": {"type": "string", "enum": names},
+        "arguments": {
+            "type": "object",
+            "description": "Executable arguments for tool_name; Runtime validates the live ToolSpec.",
+            "additionalProperties": True,
+        },
+        **copy.deepcopy(control_properties),
+    }
+    required = ["tool_name", "arguments"] + [
+        name for name in INCIDENT_REQUIRED_CONTROL_FIELDS
+        if name not in {"tool_name", "arguments"}
+    ]
+    return _compact_incident_provider_schema({
+        "type": "function",
+        "function": {
+            "name": INCIDENT_ENVELOPE_TOOL,
+            "description": "Select exactly one live read-only incident Tool and report Planner state.",
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+                "additionalProperties": False,
+            },
+        },
+    })
 
 
 def _with_incident_skill_controls(schema: dict[str, Any]) -> dict[str, Any]:
@@ -618,6 +839,13 @@ def _with_incident_skill_controls(schema: dict[str, Any]) -> dict[str, Any]:
             "enum": ["unknown", "gap", "sufficient", "not_applicable", "blocked"],
             "description": "Planner/Reflection semantic status of source-backed application mechanism coverage.",
         },
+        # Compatibility alias accepted from providers that name this field
+        # after the candidate rather than the source-coverage contract.
+        "candidate_mechanism_status": {
+            "type": "string",
+            "enum": ["unknown", "gap", "sufficient", "not_applicable", "blocked"],
+            "description": "Deprecated compatibility alias for source_mechanism_status; Runtime canonicalizes it.",
+        },
         # These fields are optional planner metadata.  Runtime remains backward
         # compatible with older providers that emit only required_evidence_gaps
         # and the flat contradicting_evidence_ids projection.
@@ -632,6 +860,8 @@ def _with_incident_skill_controls(schema: dict[str, Any]) -> dict[str, Any]:
             "items": _optional_item_schema(Contradiction),
             "description": "Optional structured contradiction metadata.",
         },
+        "obligation_id": {"type": "string", "description": "Open verification obligation targeted by this action, when known."},
+        "expected_information_gain": {"type": "string", "enum": ["low", "medium", "high"], "description": "Expected information gain of this action."},
     })
     required = list(parameters.get("required") or [])
     # The original incident controls are required for native compatibility and
@@ -641,9 +871,46 @@ def _with_incident_skill_controls(schema: dict[str, Any]) -> dict[str, Any]:
     # ``mechanism_category`` is an optional descriptive projection just like
     # the two nested metadata blocks.  The canonical causal fields are the
     # candidate component/fault/mechanism strings above.
-    required_controls = _INCIDENT_REQUIRED_CONTROL_FIELDS
+    required_controls = INCIDENT_REQUIRED_CONTROL_FIELDS
     parameters["required"] = required + [name for name in required_controls if name not in required]
     return enriched
+
+
+def _compact_incident_provider_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Keep executable schema semantics while removing repeated prose.
+
+    Incident controls are attached to every visible function. Their detailed
+    descriptions were repeated for every Planner call and dominated the Qwen
+    prompt budget. Names, types, enums, patterns and required fields stay
+    intact; Pydantic remains the Runtime validation authority.
+    """
+    function_description = schema.get("function", {}).get("description", "")
+
+    def compact(value):
+        if isinstance(value, dict):
+            result = {}
+            for key, item in value.items():
+                if key in {"title", "default", "examples", "deprecated", "$comment", "description"}:
+                    continue
+                result[key] = compact(item)
+            return result
+        if isinstance(value, list):
+            return [compact(item) for item in value]
+        return value
+
+    result = compact(copy.deepcopy(schema))
+    if function_description:
+        result.setdefault("function", {})["description"] = function_description
+    properties = (
+        result.get("function", {}).get("parameters", {}).get("properties", {})
+    )
+    original_properties = (
+        schema.get("function", {}).get("parameters", {}).get("properties", {})
+    )
+    evidence_description = original_properties.get("evidence_ids", {}).get("description")
+    if evidence_description and "evidence_ids" in properties:
+        properties["evidence_ids"]["description"] = evidence_description
+    return result
 
 
 class PlannerFacade:

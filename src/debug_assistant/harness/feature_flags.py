@@ -3,6 +3,13 @@ from dataclasses import dataclass
 
 @dataclass(slots=True)
 class FeatureFlags:
+    # Incident benchmark bundle switches.  These are intentionally separate
+    # from the lower-level V1 feature switches so a paired evaluation can
+    # disable one experimental bundle without copying the Agent runtime.
+    evidence_lifecycle: bool = True
+    context_manager: bool = True
+    no_progress_detection: bool = True
+    finalization_gate: bool = True
     observation_reuse: bool = True
     context_catalog: bool = True
     context_budget_packing: bool = True
@@ -22,6 +29,9 @@ class FeatureFlags:
     trace_v2: bool = True
     native_tool_calling: bool = True
     structured_reflection: bool = True
+    # Compress repeated Incident Planner control fields into one native
+    # diagnosis_action envelope. Kept opt-in for old provider compatibility.
+    planner_state_envelope: bool = False
 
     def validate(self) -> None:
         if self.model_context_selection and not self.context_catalog:

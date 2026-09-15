@@ -263,8 +263,11 @@ class IncidentReflectionAgent:
     diagnosis state supplied by the Harness. Do not call tools, access ground truth,
     invent evidence, or replace the current hypothesis. Return only structured feedback:
     identify supported/unsupported claims, remaining gaps, obligation and contradiction
-    reviews, whether the semantic hypothesis is stable, and the highest-information-gain
-    direction. All cited Evidence IDs must be existing ev-* IDs from the input. When
+    reviews, and emit a structured hypothesis_delta plus proposed_evidence_gaps,
+    proposed_obligations, contradiction_updates, and next_action_constraint when
+    appropriate. Do not emit obligation IDs, gap IDs, or hypothesis versions; Runtime
+    allocates those only after canonical novelty validation. All cited Evidence IDs must
+    be existing ev-* IDs from the input. When
     application source is declared and available, treat an unknown or gap source-mechanism
     status as an unresolved critical gap until bounded read_file CODE Evidence is present;
     do not infer source coverage from a runtime symptom. Do not return raw chain-of-thought
@@ -381,7 +384,60 @@ class IncidentReflectionAgent:
             return extract_json(content) if isinstance(content, str) else content
 
         self.last_call_count = 1
-        raw = complete_feedback(self._SYSTEM, user)
+        try:
+            raw = complete_feedback(self._SYSTEM, user)
+        except LLMDeadlineExceeded:
+            raise
+        except Exception as first_exception:
+            # Invalid JSON/provider payloads consume the same single repair
+            # slot as typed schema failures; they never trigger open-ended
+            # reflection retries.
+            self._add_usage()
+            self.last_schema_repaired = True
+            self.last_prompt_breakdown["repair_attempted"] = True
+            self.last_schema_error = (
+                f"first-pass provider payload error: {type(first_exception).__name__}: "
+                f"{first_exception}"
+            )
+            self.last_call_count += 1
+            repair_user = (
+                "INVALID_INCIDENT_REFLECTION_PROVIDER_PAYLOAD:\n"
+                + json.dumps(str(first_exception), ensure_ascii=False)
+                + "\n\n"
+                + contract
+            )
+            try:
+                repaired = complete_feedback(
+                    "Repair only the JSON shape of Incident Reflection feedback; preserve all semantics and Evidence IDs.",
+                    repair_user,
+                )
+            except LLMDeadlineExceeded:
+                raise
+            except Exception as repair_exception:
+                self.last_failure_type = "reflection_contract_exhausted"
+                self.last_schema_error += (
+                    f"\nRepair provider payload error: {type(repair_exception).__name__}: "
+                    f"{repair_exception}"
+                )
+                raise ReflectionContractExhausted(
+                    "incident reflection provider payload remained invalid after one repair"
+                ) from repair_exception
+            self._add_usage()
+            repaired, actions, drops, warnings = _normalize_incident_reflection_metadata(repaired)
+            self.last_normalization_actions.extend(actions)
+            self.last_metadata_drops.extend(drops)
+            self.last_metadata_warnings.extend(warnings)
+            try:
+                return ReflectionFeedback.model_validate(repaired)
+            except ValidationError as second_error:
+                self.last_schema_error += "\nRepair validation error: " + json.dumps(
+                    compact_validation_error(second_error), ensure_ascii=False,
+                )
+                self.last_failure_type = "reflection_contract_exhausted"
+                raise ReflectionContractExhausted(
+                    "incident reflection schema validation failed after one repair: "
+                    + json.dumps(compact_validation_error(second_error), ensure_ascii=False)
+                ) from second_error
         self._add_usage()
         raw, actions, drops, warnings = _normalize_incident_reflection_metadata(raw)
         self.last_normalization_actions.extend(actions)

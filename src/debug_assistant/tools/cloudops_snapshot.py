@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from typing import Any, Literal
@@ -272,12 +273,18 @@ class CloudOpsSnapshotToolRegistry:
     def specs(self):
         return [tool.spec for tool in self._tools.values()] + [self._finalize_spec]
 
-    def function_schemas(self):
+    def function_schemas(self, visible_tools=None):
+        visible = None if visible_tools is None else {str(name) for name in visible_tools}
         schemas = []
         for spec in self.specs():
             if spec.name in self.PLANNER_HIDDEN_TOOLS:
                 continue
-            schema = spec.function_schema()
+            if visible is not None and spec.name not in visible:
+                continue
+            schema = _compact_provider_schema(
+                spec.function_schema(),
+                keep_descriptions=spec.name == "finalize_diagnosis",
+            )
             if spec.name == "code_search":
                 # The incident provider supplies a query and result bound only.
                 # Retrieval mode is an implementation policy selected by the
@@ -371,6 +378,47 @@ def _serialize_snapshot_output(output: Any) -> str:
     if output is None:
         return ""
     return json.dumps(output, ensure_ascii=False, sort_keys=True)
+
+
+def _compact_provider_schema(schema: dict[str, Any], *, keep_descriptions: bool = False) -> dict[str, Any]:
+    """Remove non-semantic JSON-Schema decoration before provider transport.
+
+    Pydantic remains the validation source of truth.  Provider-facing tool
+    schemas only need names, types, enums, constraints and required fields;
+    titles/defaults/examples and long field descriptions are repeated on every
+    Planner call.  The finalization schema keeps descriptions because its
+    Evidence projection is a high-risk compatibility boundary.
+    """
+    def compact(value):
+        if isinstance(value, dict):
+            result = {}
+            for key, item in value.items():
+                if key in {"title", "default", "examples", "deprecated", "$comment"}:
+                    continue
+                if key == "description" and not keep_descriptions:
+                    continue
+                result[key] = compact(item)
+            return result
+        if isinstance(value, list):
+            return [compact(item) for item in value]
+        return value
+
+    compacted = compact(copy.deepcopy(schema))
+    if not keep_descriptions:
+        # A few high-risk argument descriptions are part of the executable
+        # contract from a Planner's perspective. Preserve those short cues
+        # while still removing the large repeated prose from ordinary fields.
+        original_properties = (
+            schema.get("function", {}).get("parameters", {}).get("properties", {})
+        )
+        compacted_properties = (
+            compacted.get("function", {}).get("parameters", {}).get("properties", {})
+        )
+        for field_name in ("name",):
+            description = original_properties.get(field_name, {}).get("description")
+            if description and field_name in compacted_properties:
+                compacted_properties[field_name]["description"] = description
+    return compacted
 
 
 def _normalize_code_index_output(output: Any) -> Any:

@@ -24,6 +24,7 @@ from debug_assistant.harness.trace import TraceRecorder
 from debug_assistant.harness.budget import BudgetController
 from debug_assistant.harness.dynamic_budget import (
     BudgetState, DynamicBudgetController, ProgressMarker, PromptBudgetExceeded,
+    RunBudgetAdmissionExceeded,
     progress_made, resolve_model_capability,
 )
 from debug_assistant.harness.deadline import RunDeadline
@@ -31,9 +32,11 @@ from debug_assistant.harness.retry import RetryPolicy
 from debug_assistant.harness.tool_executor import execute_with_retry
 from debug_assistant.harness.guards import LoopGuard
 from debug_assistant.harness.provider_health import ToolCircuitBreaker
+from debug_assistant.harness.feature_flags import FeatureFlags
 from debug_assistant.incidents.contracts import (
     Contradiction, IncidentCase, IncidentEvidence, IncidentHypothesis, IncidentMetrics,
-    IncidentRunResult, ReflectionFeedback, ReviewDecision, RootCauseCandidate,
+    IncidentRunResult, ReflectionFeedback, ReflectionContradictionUpdate,
+    ReviewDecision, RootCauseCandidate,
     VerificationObligation,
 )
 from debug_assistant.models import ActionKind, ActionProposal, AgentState, TaskSpec, ToolObservation
@@ -43,7 +46,7 @@ from debug_assistant.knowledge import (
     CapabilitySnapshot, HybridRouter, IncidentEntityExtractor,
     KnowledgeCoordinator, KnowledgeQueryBuilder, KnowledgeRetrievalTool,
 )
-from debug_assistant.llm.base import LLMDeadlineExceeded, LLMError
+from debug_assistant.llm.base import LLMDeadlineExceeded, LLMError, complete_json_compat
 from debug_assistant.llm.base import ModelCapability
 from debug_assistant.skills.catalog import INCIDENT_SKILLS
 from debug_assistant.tools.cloudops_snapshot import CloudOpsSnapshotToolRegistry
@@ -58,6 +61,8 @@ def _safe_planner_metadata_for_trace(exc: Exception) -> dict[str, Any] | None:
     for key in (
         "error_type", "index", "tool", "arguments_type", "actions_type",
         "actions_count", "child_types", "output_shape", "repair_rejection_reason",
+        "raw_output", "parsed_output", "normalized_output", "validation_error",
+        "repair_prompt", "repair_output", "repair_result",
     ):
         if key in metadata:
             safe[key] = metadata[key]
@@ -86,6 +91,12 @@ class DiagnosisHarnessConfig:
     max_review_rounds: int = 2
     max_post_reject_tool_calls: int = 3
     max_post_reject_steps: int = 4
+    # Once the current hypothesis has passed the deterministic completion
+    # predicate, bounded extra exploration is useful only for a small amount
+    # of verification.  This prevents a model from consuming the whole run
+    # budget after the answer is already reviewable.
+    max_post_sufficiency_tool_calls: int = 4
+    max_tool_contract_repairs: int = 1
     planner_llm_timeout_seconds: float = 60.0
     review_llm_timeout_seconds: float = 45.0
     max_llm_calls: int = 40
@@ -104,10 +115,13 @@ class DiagnosisHarnessConfig:
     max_no_progress: int = 4
     enable_reflection: bool = True
     max_reflection_calls: int = 2
+    max_consecutive_reflection_calls: int = 1
     enable_review: bool = True
+    max_review_recovery_cycles: int = 1
     tool_circuit_failure_threshold: int = 2
     max_context_chars: int = 24_000
     context: ContextConfig = field(default_factory=ContextConfig)
+    features: FeatureFlags = field(default_factory=FeatureFlags)
     trace_dir: str = ".debug_assistant/incident_traces"
 
     @classmethod
@@ -128,6 +142,8 @@ class DiagnosisHarnessConfig:
             max_cost_per_incident=getattr(source, "max_cost_per_incident", None),
             terminal_reserve_tokens=getattr(source, "terminal_reserve_tokens", 0),
             terminal_reserve_llm_calls=getattr(source, "terminal_reserve_llm_calls", 3),
+            max_review_recovery_cycles=getattr(source, "max_review_recovery_cycles", 1),
+            max_consecutive_reflection_calls=getattr(source, "max_consecutive_reflection_calls", 1),
             context_pressure_ratio=getattr(source, "context_pressure_ratio", 0.75),
             hard_pressure_ratio=getattr(source, "hard_pressure_ratio", 0.95),
             max_wall_time_seconds=source.max_wall_time_seconds,
@@ -147,6 +163,7 @@ class DiagnosisHarnessConfig:
             max_no_progress=source.max_no_progress_steps,
             max_context_chars=source.max_context_chars,
             context=source.context,
+            features=source.features,
             trace_dir=trace_dir or source.trace_dir,
         )
 
@@ -159,6 +176,10 @@ class DiagnosisHarnessConfig:
             raise ValueError("post-review tool calls must be between 1 and 3")
         if not 1 <= self.max_post_reject_steps <= 4:
             raise ValueError("post-review steps must be between 1 and 4")
+        if not 1 <= self.max_post_sufficiency_tool_calls <= 8:
+            raise ValueError("post-sufficiency tool calls must be between 1 and 8")
+        if not 1 <= self.max_tool_contract_repairs <= 3:
+            raise ValueError("tool contract repairs must be between 1 and 3")
         if self.planner_llm_timeout_seconds <= 0 or self.review_llm_timeout_seconds <= 0:
             raise ValueError("LLM timeouts must be positive")
         if self.max_context_chars <= 0:
@@ -179,6 +200,10 @@ class DiagnosisHarnessConfig:
             raise ValueError("retry and progress limits must be positive")
         if self.max_reflection_calls < 0:
             raise ValueError("max_reflection_calls must be non-negative")
+        if self.max_consecutive_reflection_calls <= 0:
+            raise ValueError("max_consecutive_reflection_calls must be positive")
+        if self.max_review_recovery_cycles < 0:
+            raise ValueError("max_review_recovery_cycles must be non-negative")
         if self.tool_circuit_failure_threshold <= 0:
             raise ValueError("tool_circuit_failure_threshold must be positive")
 
@@ -266,7 +291,10 @@ class DiagnosisHarness:
         knowledge_enabled = bool(self.knowledge_coordinator.available_sources)
         if knowledge_enabled:
             tools.register(knowledge_tool)
-        planner = NativeToolPlanner(self.llm, tools, self.model)
+        planner = NativeToolPlanner(
+            self.llm, tools, self.model,
+            planner_state_envelope=self.config.features.planner_state_envelope,
+        )
         reviewer = FinalReviewAgent(self.review_llm, self.review_model)
         reflection_agent = IncidentReflectionAgent(self.llm, self.model)
         trace = TraceRecorder(self.config.trace_dir, case.case_id)
@@ -281,11 +309,11 @@ class DiagnosisHarness:
         incident_projection = IncidentProjectionPolicy()
         context_manager = ContextManager(
             self.config.context,
-            enable_catalog=True,
+            enable_catalog=self.config.features.context_manager,
             enable_model_selection=False,
-            enable_budget_packing=True,
-            enable_lifecycle=True,
-            enable_projection=True,
+            enable_budget_packing=self.config.features.context_manager,
+            enable_lifecycle=self.config.features.context_manager,
+            enable_projection=self.config.features.context_manager,
             projection_policy=incident_projection,
         )
         hypotheses: list[IncidentHypothesis] = []
@@ -294,7 +322,10 @@ class DiagnosisHarness:
         fingerprints: set[str] = set()
         loop_guard = LoopGuard(
             max_repeat=self.config.max_duplicate_actions,
-            max_no_progress=self.config.max_no_progress,
+            max_no_progress=(
+                self.config.max_no_progress
+                if self.config.features.no_progress_detection else 1_000_000
+            ),
         )
         tool_circuit = ToolCircuitBreaker(
             failure_threshold=self.config.tool_circuit_failure_threshold,
@@ -304,8 +335,13 @@ class DiagnosisHarness:
         run_cost = 0.0
         cost_measured = False
         review_rounds = 0
+        review_recovery_cycles = 0
         reflection_calls = 0
+        reflection_delta_accepts = 0
+        reflection_no_delta_count = 0
+        consecutive_reflection_no_delta = 0
         reflection_feedback = ""
+        reflection_constraint = ""
         reflection_signatures: set[str] = set()
         reflection_trigger = ""
         duplicate_calls = 0
@@ -322,9 +358,29 @@ class DiagnosisHarness:
         llm_calls = 0
         planner_calls = 0
         planner_contract_retry_used = False
+        tool_contract_repairs = 0
+        contract_repair_calls = 0
         review_calls = 0
         termination_reason = ""
         run_started = time.monotonic()
+        runtime_phase = "INIT"
+        state_transition_count = 0
+
+        def transition_phase(target: str, reason: str, **metadata: Any) -> None:
+            """Record the only Runtime-owned PLAN/REFLECT/FINALIZE/REVIEW edges."""
+            nonlocal runtime_phase, state_transition_count
+            target = str(target)
+            if target == runtime_phase:
+                return
+            state_transition_count += 1
+            trace.record("STATE_TRANSITION", {
+                "from": runtime_phase,
+                "to": target,
+                "reason": reason,
+                "transition_index": state_transition_count,
+                **metadata,
+            })
+            runtime_phase = target
         budget = BudgetController(
             max_steps=self.config.max_steps,
             max_tool_calls=self.config.max_tool_calls,
@@ -355,6 +411,7 @@ class DiagnosisHarness:
             "model_capability": model_capability.as_dict(),
             "terminal_reserve": dynamic_budget.terminal_reserve_payload(),
         })
+        transition_phase("PLAN", "incident_started")
         if knowledge_enabled:
             trace.record("CAPABILITY_DETECTED", capabilities.model_dump(mode="json"))
             trace.record("ROUTER_DECISION", {
@@ -506,7 +563,8 @@ class DiagnosisHarness:
                 "terminal_reserve_llm_calls": dynamic_state.terminal_reserve_llm_calls,
             }
 
-        def admit(stage: str, *, count_llm: bool = False) -> None:
+        def admit(stage: str, *, count_llm: bool = False,
+                  allow_targeted_recovery: bool = False) -> None:
             nonlocal llm_calls, planner_calls, review_calls
             deadline.check()
             snapshot = budget_snapshot("pre_" + stage)
@@ -536,6 +594,16 @@ class DiagnosisHarness:
                         "remaining_run_tokens": dynamic_state.remaining_run_tokens,
                         "remaining_run_cost": dynamic_state.remaining_run_cost,
                     })
+                    # Exploration and semantic recovery must never consume
+                    # the terminal path.  FINALIZE is deterministic and is
+                    # therefore deliberately not admitted through this gate;
+                    # callers either finalize an already-valid hypothesis or
+                    # terminate INCONCLUSIVE.
+                    if (
+                        stage in {"planner", "tool", "reflection", "review", "contract_repair"}
+                        and not allow_targeted_recovery
+                    ):
+                        raise RunBudgetAdmissionExceeded(dynamic_state)
             if snapshot.tokens_used >= self.config.max_total_tokens:
                 raise RuntimeError("max_total_tokens exceeded")
             if (
@@ -799,6 +867,22 @@ class DiagnosisHarness:
             next_obligations: dict[str, VerificationObligation] = {}
             for obligation in supplied:
                 prior = obligation_state.get(obligation.id)
+                if (
+                    prior is not None
+                    and prior.status in {"SATISFIED", "WAIVED_WITH_EVIDENCE"}
+                    and obligation.status == "OPEN"
+                ):
+                    # Planner outputs are a semantic proposal, but terminal
+                    # obligation state is Runtime-owned. A stale or repeated
+                    # structured item must not reopen a resolved obligation
+                    # and crash the run on SATISFIED->OPEN.
+                    trace.record("OBLIGATION_REOPEN_REJECTED", {
+                        "obligation_id": obligation.id,
+                        "from": prior.status,
+                        "to": obligation.status,
+                        "reason": "terminal_runtime_state_preserved",
+                    })
+                    obligation = prior
                 if prior is not None and obligation.status not in _OBLIGATION_TRANSITIONS[prior.status]:
                     raise RuntimeError(
                         f"invalid obligation status transition {prior.status}->{obligation.status}"
@@ -1078,6 +1162,14 @@ class DiagnosisHarness:
         def validate_reflection_feedback(feedback: ReflectionFeedback) -> None:
             known_ids = {item.evidence_id for item in evidence_memory.pinned}
             ids = list(feedback.supporting_evidence_ids) + list(feedback.contradicting_evidence_ids)
+            ids.extend(feedback.hypothesis_delta.supporting_evidence_ids)
+            ids.extend(feedback.hypothesis_delta.contradicting_evidence_ids)
+            ids.extend(
+                evidence_id
+                for item in feedback.proposed_obligations
+                for evidence_id in item.supporting_evidence_ids
+            )
+            ids.extend(item.evidence_id for item in feedback.contradiction_updates)
             ids.extend(
                 evidence_id
                 for item in feedback.obligation_reviews
@@ -1087,6 +1179,186 @@ class DiagnosisHarness:
             bad = [item for item in ids if not item.startswith("ev-") or item not in known_ids]
             if bad:
                 raise ValueError("Reflection referenced unknown Evidence IDs: " + ", ".join(sorted(set(bad))))
+
+        def apply_reflection_delta(feedback: ReflectionFeedback, trigger: str) -> bool:
+            """Apply only a genuinely new Runtime-owned Reflection Delta."""
+            nonlocal obligation_created_count, blocking_contradiction_count
+            nonlocal reflection_constraint, reflection_delta_accepts
+            current = hypotheses[-1] if hypotheses else None
+            before = (
+                self._hypothesis_semantic_fingerprint(current) if current else None,
+                tuple(sorted((item.id, item.claim.casefold(), item.status)
+                             for item in obligation_state.values())),
+                tuple(sorted((item.evidence_id, item.status, item.severity)
+                             for item in (current.contradictions if current else ()))),
+                reflection_constraint,
+            )
+            constraint = " ".join(str(feedback.next_action_constraint or "").split()).casefold()
+            allowed_constraints = {
+                "", "targeted_verification", "no_broad_exploration",
+                "finalize", "inconclusive",
+            }
+            if constraint not in allowed_constraints:
+                trace.record("REFLECTION_DELTA_REJECTED", {
+                    "trigger": trigger,
+                    "reason": "unknown_next_action_constraint",
+                    "constraint": feedback.next_action_constraint,
+                })
+                return False
+
+            next_obligations = dict(obligation_state)
+            new_obligation_ids: list[str] = []
+            proposals = [
+                *(item for item in feedback.proposed_evidence_gaps),
+                *(item for item in feedback.proposed_obligations),
+            ]
+            for proposal in proposals:
+                claim = " ".join(str(proposal.claim).split()).strip()
+                if not claim:
+                    continue
+                existing = next((
+                    item for item in next_obligations.values()
+                    if " ".join(item.claim.split()).casefold() == claim.casefold()
+                ), None)
+                if existing is not None:
+                    continue
+                supporting = tuple(getattr(proposal, "supporting_evidence_ids", ()) or ())
+                obligation = VerificationObligation(
+                    id=_obligation_id(claim),
+                    claim=claim,
+                    critical=bool(getattr(proposal, "critical", True)),
+                    status="OPEN",
+                    supporting_evidence_ids=supporting,
+                )
+                next_obligations[obligation.id] = obligation
+                new_obligation_ids.append(obligation.id)
+                obligation_created_count += 1
+                trace.record("OBLIGATION_CREATED", {
+                    **obligation.model_dump(),
+                    "reason": "reflection_delta_proposal",
+                    "trigger": trigger,
+                })
+
+            next_contradictions = {
+                item.evidence_id: item
+                for item in (current.contradictions if current else ())
+            }
+            for update in feedback.contradiction_updates:
+                prior = next_contradictions.get(update.evidence_id)
+                if prior is not None and update.status not in _CONTRADICTION_TRANSITIONS[prior.status]:
+                    trace.record("REFLECTION_DELTA_REJECTED", {
+                        "trigger": trigger,
+                        "reason": "invalid_contradiction_transition",
+                        "evidence_id": update.evidence_id,
+                        "from": prior.status,
+                        "to": update.status,
+                    })
+                    return False
+                next_contradictions[update.evidence_id] = Contradiction(
+                    evidence_id=update.evidence_id,
+                    claim=update.claim,
+                    severity=update.severity,
+                    status=update.status,
+                )
+
+            delta = feedback.hypothesis_delta
+            updated = current
+            accepted_fields: list[str] = []
+            if current is not None:
+                changes: dict[str, Any] = {}
+                for field in (
+                    "claim", "component", "fault", "fault_code",
+                    "fault_explanation", "mechanism", "source_mechanism_status",
+                ):
+                    value = getattr(delta, field, None)
+                    if isinstance(value, str) and value.strip():
+                        if value != getattr(current, field):
+                            changes[field] = value.strip()
+                            accepted_fields.append(field)
+                support_ids = tuple(dict.fromkeys(
+                    (*current.supporting_evidence_ids,
+                     *feedback.supporting_evidence_ids,
+                     *delta.supporting_evidence_ids)
+                ))
+                if support_ids != current.supporting_evidence_ids:
+                    changes["supporting_evidence_ids"] = support_ids
+                    accepted_fields.append("supporting_evidence_ids")
+                contradiction_ids = tuple(dict.fromkeys(
+                    (*current.contradicting_evidence_ids,
+                     *feedback.contradicting_evidence_ids,
+                     *delta.contradicting_evidence_ids)
+                ))
+                if contradiction_ids != current.contradicting_evidence_ids:
+                    changes["contradicting_evidence_ids"] = contradiction_ids
+                    accepted_fields.append("contradicting_evidence_ids")
+                if next_obligations != obligation_state:
+                    changes["verification_obligations"] = tuple(next_obligations.values())
+                    changes["required_gaps"] = tuple(
+                        item.claim for item in next_obligations.values()
+                        if item.blocks_finalization
+                    )
+                    accepted_fields.append("verification_obligations")
+                if next_contradictions != {
+                    item.evidence_id: item for item in current.contradictions
+                }:
+                    changes["contradictions"] = tuple(next_contradictions.values())
+                    accepted_fields.append("contradictions")
+                if changes:
+                    updated = current.model_copy(update=changes)
+            elif new_obligation_ids:
+                accepted_fields.append("proposed_obligations")
+
+            if constraint and constraint != reflection_constraint:
+                reflection_constraint = constraint
+                accepted_fields.append("next_action_constraint")
+
+            after = (
+                self._hypothesis_semantic_fingerprint(updated) if updated else None,
+                tuple(sorted((item.id, item.claim.casefold(), item.status)
+                             for item in next_obligations.values())),
+                tuple(sorted((item.evidence_id, item.status, item.severity)
+                             for item in (updated.contradictions if updated else next_contradictions.values()))),
+                reflection_constraint,
+            )
+            if before == after:
+                trace.record("REFLECTION_NO_DELTA", {
+                    "trigger": trigger,
+                    "reason": "canonical_runtime_state_unchanged",
+                })
+                return False
+
+            obligation_state.clear()
+            obligation_state.update(next_obligations)
+            blocking_contradiction_count = sum(
+                1 for item in (updated.contradictions if updated else next_contradictions.values())
+                if item.blocks_finalization
+            )
+            if updated is not None:
+                updated = updated.model_copy(update={
+                    "stable_rounds": 0,
+                    "verification_obligations": tuple(next_obligations.values()),
+                    "required_gaps": tuple(
+                        item.claim for item in next_obligations.values()
+                        if item.blocks_finalization
+                    ),
+                    "contradictions": tuple(next_contradictions.values()),
+                    "contradicting_evidence_ids": tuple(
+                        item.evidence_id for item in next_contradictions.values()
+                        if item.blocks_finalization
+                    ),
+                })
+                if not hypotheses or hypotheses[-1] != updated:
+                    hypotheses.append(updated)
+                state.current_hypothesis = updated.model_dump()
+            reflection_delta_accepts += 1
+            trace.record("REFLECTION_DELTA_ACCEPTED", {
+                "trigger": trigger,
+                "accepted_fields": sorted(set(accepted_fields)),
+                "new_obligation_ids": new_obligation_ids,
+                "runtime_hypothesis_version": len(hypotheses),
+                "next_action_constraint": reflection_constraint,
+            })
+            return True
 
         def mark_blocked_capability(tool_name: str) -> None:
             nonlocal obligation_blocked_count
@@ -1130,10 +1402,121 @@ class DiagnosisHarness:
                 "hypothesis": current.model_dump(),
             })
 
+        def targeted_contract_repair(tool_name: str, arguments: dict[str, Any],
+                                     error: dict[str, Any], *,
+                                     logical_repair_index: int = 1) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+            """Repair only missing executable fields, once per bounded budget.
+
+            This call is deliberately not a second Planner. It receives the
+            rejected argument object, the live Pydantic schema, and compact
+            runtime-owned state. It may add a required value only when the
+            provider can identify it from that state; it never fabricates an
+            Evidence ID, permission, or benchmark label.
+            """
+            nonlocal llm_calls, contract_repair_calls
+            spec = next((item for item in tools.specs() if item.name == tool_name), None)
+            if spec is None:
+                return None, {"status": "not_attempted", "reason": "unknown_tool"}
+            required = tuple(
+                name for name, field in spec.args_model.model_fields.items()
+                if field.is_required()
+            )
+            missing = tuple(
+                name for name in required
+                if name not in arguments or arguments.get(name) is None
+            )
+            if not missing:
+                return None, {"status": "not_attempted", "reason": "not_missing_required_field"}
+            if logical_repair_index > self.config.max_tool_contract_repairs:
+                return None, {"status": "not_attempted", "reason": "repair_budget_exhausted"}
+            provider = self.llm
+            if not hasattr(provider, "complete_json"):
+                return None, {"status": "not_attempted", "reason": "provider_has_no_json_api"}
+
+            contract_repair_calls += 1
+            trace.record("TOOL_CONTRACT_REPAIR_STARTED", {
+                "tool": tool_name,
+                "repair_index": contract_repair_calls,
+                "missing_fields": list(missing),
+            })
+            known_targets = sorted({
+                str(item.target).strip() for item in incident_evidence()
+                if str(item.target).strip()
+            })
+            repair_system = (
+                "You are a bounded tool-argument repairer for a read-only incident Agent. "
+                "Return one JSON object containing only missing required tool arguments. "
+                "Use a value only when it is explicitly present and unambiguous in the "
+                "provided structured state or known entity candidates. If it is ambiguous "
+                "or absent, return an empty object. Do not re-plan, add optional fields, "
+                "invent service names, infer benchmark labels, or emit prose."
+            )
+            repair_user = json.dumps({
+                "tool_name": tool_name,
+                "rejected_arguments": arguments,
+                "validation_error": error,
+                "missing_required_fields": list(missing),
+                "required_schema": spec.args_model.model_json_schema(),
+                "current_hypothesis": state.current_hypothesis,
+                "known_entity_candidates": known_targets,
+            }, ensure_ascii=False, default=str)
+            try:
+                admit("contract_repair", count_llm=True)
+                timeout = provider_timeout(min(self.config.planner_llm_timeout_seconds, 30.0))
+                repaired = self._provider_call(
+                    complete_json_compat,
+                    provider, repair_system, repair_user,
+                    model=self.model or None,
+                    logical_timeout_seconds=timeout,
+                    hard_timeout_seconds=timeout,
+                    state_source=provider,
+                    state_attributes=("last_usage",),
+                )
+                add_usage(provider, stage="contract_repair")
+            except Exception as exc:
+                result = {
+                    "status": "failed",
+                    "failure_type": type(exc).__name__,
+                    "message": str(exc),
+                }
+                trace.record("TOOL_CONTRACT_REPAIR_RESULT", {
+                    "tool": tool_name, "repair_index": contract_repair_calls, **result,
+                })
+                return None, result
+            if not isinstance(repaired, dict):
+                result = {"status": "rejected", "reason": "repair_result_not_object"}
+                trace.record("TOOL_CONTRACT_REPAIR_RESULT", {
+                    "tool": tool_name, "repair_index": contract_repair_calls, **result,
+                })
+                return None, result
+            repaired_fields = {
+                name: repaired[name] for name in missing if name in repaired
+            }
+            merged = {**arguments, **repaired_fields}
+            validated, repaired_error = tools.validate_arguments(tool_name, merged)
+            result = {
+                "status": "accepted" if not repaired_error else "rejected",
+                "returned_fields": sorted(repaired_fields),
+                "normalized_arguments": dict(validated or merged),
+                "validation_error": repaired_error,
+            }
+            trace.record("TOOL_CONTRACT_REPAIR_RESULT", {
+                "tool": tool_name, "repair_index": contract_repair_calls, **result,
+            })
+            return (validated, result) if not repaired_error else (None, result)
+
         def trigger_reflection(reason: str, *, review_feedback_text: str = "") -> str:
             nonlocal reflection_calls, reflection_feedback, reflection_trigger, schema_repair_count
-            nonlocal llm_calls
+            nonlocal llm_calls, reflection_no_delta_count, consecutive_reflection_no_delta
             if not self.config.enable_reflection or self.config.max_reflection_calls == 0:
+                return ""
+            if consecutive_reflection_no_delta >= self.config.max_consecutive_reflection_calls:
+                trace.record("REFLECTION_BLOCKED", {
+                    "trigger": reason,
+                    "reason": "max_consecutive_reflection_without_runtime_delta",
+                    "max_consecutive_reflection_calls": self.config.max_consecutive_reflection_calls,
+                })
+                transition_phase("PLAN", "reflection_blocked_without_delta")
                 return ""
             # Test doubles and old compatibility providers may only implement
             # native planner calls. They simply cannot serve the optional role.
@@ -1163,6 +1546,7 @@ class DiagnosisHarness:
             reflection_signatures.add(signature)
             reflection_trigger = reason
             reflection_calls += 1
+            transition_phase("REFLECT", reason, reflection_call=reflection_calls)
             trace.record("REFLECTION_START", {
                 "call": reflection_calls, "trigger": reason,
                 "evidence_count": len(evidence_memory.pinned),
@@ -1256,14 +1640,43 @@ class DiagnosisHarness:
                     })
                 validate_reflection_feedback(feedback)
                 reflection_feedback = json.dumps(feedback.model_dump(), ensure_ascii=False)
+                delta_accepted = apply_reflection_delta(feedback, reason)
+                if delta_accepted:
+                    consecutive_reflection_no_delta = 0
+                else:
+                    reflection_no_delta_count += 1
+                    consecutive_reflection_no_delta += 1
                 trace.record("REFLECTION_RESULT", {
                     "call": reflection_calls, "trigger": reason,
+                    "delta_accepted": delta_accepted,
+                    "consecutive_no_delta": consecutive_reflection_no_delta,
                     "usage": dict(getattr(reflection_agent, "last_usage", {}) or {}),
                     "prompt_breakdown": dict(getattr(reflection_agent, "last_prompt_breakdown", {}) or {}),
                     "prompt_breakdowns": list(getattr(reflection_agent, "last_prompt_breakdowns", ()) or ()),
                     **feedback.model_dump(),
                 })
+                transition_phase("PLAN", "reflection_completed", delta_accepted=delta_accepted)
                 return reflection_feedback
+            except RunBudgetAdmissionExceeded as exc:
+                llm_calls = max(0, llm_calls - 1)
+                reflection_calls = max(0, reflection_calls - 1)
+                dynamic_budget.set_run_usage(
+                    tokens_used=prompt_tokens + completion_tokens,
+                    llm_calls_used=llm_calls,
+                    cost_used=run_cost,
+                )
+                trace.record("BUDGET_ADMISSION_REJECTED", {
+                    "stage": "reflection",
+                    "reason": exc.decision.reason,
+                    "budget_before_call": exc.decision.remaining_run_tokens,
+                    "estimated_call_cost": exc.decision.breakdown,
+                    "budget_after_call": max(
+                        0,
+                        exc.decision.remaining_run_tokens
+                        - exc.decision.breakdown.get("required_run_tokens", 0),
+                    ),
+                })
+                return ""
             except PromptBudgetExceeded as exc:
                 llm_calls = max(0, llm_calls - 1)
                 reflection_calls = max(0, reflection_calls - 1)
@@ -1283,13 +1696,34 @@ class DiagnosisHarness:
                 })
                 return ""
             except ReflectionContractExhausted as exc:
+                transition_phase("INCONCLUSIVE", "reflection_contract_exhausted")
+                trace.record("REPAIR_FAILED", {
+                    "layer": "reflection_contract",
+                    "logical_turn": reflection_calls,
+                    "repair_attempts": 1,
+                    "reason": "reflection_schema_repair_exhausted",
+                })
                 trace.record("REFLECTION_CONTRACT_EXHAUSTED", {
                     "call": reflection_calls, "trigger": reason,
                     "error_type": type(exc).__name__,
                     "failure_category": "reflection_contract_exhausted",
                 })
                 raise
+            except LLMDeadlineExceeded as exc:
+                transition_phase("PLAN", "reflection_provider_timeout")
+                trace.record("REFLECTION_PROVIDER_FAILURE", {
+                    "call": reflection_calls, "trigger": reason,
+                    "error_type": type(exc).__name__,
+                    "failure_category": "provider_timeout",
+                    "message": str(exc),
+                })
+                # A provider timeout is recoverable at the runtime boundary:
+                # preserve the prior hypothesis and continue through the
+                # bounded planner/finalization guards. It is not a schema
+                # rejection and must not consume a contract-repair slot.
+                return ""
             except Exception as exc:
+                transition_phase("PLAN", "reflection_rejected_schema")
                 trace.record("REFLECTION_REJECTED_SCHEMA", {
                     "call": reflection_calls, "trigger": reason,
                     "error_type": type(exc).__name__, "message": str(exc),
@@ -1299,9 +1733,34 @@ class DiagnosisHarness:
                 # not let a failed/timeout call reset the progress guard.
                 return ""
 
+        def hypothesis_can_finalize(hypothesis: IncidentHypothesis | None,
+                                    known_evidence_ids: set[str]) -> bool:
+            """Return the run-time completion predicate for this experiment arm.
+
+            Baseline keeps the same typed candidate and review protocol, but
+            deliberately omits the optimized evidence-sufficiency gate.  It
+            still requires enough known evidence IDs for the shared output
+            schema and evaluator to remain meaningful.
+            """
+            if hypothesis is None:
+                return False
+            if self.config.features.finalization_gate:
+                return hypothesis.can_finalize(known_evidence_ids)
+            return len(set(hypothesis.supporting_evidence_ids)) >= 2
+
+        def best_candidate_from_hypothesis() -> RootCauseCandidate | None:
+            if not hypotheses:
+                return None
+            hypothesis = hypotheses[-1]
+            known = {item.evidence_id for item in evidence_memory.pinned}
+            if not hypothesis_can_finalize(hypothesis, known):
+                return None
+            return self._candidate_from_hypothesis(hypothesis)
+
         def finalize_candidate(candidate: RootCauseCandidate, source: str,
                                *, hypothesis: IncidentHypothesis | None = None) -> RootCauseCandidate:
             """The only candidate-producing boundary before Final Review."""
+            transition_phase("FINALIZE", source)
             known_evidence_ids = {item.evidence_id for item in evidence_memory.pinned}
             if any(not evidence_id.startswith("ev-") for evidence_id in candidate.evidence_ids):
                 raise RuntimeError("final candidate may cite only ev-* Evidence IDs")
@@ -1310,6 +1769,47 @@ class DiagnosisHarness:
             if not set(candidate.evidence_ids).issubset(known_evidence_ids):
                 raise RuntimeError("final candidate cites unknown evidence")
             candidate_ids = set(candidate.evidence_ids)
+
+            # Claim/causal metadata is an optional explanation of the frozen
+            # Hypothesis.  Providers sometimes copy a broader working-set
+            # citation list into these fields even though the Candidate core
+            # cites a narrower, validated set.  Do not turn that serialization
+            # drift into a runtime failure, and never promote the extra IDs:
+            # retain only metadata whose citations are already in the Candidate
+            # Evidence projection.  The Evidence and Review gates below remain
+            # unchanged.
+            dropped_mapping_count = 0
+            dropped_causal_count = 0
+            retained_mappings = []
+            for mapping in candidate.claim_evidence_mapping:
+                ids = set(mapping.evidence_ids)
+                if ids and ids.issubset(candidate_ids) and ids.issubset(known_evidence_ids):
+                    retained_mappings.append(mapping)
+                else:
+                    dropped_mapping_count += 1
+            retained_causal = []
+            for link in candidate.causal_chain_summary:
+                ids = set(link.evidence_ids)
+                if ids and ids.issubset(candidate_ids) and ids.issubset(known_evidence_ids):
+                    retained_causal.append(link)
+                else:
+                    dropped_causal_count += 1
+            if (
+                dropped_mapping_count
+                or dropped_causal_count
+                or len(retained_mappings) != len(candidate.claim_evidence_mapping)
+                or len(retained_causal) != len(candidate.causal_chain_summary)
+            ):
+                candidate = candidate.model_copy(update={
+                    "claim_evidence_mapping": tuple(retained_mappings),
+                    "causal_chain_summary": tuple(retained_causal),
+                })
+                trace.record("FINALIZATION_METADATA_NORMALIZED", {
+                    "source": source,
+                    "dropped_claim_mappings": dropped_mapping_count,
+                    "dropped_causal_links": dropped_causal_count,
+                    "reason": "optional structured metadata cited Evidence outside frozen Candidate",
+                })
             mapping_ids = {
                 evidence_id
                 for mapping in candidate.claim_evidence_mapping
@@ -1352,7 +1852,7 @@ class DiagnosisHarness:
                     ),
                 })
             if hypothesis is not None:
-                if not hypothesis.can_finalize(known_evidence_ids):
+                if self.config.features.finalization_gate and not hypothesis.can_finalize(known_evidence_ids):
                     raise RuntimeError("final candidate is not supported by a complete hypothesis")
                 omitted_support = tuple(
                     evidence_id for evidence_id in candidate.evidence_ids
@@ -1371,7 +1871,7 @@ class DiagnosisHarness:
                     reconciled = hypothesis.model_copy(update={
                         "supporting_evidence_ids": merged_support,
                     })
-                    if not reconciled.can_finalize(known_evidence_ids):
+                    if self.config.features.finalization_gate and not reconciled.can_finalize(known_evidence_ids):
                         raise RuntimeError("final candidate is not supported by a complete hypothesis")
                     if hypotheses and hypotheses[-1] == hypothesis:
                         hypotheses[-1] = reconciled
@@ -1402,6 +1902,8 @@ class DiagnosisHarness:
             nonlocal planner_contract_retry_used
             nonlocal prior_context
             nonlocal llm_calls, planner_calls
+            nonlocal consecutive_reflection_no_delta
+            nonlocal tool_contract_repairs
             start_steps, start_tools = state.step, state.tool_calls
             prompt_compaction_attempts = 0
 
@@ -1426,6 +1928,26 @@ class DiagnosisHarness:
                         value for value in ((current.component,) if current else ()) if value
                     ),
                 )
+
+            def visible_tool_names() -> tuple[str, ...] | None:
+                """Expose a capability/stage slice without changing authority.
+
+                The registry remains the permission and validation authority.
+                This only reduces the provider's choice set after the first
+                Skill transition; the initial turn still sees the full catalog.
+                """
+                if not self.config.features.lightweight_skills or not active_skill:
+                    return None
+                skill_spec = INCIDENT_SKILLS.get(active_skill)
+                names = set(skill_spec.suggested_tools if skill_spec else ())
+                names.add("finalize_diagnosis")
+                if knowledge_enabled:
+                    names.add("knowledge_retrieval")
+                # Code is a handoff capability when a source workspace is
+                # actually bound. It is not advertised for snapshot-only runs.
+                if source_workspace_available:
+                    names.update(available_code_tools)
+                return tuple(sorted(names))
 
             def ensure_review_progress(candidate: RootCauseCandidate,
                                         current_hypothesis: IncidentHypothesis | None) -> None:
@@ -1456,9 +1978,7 @@ class DiagnosisHarness:
                 agent_steps_remaining = max(0, step_limit - (state.step - start_steps))
                 runtime_budget = budget_snapshot("investigation_loop")
                 if runtime_budget.phase == "finalize":
-                    fallback = self._candidate_from_sufficient_hypothesis(
-                        hypotheses, evidence_memory.pinned,
-                    )
+                    fallback = best_candidate_from_hypothesis()
                     if fallback is None:
                         raise RuntimeError("finalization reserve reached without a complete hypothesis")
                     ensure_review_progress(fallback, hypotheses[-1] if hypotheses else None)
@@ -1467,9 +1987,7 @@ class DiagnosisHarness:
                         fallback, termination_reason, hypothesis=hypotheses[-1],
                     )
                 if state.tool_calls >= self.config.max_tool_calls:
-                    fallback = self._candidate_from_sufficient_hypothesis(
-                        hypotheses, evidence_memory.pinned,
-                    )
+                    fallback = best_candidate_from_hypothesis()
                     if fallback is None:
                         raise RuntimeError("max_tool_calls exceeded before finalization")
                     ensure_review_progress(fallback, hypotheses[-1] if hypotheses else None)
@@ -1477,6 +1995,53 @@ class DiagnosisHarness:
                     return finalize_candidate(
                         fallback, termination_reason, hypothesis=hypotheses[-1],
                     )
+                if (
+                    evidence_sufficient_tool_calls is not None
+                    and state.tool_calls - evidence_sufficient_tool_calls
+                    >= self.config.max_post_sufficiency_tool_calls
+                ):
+                    fallback = best_candidate_from_hypothesis()
+                    if fallback is not None:
+                        termination_reason = "post_sufficiency_tool_budget"
+                        trace.record("BUDGET_AWARE_CONVERGENCE", {
+                            "step": state.step,
+                            "tool_calls": state.tool_calls,
+                            "evidence_sufficient_step": evidence_sufficient_step,
+                            "evidence_sufficient_tool_calls": evidence_sufficient_tool_calls,
+                            "post_sufficiency_tool_calls": (
+                                state.tool_calls - evidence_sufficient_tool_calls
+                            ),
+                            "limit": self.config.max_post_sufficiency_tool_calls,
+                            "reason": "bounded verification window ended",
+                        })
+                        ensure_review_progress(fallback, hypotheses[-1])
+                        return finalize_candidate(
+                            fallback, termination_reason, hypothesis=hypotheses[-1],
+                        )
+                dynamic_budget.set_run_usage(
+                    tokens_used=prompt_tokens + completion_tokens,
+                    llm_calls_used=llm_calls,
+                    cost_used=run_cost,
+                )
+                pressure_before_planner = dynamic_budget.decision(
+                    "planner_admission", tokens_used=prompt_tokens,
+                    llm_calls_used=llm_calls, cost_used=run_cost,
+                )
+                if pressure_before_planner.state is BudgetState.HARD_PRESSURE:
+                    fallback = best_candidate_from_hypothesis()
+                    if fallback is not None:
+                        termination_reason = "token_budget_sufficient_hypothesis"
+                        trace.record("BUDGET_AWARE_CONVERGENCE", {
+                            "step": state.step,
+                            "tokens_used": prompt_tokens + completion_tokens,
+                            "remaining_run_tokens": pressure_before_planner.remaining_run_tokens,
+                            "state": pressure_before_planner.state.value,
+                            "reason": pressure_before_planner.reason,
+                        })
+                        ensure_review_progress(fallback, hypotheses[-1])
+                        return finalize_candidate(
+                            fallback, termination_reason, hypothesis=hypotheses[-1],
+                        )
                 dynamic_budget.set_run_usage(
                     tokens_used=prompt_tokens + completion_tokens,
                     llm_calls_used=llm_calls,
@@ -1531,13 +2096,24 @@ class DiagnosisHarness:
                     reflection_feedback=reflection_feedback,
                     tool_health=tool_circuit.summary(),
                     reflection_trigger=reflection_trigger,
+                    next_action_constraint=reflection_constraint,
                     entities=entities,
                     capabilities=capabilities,
                     router_decision=router_decision,
                     prior_context=bounded_prior,
+                    compact=self.config.features.planner_state_envelope,
                 )
+                exposed_tools = visible_tool_names()
+                if exposed_tools is not None:
+                    trace.record("TOOL_EXPOSURE_SLICE", {
+                        "step": state.step + 1,
+                        "active_skill": active_skill,
+                        "tools": list(exposed_tools),
+                        "reason": "stage_and_capability_aware_provider_catalog",
+                    })
                 control_prefix = (
-                    "AGENT_CONTROL_STATE:\n"
+                    ("PLANNER_STATE:\n" if self.config.features.planner_state_envelope
+                     else "AGENT_CONTROL_STATE:\n")
                     + json.dumps(control_state, ensure_ascii=False)
                     + "\n\nDIAGNOSTIC_CONTEXT:\n"
                 )
@@ -1621,26 +2197,59 @@ class DiagnosisHarness:
                     })
                 planner_call_context = context
                 prompt_budget_retry = False
+                contract_retry_for_step = False
                 while True:
                     trace.record("PLANNER_CALL_STARTED", {
                         "step": state.step + 1,
                         "logical_timeout_seconds": self.config.planner_llm_timeout_seconds,
-                        "contract_retry": planner_contract_retry_used,
+                        "contract_retry": contract_retry_for_step,
                         "budget": budget_payload(budget_snapshot("planner_start")),
                     })
                     try:
-                        admit("planner", count_llm=True)
+                        admit(
+                            "planner", count_llm=True,
+                            allow_targeted_recovery=contract_retry_for_step,
+                        )
                         planner_timeout = provider_timeout(self.config.planner_llm_timeout_seconds)
                         result = self._provider_call(
                             planner.propose,
                             state, planner_call_context,
                             logical_timeout_seconds=planner_timeout,
                             prompt_budget=dynamic_budget,
+                            visible_tool_names=exposed_tools,
                             hard_timeout_seconds=planner_timeout,
                             state_source=planner,
                             state_attributes=("last_prompt_breakdown", "last_prompt_breakdowns"),
                         )
                         break
+                    except RunBudgetAdmissionExceeded as exc:
+                        llm_calls = max(0, llm_calls - 1)
+                        planner_calls = max(0, planner_calls - 1)
+                        dynamic_budget.set_run_usage(
+                            tokens_used=prompt_tokens + completion_tokens,
+                            llm_calls_used=llm_calls,
+                            cost_used=run_cost,
+                        )
+                        trace.record("BUDGET_ADMISSION_REJECTED", {
+                            "stage": "planner",
+                            "step": state.step + 1,
+                            "reason": exc.decision.reason,
+                            "budget_before_call": exc.decision.remaining_run_tokens,
+                            "estimated_call_cost": exc.decision.breakdown,
+                            "budget_after_call": max(
+                                0,
+                                exc.decision.remaining_run_tokens
+                                - exc.decision.breakdown.get("required_run_tokens", 0),
+                            ),
+                        })
+                        fallback = best_candidate_from_hypothesis()
+                        if fallback is None:
+                            raise
+                        termination_reason = "pre_call_budget_admission_sufficient_hypothesis"
+                        ensure_review_progress(fallback, hypotheses[-1])
+                        return finalize_candidate(
+                            fallback, termination_reason, hypothesis=hypotheses[-1],
+                        )
                     except PromptBudgetExceeded as exc:
                         # Admission happens before the agent can render its
                         # complete provider payload. This was a local
@@ -1669,7 +2278,7 @@ class DiagnosisHarness:
                             "step": state.step + 1,
                             "error_type": type(exc).__name__, "message": str(exc),
                         })
-                        fallback = self._candidate_from_sufficient_hypothesis(hypotheses, evidence_memory.pinned)
+                        fallback = best_candidate_from_hypothesis()
                         if fallback is None:
                             raise
                         final_candidate_step = state.step
@@ -1692,7 +2301,8 @@ class DiagnosisHarness:
                         if planner_metadata is not None:
                             planner_failure["planner_metadata"] = planner_metadata
                         trace.record("PLANNER_CALL_FAILED", planner_failure)
-                        if not planner_contract_retry_used:
+                        if not contract_retry_for_step:
+                            contract_retry_for_step = True
                             planner_contract_retry_used = True
                             trace.record("PLANNER_CONTRACT_RETRY", {
                                 "step": state.step + 1,
@@ -1704,13 +2314,22 @@ class DiagnosisHarness:
                                 context
                                 + "\n\nBOUNDED_CONTRACT_RETRY: The previous Planner response violated the "
                                 "structured tool contract. Return exactly one valid native tool call; preserve "
-                                "the current semantic state and do not guess missing Evidence IDs."
+                                "the current semantic state and do not guess missing Evidence IDs. "
+                                f"Contract error: {str(exc)}. Use empty strings/lists instead of null for "
+                                "optional incident controls. For finalize_diagnosis, include evidence_ids and "
+                                "copy the same known ev-* IDs into supporting_evidence_ids."
                             )
                             continue
                         trace.record("PLANNER_CONTRACT_EXHAUSTED", {
                             "step": state.step + 1,
                             "retry_count": 1,
                             "planner_metadata": planner_metadata or {},
+                        })
+                        trace.record("REPAIR_FAILED", {
+                            "layer": "planner_contract",
+                            "logical_turn": state.step + 1,
+                            "repair_attempts": 1,
+                            "reason": "bounded_planner_contract_retry_exhausted",
                         })
                         raise PlannerContractExhausted(exc) from exc
                     except PromptBudgetExceeded as exc:
@@ -1745,12 +2364,28 @@ class DiagnosisHarness:
                     "prompt_breakdowns": list(getattr(planner, "last_prompt_breakdowns", ()) or ()),
                     "usage": dict(result.response.usage or {}),
                 })
+                trace.record("PLANNER_RESPONSE_AUDIT", {
+                    "step": state.step + 1,
+                    "raw_output": dict(getattr(result.response, "raw_output", {}) or {}),
+                    "parsed_output": result.response.structured,
+                    "normalized_tool_count": len(result.tool_calls),
+                    "tool_names": [call.name for call in result.tool_calls],
+                })
                 state.step += 1
                 trace.record("AGENT_STEP", {"step": state.step, "tool_call_count": len(result.tool_calls)})
+                for audit in getattr(result, "tool_call_audits", ()):
+                    trace.record("PROVIDER_TOOL_CALL_AUDIT", {
+                        "step": state.step,
+                        "provider": model_capability.provider or type(self.llm).__name__,
+                        "model": model_capability.model or self.model,
+                        **dict(audit),
+                    })
                 if not result.tool_calls:
                     raise RuntimeError("Diagnosis Agent returned no action")
                 if len(result.tool_calls) != len(result.skill_selections):
                     raise RuntimeError("every incident action must carry a Skill selection")
+                tool_repairs_this_turn = 0
+                tool_contract_replan_requested = False
                 for call, selection in zip(result.tool_calls, result.skill_selections):
                     previous_skill = active_skill
                     active_skill = selection.skill
@@ -1759,7 +2394,16 @@ class DiagnosisHarness:
                         "current_hypothesis": selection.current_hypothesis,
                         "evidence_gap": selection.evidence_gap, "tool": call.name,
                         "source_mechanism_status": selection.source_mechanism_status,
+                        "obligation_id": selection.obligation_id,
+                        "expected_information_gain": selection.expected_information_gain,
                     })
+                    if selection.compatibility_normalizations:
+                        trace.record("PLANNER_COMPATIBILITY_NORMALIZED", {
+                            "step": state.step,
+                            "tool": call.name,
+                            "actions": list(selection.compatibility_normalizations),
+                            "reason": "provider-native incident argument compatibility",
+                        })
                     if selection.reasoning_metadata_normalizations:
                         trace.record("PLANNER_REASONING_METADATA_NORMALIZED", {
                             "step": state.step,
@@ -1815,15 +2459,105 @@ class DiagnosisHarness:
                         )
                     ):
                         trigger_reflection("hypothesis_instability")
-                    if hypothesis.can_finalize(known_evidence_ids) and evidence_sufficient_step is None:
+                    deterministic_sufficiency = hypothesis_can_finalize(
+                        hypothesis, known_evidence_ids,
+                    )
+                    trace.record("EVIDENCE_SUFFICIENCY_EVALUATED", {
+                        "step": state.step,
+                        "tool": call.name,
+                        "planner_declared": selection.evidence_sufficiency == "sufficient",
+                        "evidence_sufficient": bool(deterministic_sufficiency),
+                        "supporting_evidence_count": len(hypothesis.supporting_evidence_ids),
+                        "required_gap_count": len(hypothesis.required_gap_projection()),
+                        "open_critical_obligation_count": sum(
+                            1 for item in hypothesis.verification_obligations
+                            if item.blocks_finalization and item.status == "OPEN"
+                        ),
+                        "blocking_contradiction_count": sum(
+                            1 for item in hypothesis.contradictions
+                            if item.blocks_finalization and item.status == "OPEN"
+                        ),
+                        "diagnostics": finalization_diagnostics,
+                    })
+                    # Positive edge only: old traces could contain a false
+                    # EVIDENCE_SUFFICIENT payload when the Planner declared
+                    # sufficient but the deterministic predicate rejected it.
+                    if deterministic_sufficiency and evidence_sufficient_step is None:
                         evidence_sufficient_step = state.step
                         evidence_sufficient_tool_calls = state.tool_calls
                         trace.record("EVIDENCE_SUFFICIENT", {
-                            "step": state.step, "hypothesis": hypothesis.model_dump(),
+                            "step": state.step,
+                            "evidence_sufficient": True,
+                            "planner_declared": selection.evidence_sufficiency == "sufficient",
+                            "hypothesis": hypothesis.model_dump(),
                         })
                     validated, error = tools.validate_arguments(call.name, call.arguments)
+                    repair_attempted = False
+                    repair_result_for_admission = None
                     if error:
-                        raise RuntimeError(f"invalid incident action: {error['message']}")
+                        repair_attempted = True
+                        rejection = {
+                            "step": state.step,
+                            "tool": call.name,
+                            "arguments": dict(call.arguments),
+                            "reason": "tool_contract_validation",
+                            "validation_error": error,
+                            "instruction": (
+                                "Repair only the rejected tool arguments on the next Planner turn; "
+                                "do not invent values or repeat the invalid fingerprint."
+                            ),
+                        }
+                        tool_repairs_this_turn += 1
+                        repaired, repair_result = targeted_contract_repair(
+                            call.name, dict(call.arguments), error,
+                            logical_repair_index=tool_repairs_this_turn,
+                        )
+                        if repaired is not None:
+                            validated = repaired
+                            call = type(call)(call.id, call.name, dict(repaired))
+                            rejection["repair_status"] = "accepted"
+                            repair_result_for_admission = repair_result
+                        else:
+                            tool_contract_repairs += 1
+                            rejection["repair_status"] = repair_result.get("status", "rejected")
+                            rejection["repair_index"] = tool_contract_repairs
+                            rejected_actions.append(rejection)
+                            trace.record("TOOL_CONTRACT_REJECTED", rejection)
+                            trace.record("TOOL_CONTRACT_REPAIR_REQUESTED", {
+                                "step": state.step,
+                                "tool": call.name,
+                                "repair_index": tool_contract_repairs,
+                                "max_repairs": self.config.max_tool_contract_repairs,
+                                "missing_or_invalid_fields": repair_result.get("missing_fields", []),
+                                "repair_result": repair_result,
+                            })
+                            trace.record("REPAIR_FAILED", {
+                                "layer": "tool_contract",
+                                "logical_turn": state.step,
+                                "tool": call.name,
+                                "repair_attempts": tool_contract_repairs,
+                                "reason": "targeted_tool_contract_repair_rejected",
+                            })
+                            trace.record("TOOL_CONTRACT_REPAIR_EXHAUSTED", {
+                                "step": state.step,
+                                "tool": call.name,
+                                "repair_index": tool_repairs_this_turn,
+                                "max_repairs": self.config.max_tool_contract_repairs,
+                            })
+                            # A failed repair exits this logical Planner turn.
+                            # The next Planner turn may choose a different
+                            # action, but it cannot spend a second repair in
+                            # this turn.
+                            tool_contract_replan_requested = True
+                            break
+                    trace.record("TOOL_CONTRACT_ADMITTED", {
+                        "step": state.step,
+                        "tool": call.name,
+                        "validation_result": "valid",
+                        "validated_arguments": dict(validated),
+                        "repair_attempted": repair_attempted,
+                        "repair": repair_result_for_admission,
+                    })
                     if call.name != "finalize_diagnosis" and state.tool_calls - start_tools >= tool_limit:
                         trace.record("ACTION_REJECTED", {
                             "reason": "tool_budget_exhausted", "tool": call.name,
@@ -1833,7 +2567,7 @@ class DiagnosisHarness:
                     final_candidate = None
                     re_finalization = call.name == "finalize_diagnosis" and review_baseline is not None
                     if call.name == "finalize_diagnosis":
-                        if not hypothesis.can_finalize(known_evidence_ids):
+                        if self.config.features.finalization_gate and not hypothesis.can_finalize(known_evidence_ids):
                             trace.record("REFLECTION_TRIGGER", {
                                 "reason": "premature_finalize", "step": state.step,
                             })
@@ -1856,7 +2590,7 @@ class DiagnosisHarness:
                         )
                         ensure_review_progress(final_candidate, hypothesis)
                     if (call.name != "finalize_diagnosis"
-                            and hypothesis.can_finalize(known_evidence_ids)
+                            and hypothesis_can_finalize(hypothesis, known_evidence_ids)
                             and not selection.remaining_evidence_need):
                         candidate = self._candidate_from_hypothesis(hypothesis)
                         final_candidate_step = state.step
@@ -1912,27 +2646,27 @@ class DiagnosisHarness:
                             "arguments": validated,
                             "fingerprint": fingerprint,
                             "reason": "duplicate_fingerprint",
+                            "action_class": "duplicate",
                             "instruction": "Do not request this action again; use its existing Evidence or choose a different critical check.",
                         }
                         rejected_actions.append(rejection)
                         trace.record("ACTION_REJECTED", rejection)
-                        loop_guard.observe_semantic_progress(
-                            state,
-                            evidence_ids=(item.evidence_id for item in evidence_memory.pinned),
-                            hypothesis=hypotheses[-1] if hypotheses else None,
-                            obligations=(hypotheses[-1].verification_obligations if hypotheses else ()),
-                            contradictions=(hypotheses[-1].contradictions if hypotheses else ()),
-                            review_feedback=review_feedback,
-                        )
-                        if state.no_progress_count >= self.config.max_no_progress:
+                        if self.config.features.no_progress_detection:
+                            loop_guard.observe_semantic_progress(
+                                state,
+                                evidence_ids=(item.evidence_id for item in evidence_memory.pinned),
+                                hypothesis=hypotheses[-1] if hypotheses else None,
+                                obligations=(hypotheses[-1].verification_obligations if hypotheses else ()),
+                                contradictions=(hypotheses[-1].contradictions if hypotheses else ()),
+                                review_feedback=review_feedback,
+                            )
+                        if self.config.features.no_progress_detection and state.no_progress_count >= self.config.max_no_progress:
                             reflected = trigger_reflection("semantic_no_progress")
                             if reflected:
                                 loop_guard.no_progress = 0
                                 state.no_progress_count = 0
                                 continue
-                            fallback = self._candidate_from_sufficient_hypothesis(
-                                hypotheses, evidence_memory.pinned,
-                            )
+                            fallback = best_candidate_from_hypothesis()
                             if fallback is None:
                                 raise RuntimeError("semantic no-progress limit exceeded")
                             ensure_review_progress(fallback, hypotheses[-1] if hypotheses else None)
@@ -1945,12 +2679,14 @@ class DiagnosisHarness:
                     action = {
                         "step": state.step, "skill": selection.skill, "skill_reason": selection.reason,
                         "tool": call.name, "arguments": validated, "fingerprint": fingerprint,
+                        "obligation_id": selection.obligation_id,
+                        "expected_information_gain": selection.expected_information_gain,
                     }
                     actions.append(action)
                     if call.name == "finalize_diagnosis":
                         trace.record("FINALIZATION_PROPOSED", {
                             "step": state.step,
-                            "hypothesis_valid": hypothesis.can_finalize(known_evidence_ids),
+                            "hypothesis_valid": hypothesis_can_finalize(hypothesis, known_evidence_ids),
                         })
                         candidate = final_candidate or RootCauseCandidate.model_validate(validated)
                         final_candidate_step = state.step
@@ -2017,9 +2753,12 @@ class DiagnosisHarness:
                             source=call.name, summary=projected, excerpt=projected,
                             target=target,
                             tags=["task_kind:incident"],
+                            enforce_admission=self.config.features.evidence_lifecycle,
+                            deduplicate=self.config.features.evidence_lifecycle,
                         )
                         if shared_evidence is not None:
                             state.no_progress_count = 0
+                            consecutive_reflection_no_delta = 0
                             item = IncidentEvidence(
                                 evidence_id=shared_evidence.evidence_id, source=shared_evidence.source,
                                 target=shared_evidence.target or target,
@@ -2033,6 +2772,41 @@ class DiagnosisHarness:
                     dynamic_progress = progress_made(
                         progress_before_action, progress_after_action,
                     )
+                    action["new_evidence_count"] = len(
+                        progress_after_action.evidence_ids - progress_before_action.evidence_ids
+                    )
+                    action["obligation_progress_count"] = max(
+                        0,
+                        len(progress_before_action.open_obligations)
+                        - len(progress_after_action.open_obligations),
+                    )
+                    action["hypothesis_changed"] = (
+                        progress_before_action.hypothesis != progress_after_action.hypothesis
+                    )
+                    action["information_gain"] = (
+                        "high" if action["new_evidence_count"] > 0
+                        or action["obligation_progress_count"] > 0
+                        or action["hypothesis_changed"] else "none"
+                    )
+                    # Gold required-group matching is evaluator-only. Keep a
+                    # clearly marked obligation proxy in the runtime artifact
+                    # instead of leaking evaluator facts into planning.
+                    action["required_evidence_group_progress"] = {
+                        "status": "obligation_proxy",
+                        "progress_count": action["obligation_progress_count"],
+                        "new_evidence_count": action["new_evidence_count"],
+                        "note": "Gold group matching is evaluator-only",
+                    }
+                    if not observation.ok:
+                        action["action_class"] = "failed"
+                    elif action["new_evidence_count"] > 0 or action["obligation_progress_count"] > 0:
+                        action["action_class"] = (
+                            "necessary" if selection.obligation_id
+                            or action["obligation_progress_count"] > 0
+                            else "useful_noncritical"
+                        )
+                    else:
+                        action["action_class"] = "zero_information_gain"
                     dynamic_state_after_action = dynamic_budget.decision(
                         "post_tool_progress",
                         tokens_used=prompt_tokens,
@@ -2048,24 +2822,33 @@ class DiagnosisHarness:
                         "open_obligation_count": len(progress_after_action.open_obligations),
                         "blocking_contradiction_count": len(progress_after_action.blocking_contradictions),
                         "component_count": len(progress_after_action.components),
+                        "obligation_id": selection.obligation_id,
+                        "expected_information_gain": selection.expected_information_gain,
+                        "new_evidence_count": action["new_evidence_count"],
+                        "obligation_progress_count": action["obligation_progress_count"],
+                        "hypothesis_changed": action["hypothesis_changed"],
+                        "information_gain": action["information_gain"],
+                        "action_class": action["action_class"],
+                        "required_evidence_group_progress": action[
+                            "required_evidence_group_progress"
+                        ],
                     })
-                    loop_guard.observe_semantic_progress(
-                        state,
-                        evidence_ids=(item.evidence_id for item in evidence_memory.pinned),
-                        hypothesis=hypotheses[-1] if hypotheses else None,
-                        obligations=(hypotheses[-1].verification_obligations if hypotheses else ()),
-                        contradictions=(hypotheses[-1].contradictions if hypotheses else ()),
-                        review_feedback=review_feedback,
-                    )
-                    if state.no_progress_count >= self.config.max_no_progress:
+                    if self.config.features.no_progress_detection:
+                        loop_guard.observe_semantic_progress(
+                            state,
+                            evidence_ids=(item.evidence_id for item in evidence_memory.pinned),
+                            hypothesis=hypotheses[-1] if hypotheses else None,
+                            obligations=(hypotheses[-1].verification_obligations if hypotheses else ()),
+                            contradictions=(hypotheses[-1].contradictions if hypotheses else ()),
+                            review_feedback=review_feedback,
+                        )
+                    if self.config.features.no_progress_detection and state.no_progress_count >= self.config.max_no_progress:
                         reflected = trigger_reflection("semantic_no_progress")
                         if reflected:
                             loop_guard.no_progress = 0
                             state.no_progress_count = 0
                             continue
-                        fallback = self._candidate_from_sufficient_hypothesis(
-                            hypotheses, evidence_memory.pinned,
-                        )
+                        fallback = best_candidate_from_hypothesis()
                         if fallback is None:
                             raise RuntimeError("semantic no-progress limit exceeded")
                         ensure_review_progress(fallback, hypotheses[-1] if hypotheses else None)
@@ -2074,9 +2857,14 @@ class DiagnosisHarness:
                             fallback, "semantic_no_progress_sufficient_hypothesis",
                             hypothesis=hypotheses[-1],
                         )
-            fallback = self._candidate_from_sufficient_hypothesis(
-                hypotheses, evidence_memory.pinned,
-            )
+                if tool_contract_replan_requested:
+                    trace.record("REPAIR_FAILED_REPLAN", {
+                        "logical_turn": state.step,
+                        "reason": "tool_contract_repair_failed; return to PLAN",
+                    })
+                    transition_phase("PLAN", "tool_contract_repair_failed")
+                    continue
+            fallback = best_candidate_from_hypothesis()
             if fallback is not None:
                 termination_reason = "step_budget_sufficient_hypothesis"
                 ensure_review_progress(fallback, hypotheses[-1] if hypotheses else None)
@@ -2084,6 +2872,90 @@ class DiagnosisHarness:
                     fallback, termination_reason, hypothesis=hypotheses[-1],
                 )
             raise RuntimeError("incident step budget exhausted before finalization")
+
+        def apply_review_rejection(decision: ReviewDecision) -> tuple[bool, bool]:
+            """Convert Review findings into a bounded recovery decision.
+
+            Returns ``(recoverable, contradiction_requires_reflection)``. Review
+            never chooses tools or re-investigates; it only supplies grounding
+            findings for this deterministic Runtime transition.
+            """
+            nonlocal obligation_created_count, blocking_contradiction_count
+            current = hypotheses[-1] if hypotheses else None
+            claims = tuple(dict.fromkeys(
+                " ".join(str(item).split()).strip()
+                for item in (*decision.missing_evidence, *decision.causal_gaps)
+                if " ".join(str(item).split()).strip()
+            ))
+            next_obligations = dict(obligation_state)
+            created: list[str] = []
+            for claim in claims:
+                existing = next((
+                    item for item in next_obligations.values()
+                    if " ".join(item.claim.split()).casefold() == claim.casefold()
+                ), None)
+                if existing is not None:
+                    continue
+                obligation = VerificationObligation(
+                    id=_obligation_id(claim),
+                    claim=claim,
+                    critical=True,
+                    status="OPEN",
+                    supporting_evidence_ids=(),
+                )
+                next_obligations[obligation.id] = obligation
+                created.append(obligation.id)
+                obligation_created_count += 1
+                trace.record("OBLIGATION_CREATED", {
+                    **obligation.model_dump(),
+                    "reason": "review_missing_evidence",
+                    "review_round": review_rounds,
+                })
+
+            if next_obligations != obligation_state:
+                obligation_state.clear()
+                obligation_state.update(next_obligations)
+                if current is not None:
+                    updated = current.model_copy(update={
+                        "verification_obligations": tuple(next_obligations.values()),
+                        "required_gaps": tuple(
+                            item.claim for item in next_obligations.values()
+                            if item.blocks_finalization
+                        ),
+                        "evidence_sufficient": False,
+                    })
+                    hypotheses[-1] = updated
+                    state.current_hypothesis = updated.model_dump()
+                trace.record("REVIEW_RECOVERY_OBLIGATIONS", {
+                    "round": review_rounds,
+                    "obligation_ids": created,
+                    "reason": "recoverable_missing_evidence",
+                })
+
+            blocking = tuple(dict.fromkeys(
+                (*decision.blocking_contradictions, *decision.contradictions)
+            ))
+            contradiction_requires_reflection = bool(blocking)
+            recoverability = decision.recoverability
+            recoverable = bool(
+                not recoverability.unrecoverable
+                and (
+                    recoverability.recoverable
+                    or claims
+                    or decision.targeted_followup
+                    or decision.suggested_investigation
+                    or contradiction_requires_reflection
+                )
+            )
+            trace.record("REVIEW_RECOVERY_DECISION", {
+                "round": review_rounds,
+                "recoverable": recoverable,
+                "unrecoverable": recoverability.unrecoverable,
+                "missing_evidence_count": len(claims),
+                "blocking_contradiction_count": len(blocking),
+                "targeted_followup": decision.targeted_followup or decision.suggested_investigation,
+            })
+            return recoverable, contradiction_requires_reflection
 
         candidate = None
         decision = None
@@ -2096,6 +2968,7 @@ class DiagnosisHarness:
                 termination_reason = "review_disabled"
             while self.config.enable_review and review_rounds < self.config.max_review_rounds:
                 review_rounds += 1
+                transition_phase("REVIEW", "candidate_finalized", review_round=review_rounds)
                 review_usage_accounted = False
                 try:
                     admit("review", count_llm=True)
@@ -2161,6 +3034,34 @@ class DiagnosisHarness:
                             ),
                             prompt_budget=dynamic_budget,
                         )
+                    except RunBudgetAdmissionExceeded as exc:
+                        # Review is the terminal semantic gate. A run-budget
+                        # admission rejection must remain INCONCLUSIVE and
+                        # must never be misreported as a Review PASS.
+                        llm_calls = max(0, llm_calls - 1)
+                        review_calls = max(0, review_calls - 1)
+                        dynamic_budget.set_run_usage(
+                            tokens_used=prompt_tokens + completion_tokens,
+                            llm_calls_used=llm_calls,
+                            cost_used=run_cost,
+                        )
+                        review_usage_accounted = True
+                        trace.record("BUDGET_ADMISSION_REJECTED", {
+                            "stage": "review",
+                            "round": review_rounds,
+                            "reason": exc.decision.reason,
+                            "budget_before_call": exc.decision.remaining_run_tokens,
+                            "estimated_call_cost": exc.decision.breakdown,
+                            "budget_after_call": max(
+                                0,
+                                exc.decision.remaining_run_tokens
+                                - exc.decision.breakdown.get("required_run_tokens", 0),
+                            ),
+                        })
+                        status = "INCONCLUSIVE"
+                        termination_reason = "review_budget_admission_exceeded"
+                        error_type, error_message = type(exc).__name__, str(exc)
+                        break
                     except PromptBudgetExceeded as exc:
                         # Review is the terminal semantic gate. If even its
                         # complete payload cannot fit, stop fail-closed as
@@ -2280,6 +3181,12 @@ class DiagnosisHarness:
                         "round": review_rounds, "error_type": type(exc).__name__,
                         "message": str(exc), "validation_error": reviewer.last_schema_error,
                     })
+                    trace.record("REPAIR_FAILED", {
+                        "layer": "review_contract",
+                        "logical_turn": review_rounds,
+                        "repair_attempts": 1,
+                        "reason": "review_schema_repair_exhausted",
+                    })
                     trace.record("PROVISIONAL_CANDIDATE", {
                         "candidate": candidate.model_dump() if candidate is not None else None,
                         "reason": "Final Review structured contract remained invalid after one bounded repair",
@@ -2323,20 +3230,57 @@ class DiagnosisHarness:
                     status = "PASS"
                     termination_reason = "final_review_pass"
                     break
-                trace.record("REFLECTION_TRIGGER", {"reason": "review_reject", "round": review_rounds})
+                recoverable, contradiction_requires_reflection = apply_review_rejection(decision)
+                trace.record("REVIEW_REJECT", {
+                    "round": review_rounds,
+                    "recoverable": recoverable,
+                    "contradiction_requires_reflection": contradiction_requires_reflection,
+                })
+                if not recoverable:
+                    transition_phase("INCONCLUSIVE", "review_unrecoverable")
+                    trace.record("REVIEW_RECOVERY_BLOCKED", {
+                        "round": review_rounds,
+                        "reason": "review_declared_unrecoverable_or_no_targeted_path",
+                    })
+                    status = "INCONCLUSIVE"
+                    termination_reason = "review_unrecoverable"
+                    break
                 if review_rounds == self.config.max_review_rounds:
                     status = "INCONCLUSIVE"
                     termination_reason = "review_bound_exhausted"
                     break
+                if review_recovery_cycles >= self.config.max_review_recovery_cycles:
+                    transition_phase("INCONCLUSIVE", "review_recovery_bound_exhausted")
+                    trace.record("REVIEW_RECOVERY_BLOCKED", {
+                        "round": review_rounds,
+                        "reason": "max_review_recovery_cycles",
+                        "max_review_recovery_cycles": self.config.max_review_recovery_cycles,
+                    })
+                    status = "INCONCLUSIVE"
+                    termination_reason = "review_recovery_bound_exhausted"
+                    break
+                review_recovery_cycles += 1
+                trace.record("REVIEW_RECOVERY_CYCLE", {
+                    "round": review_rounds,
+                    "cycle": review_recovery_cycles,
+                    "max_cycles": self.config.max_review_recovery_cycles,
+                })
                 rejected_candidate = candidate
                 rejected_evidence_ids = frozenset(
                     item.evidence_id for item in evidence_memory.pinned
                 )
                 rejected_hypothesis = hypotheses[-1] if hypotheses else None
                 review_feedback_json = json.dumps(decision.model_dump(), ensure_ascii=False)
-                reflection_result = trigger_reflection(
-                    "review_reject", review_feedback_text=review_feedback_json,
-                )
+                reflection_result = ""
+                if contradiction_requires_reflection:
+                    trace.record("REFLECTION_TRIGGER", {
+                        "reason": "review_reasoning_contradiction", "round": review_rounds,
+                    })
+                    reflection_result = trigger_reflection(
+                        "review_reasoning_contradiction", review_feedback_text=review_feedback_json,
+                    )
+                else:
+                    transition_phase("PLAN", "review_reject_recoverable")
                 combined_feedback = json.dumps({
                     "review": decision.model_dump(),
                     "reflection": json.loads(reflection_result) if reflection_result else None,
@@ -2348,6 +3292,19 @@ class DiagnosisHarness:
                     review_evidence_ids=rejected_evidence_ids,
                     review_hypothesis=rejected_hypothesis,
                 )
+        except RunBudgetAdmissionExceeded as exc:
+            status = "INCONCLUSIVE"
+            termination_reason = "pre_call_budget_admission_exceeded"
+            trace.record("INCIDENT_INCONCLUSIVE", {
+                "error_type": type(exc).__name__,
+                "failure_category": termination_reason,
+                "message": str(exc),
+                "budget_before_call": exc.decision.remaining_run_tokens,
+                "estimated_call_cost": exc.decision.breakdown,
+                "step": state.step,
+                "tool_calls": state.tool_calls,
+            })
+            error_type, error_message = type(exc).__name__, str(exc)
         except ReflectionContractExhausted as exc:
             status = "INCONCLUSIVE"
             termination_reason = "reflection_contract_exhausted"
@@ -2470,7 +3427,11 @@ class DiagnosisHarness:
                 error_type, error_message = type(exc).__name__, str(exc)
         except Exception as exc:
             status = "FAILED"
-            termination_reason = self._failure_category(exc)
+            # Inner bounded loops may already have recorded a more specific
+            # terminal cause (for example tool_contract_repair_exhausted).
+            # Do not overwrite that cause with generic runtime_failure.
+            if not termination_reason:
+                termination_reason = self._failure_category(exc)
             failure_payload = {
                 "error_type": type(exc).__name__, "failure_category": termination_reason,
                 "message": str(exc),
@@ -2481,6 +3442,10 @@ class DiagnosisHarness:
                 failure_payload["planner_metadata"] = planner_metadata
             trace.record("INCIDENT_FAILED", failure_payload)
             error_type, error_message = type(exc).__name__, str(exc)
+        if status == "PASS":
+            transition_phase("DONE", termination_reason or "review_pass")
+        else:
+            transition_phase("INCONCLUSIVE", termination_reason or "terminal_failure")
         terminal_budget = budget_snapshot("terminal")
         trace.record("INCIDENT_COMPLETED", {
             "status": status, "termination_reason": termination_reason,
@@ -2489,8 +3454,10 @@ class DiagnosisHarness:
         })
         trace.record("INCIDENT_FINISHED", {
             "status": status, "termination_reason": termination_reason,
+            "failure_category": self._termination_failure_category(status, termination_reason),
             "steps": state.step, "tool_calls": state.tool_calls,
         })
+        failure_category = self._termination_failure_category(status, termination_reason)
         return IncidentRunResult(
             case_id=case.case_id, status=status, candidate=candidate, review=decision,
             evidence=incident_evidence(), hypotheses=tuple(hypotheses), actions=tuple(actions),
@@ -2511,10 +3478,14 @@ class DiagnosisHarness:
                 ),
                 termination_reason=termination_reason,
                 reflection_calls=reflection_calls,
+                reflection_delta_accepts=reflection_delta_accepts,
+                reflection_no_delta_count=reflection_no_delta_count,
                 duplicate_calls=duplicate_calls,
                 circuit_open_count=tool_circuit.open_count,
                 blocked_tool_call_count=blocked_tool_call_count,
                 schema_repair_count=schema_repair_count,
+                contract_repair_count=contract_repair_calls,
+                review_recovery_cycles=review_recovery_cycles,
                 obligation_created_count=obligation_created_count,
                 obligation_blocked_count=obligation_blocked_count,
                 blocking_contradiction_count=blocking_contradiction_count,
@@ -2522,7 +3493,7 @@ class DiagnosisHarness:
             ),
             trace_path=str(trace.path),
             error_type=error_type, error_message=error_message,
-            failure_category=termination_reason if status == "FAILED" else "",
+            failure_category=failure_category,
         )
 
     @staticmethod
@@ -2677,6 +3648,36 @@ class DiagnosisHarness:
         return "runtime_failure"
 
     @staticmethod
+    def _termination_failure_category(status: str, termination_reason: str) -> str:
+        """Normalize terminal causes without collapsing Provider and Agent errors."""
+        if status == "PASS" or not termination_reason:
+            return ""
+        reason = str(termination_reason).casefold()
+        if "planner_contract" in reason:
+            return "planner_contract_failure"
+        if "tool_contract" in reason:
+            return "tool_contract_failure"
+        if "review_contract" in reason:
+            return "review_provider_failure"
+        if "review_feedback" in reason or "review_unresolved" in reason:
+            return "convergence_failure"
+        if "provider_timeout_after_review" in reason or (
+            "review" in reason and "timeout" in reason
+        ):
+            return "review_provider_failure"
+        if "provider_timeout" in reason or "provider_failure" in reason:
+            return "provider_failure"
+        if "budget" in reason:
+            return "budget_failure"
+        if "no_progress" in reason or "review_bound" in reason or "convergence" in reason:
+            return "convergence_failure"
+        if "finalization" in reason or "sufficient_hypothesis" in reason:
+            return "semantic_reasoning_failure"
+        if "evaluation" in reason:
+            return "evaluation_failure"
+        return "runtime_failure"
+
+    @staticmethod
     def _planner_control_state(case, hypotheses, actions, review_feedback,
                                *, tool_budget_remaining: int,
                                agent_steps_remaining: int, llm_calls_remaining: int | None = None,
@@ -2687,16 +3688,18 @@ class DiagnosisHarness:
                                reflection_feedback: str = "",
                                tool_health: dict[str, Any] | None = None,
                                reflection_trigger: str = "",
+                               next_action_constraint: str = "",
                                entities: Any | None = None,
                                capabilities: Any | None = None,
                                router_decision: Any | None = None,
-                               prior_context: Any | None = None) -> dict[str, Any]:
+                               prior_context: Any | None = None,
+                               compact: bool = False) -> dict[str, Any]:
         current = hypotheses[-1] if hypotheses else None
         visible_actions = [
             {key: value for key, value in action.items() if key != "observation_id"}
             for action in actions[-8:]
         ]
-        return {
+        payload = {
             "INCIDENT": {"summary": case.summary, "system": case.system, "namespace": case.namespace},
             "ENTITIES": entities.model_dump(mode="json") if hasattr(entities, "model_dump") else {},
             "CAPABILITIES": capabilities.model_dump(mode="json") if hasattr(capabilities, "model_dump") else {},
@@ -2743,6 +3746,7 @@ class DiagnosisHarness:
             "REVIEW_FEEDBACK": review_feedback or None,
             "REFLECTION_FEEDBACK": reflection_feedback or None,
             "REFLECTION_TRIGGER": reflection_trigger or None,
+            "NEXT_ACTION_CONSTRAINT": next_action_constraint or None,
             "TOOL_HEALTH": tool_health or {},
             "SOURCE_CAPABILITIES": {
                 "source_workspace_available": bool(source_workspace_available),
@@ -2756,6 +3760,36 @@ class DiagnosisHarness:
                 source_evidence_ids=source_evidence_ids,
             ),
         }
+        if not compact:
+            return payload
+        # The envelope protocol already carries Planner controls once. Keep
+        # one compact state projection here as well: old payloads repeated
+        # PREVIOUS_ACTIONS/RECENT_ACTIONS, full hypothesis plus projections,
+        # and obligations/contradictions plus summaries.
+        compact_hypothesis = None
+        if current is not None:
+            compact_hypothesis = {
+                "claim": current.claim,
+                "evidence_gap": current.evidence_gap,
+                "component": current.component,
+                "fault": current.fault,
+                "fault_code": current.fault_code,
+                "mechanism": current.mechanism,
+                "supporting_evidence_ids": list(current.supporting_evidence_ids),
+                "contradicting_evidence_ids": list(current.contradicting_evidence_ids),
+                "required_gaps": list(current.required_gaps),
+                "evidence_sufficient": current.evidence_sufficient,
+                "source_mechanism_status": current.source_mechanism_status,
+                "stable_rounds": current.stable_rounds,
+            }
+        compact_payload = dict(payload)
+        compact_payload["CURRENT_HYPOTHESIS"] = compact_hypothesis
+        for key in (
+            "VERIFICATION_OBLIGATIONS", "CONTRADICTIONS", "PREVIOUS_ACTIONS",
+            "SOURCE_CAPABILITIES",
+        ):
+            compact_payload.pop(key, None)
+        return compact_payload
 
     @staticmethod
     def _source_mechanism_coverage(
@@ -2932,12 +3966,23 @@ def _call_in_terminable_process(method, args, kwargs, timeout_seconds: float,
     if error_type in {"LLMError", "LLMTransportTimeout"}:
         raise LLMError(message)
     if error_type in {"PlannerContractError", "NativePlannerContractError"}:
-        raise PlannerContractError(message)
+        # The provider runs in a terminable child process.  Reconstruct the
+        # contract exception with its bounded metadata so raw provider-visible
+        # output and normalized arguments survive the process boundary.
+        restored = PlannerContractError(
+            message,
+            validation_errors=(metadata or {}).get("validation_errors", [])
+            if isinstance(metadata, dict) else [],
+            output=(metadata or {}) if isinstance(metadata, dict) else {},
+        )
+        if isinstance(metadata, dict):
+            restored.metadata.update(metadata)
+        raise restored
     if error_type == "ReflectionContractExhausted":
         raise ReflectionContractExhausted(message)
     if error_type == "ReviewSchemaError":
         raise ReviewSchemaError(message)
-    if error_type == "PromptBudgetExceeded":
+    if error_type in {"PromptBudgetExceeded", "RunBudgetAdmissionExceeded"}:
         from debug_assistant.harness.dynamic_budget import PromptBudgetDecision
         metadata = metadata if isinstance(metadata, dict) else {}
         decision = PromptBudgetDecision(
@@ -2945,13 +3990,15 @@ def _call_in_terminable_process(method, args, kwargs, timeout_seconds: float,
             estimated_prompt_tokens=int(metadata.get("estimated_prompt_tokens", 0) or 0),
             input_hard_capacity=metadata.get("input_hard_capacity"),
             state=BudgetState(str(metadata.get("state", "HARD_PRESSURE"))),
-            remaining_run_tokens=0,
+            remaining_run_tokens=int(metadata.get("remaining_run_tokens", 0) or 0),
             terminal_reserve_tokens=0,
             terminal_reserve_llm_calls=0,
             breakdown=dict(metadata.get("breakdown") or {}),
             compaction_required=True,
-            reason="prompt is at the physical input boundary",
+            reason=str(metadata.get("reason") or "prompt is at the physical input boundary"),
         )
+        if error_type == "RunBudgetAdmissionExceeded":
+            raise RunBudgetAdmissionExceeded(decision)
         raise PromptBudgetExceeded(decision)
     raise RuntimeError(f"provider child failed with {error_type}: {message}")
 

@@ -1,221 +1,285 @@
 # Debug Assistant Agent
 
-debug-assistant-agent is a production-oriented, read-only repository diagnosis
-and localization agent. It inspects issue text, source files, tests, git history,
-repository indexes, and tool observations, then produces an evidence-backed
-diagnosis. It does not edit repositories, generate patches, or claim that a
-code change was applied.
+一个面向云运维和代码故障排查的只读 Agent Runtime。
 
-The current runtime version is **1.5.2 — Typed Agent Runtime / Production Hardening**.
+项目让大模型通过受控工具调查故障现场，围绕运行状态、配置、日志、依赖和源码建立证据链，最终输出带证据引用的根因候选。模型负责语义判断，确定性 Runtime 负责工具权限、状态转移、预算和安全边界。
 
-## ReAct control loop
+## Features
 
-The main investigation loop follows the ReAct pattern:
-
-**Reason → Act → Observe → Reflect → Reason**
-
-`Planner` performs the reasoning and chooses the next tool intent. The
-`ToolOrchestrator` validates and executes the action (Act). Tool results,
-source coverage, and evidence records provide environmental feedback (Observe).
-`Reflection` and `SemanticReducer` review that feedback, update the derived
-internal state, and select the conditions for the next reasoning round (Reflect
-→ Reason).
-
-This is a dynamic loop, not a fixed sequence of repository steps. The harness
-may route, retry, expand, parallelize, or reject an action based on the current
-state and budget. The number of iterations is determined by deterministic
-termination and safety conditions described below.
+- **Evidence-grounded diagnosis**：区分 `Observation`、`Evidence` 和 `Hypothesis`，避免把模型猜测直接当成事实。
+- **Typed tool calling**：使用结构化契约校验工具名、参数和输出，支持原生 Tool Calling 与有界 JSON fallback。
+- **Deterministic Agent Runtime**：统一处理 Planner、Reflection、Review、重试、预算、超时、循环防护和终止。
+- **Read-only by design**：只读访问仓库、故障快照和受限源码，不执行修复命令，不修改目标代码。
+- **Auditable execution**：保留 `run.json`、`trace.jsonl` 和 Evidence provenance，支持回放与问题定位。
+- **Separated evaluation**：运行时诊断、候选 Review 和运行后 Evaluator 相互隔离，避免诊断过程依赖标准答案。
+- **Failure-aware engineering**：区分 Provider、Contract、Runtime、Budget、Convergence 和 semantic reasoning 等失败类型。
 
 ## Architecture
 
-The runtime separates model proposals from deterministic execution and semantic
-state management:
+```text
+Issue / Incident Snapshot
+            │
+            ▼
+DiagnosisHarness
+  ├─ Budget / Deadline / Loop Guard / Retry
+  ├─ Capability Detection / Routing
+  └─ Context Manager
+            │
+            ▼
+Planner ──► Skill ──► Read-only Tool Registry
+                              │
+                              ▼
+                    Observation Store
+                              │
+                              ▼
+                       Evidence Memory
+                              │
+                              ▼
+                 Hypothesis / Obligations / Contradictions
+                              │
+                 ┌────────────┴────────────┐
+                 ▼                         ▼
+          Finalization Gate            Reflection
+                 │
+                 ▼
+             Final Review
+                 │
+                 ▼
+       Diagnosis Result + Trace + Metrics
+```
 
-~~~text
-CLI
-  |
-  v
-AppConfig + AgentHarness
-  |
-  +-- RunDeadline / BudgetController / provider health
-  +-- SafeRepositoryFS + path resolver + repository index/chunks
-  +-- lexical search + optional semantic embeddings + hybrid ranking
-  |
-  v
-Planner capability negotiation
-  |
-  +-- native typed tool calls, when the provider supports them
-  +-- bounded structured-JSON planner fallback otherwise
-  |
-  v
-ToolRegistry + ToolOrchestrator
-  |
-  +-- Pydantic argument validation
-  +-- read-range expansion/splitting with provenance
-  +-- bounded parallel read-only actions
-  +-- serial execution, retry, route and loop guards
-  |
-  v
-ObservationStore + EvidenceMemory + ReadCoverageIndex
-  |
-  +-- information needs and evidence obligations
-  +-- context catalog, lifecycle and budget packing
-  +-- source/file/symbol/range compatibility checks
-  |
-  v
-Typed Reflection -> SemanticReducer -> semantic invariants
-  |
-  +-- derive evidence sufficiency and terminal status from committed evidence
-  +-- prevent satisfied/superseded obligations from being reopened
-  +-- split a new obligation when the same source needs a different goal type
-  |
-  v
-Bounded Reporter -> final report + trace + localization metrics
-~~~
+### Core components
 
-The LLM proposes actions and semantic input. The harness validates tool
-arguments, enforces the read-only boundary, records observations and evidence,
-and commits semantic state only after invariant validation. Reflection output
-cannot directly overwrite the derived hypothesis status.
+| Component | Responsibility |
+|---|---|
+| `DiagnosisHarness` | 管理一次诊断任务的生命周期、状态、预算、工具和终止条件 |
+| `Planner` | 根据当前上下文和证据缺口选择下一步调查动作 |
+| `Skill` | 表达服务调查、配置调查、日志调查、代码调查等调查意图 |
+| `Tool Registry` | 暴露经过权限和参数校验的只读工具 |
+| `ObservationStore` | 保存工具返回的完整原始观察 |
+| `EvidenceMemory` | 将满足来源、范围和引用约束的观察晋升为可引用证据 |
+| `ContextManager` | 根据假设、证据、矛盾和预算组装下一轮模型上下文 |
+| `Finalization Gate` | 在提交候选前检查字段、证据、验证义务和矛盾 |
+| `Final Review` | 审核候选与所引用证据是否自洽 |
+| `Evaluator` | 在运行结束后独立计算诊断质量和运行指标 |
 
-### Main runtime components
+核心原则是：
 
-- AgentHarness owns the per-task lifecycle, shared cooperative deadline,
-  budgets, retries, convergence, trace recording, and finalization.
-- RepositoryIndex, SafeRepositoryFS, and the search engine provide bounded
-  repository discovery. Search results are discovery evidence; relevant hits
-  must be followed by a bounded source read before they become source evidence.
-- ToolRegistry exposes only read-only tools such as tree listing, grep, symbol
-  lookup, source reads, git history, and test discovery.
-- ToolOrchestrator turns typed requests into validated, bounded execution plans.
-  Short source reads may be widened for context, while the original requested
-  range is retained in metadata.
-- EvidenceObligationTracker and ReadCoverageIndex preserve provenance and
-  distinguish location obligations from semantic behavior/causality obligations.
-  Terminal obligation goal types are immutable.
-- TypedReflection, SemanticReducer, and semantic_invariants form the semantic
-  transaction boundary. Malformed individual review rows are isolated without
-  discarding valid reflection fields.
-- Reporter applies context and evidence limits. A deterministic fallback
-  reporter is used when provider output is unavailable or violates its contract.
+> **LLM owns semantic reasoning; Runtime owns structure and control.**
 
-## Design principle: semantic LLM, structural harness
+模型可以提出调查动作和诊断解释，但不能绕过工具白名单、路径限制、Evidence 校验、预算或终止条件。
 
-The central boundary is: **the LLM owns semantic interpretation; the harness
-owns structure and state transitions**.
+## Supported scenarios
 
-- The LLM supplies reasoning, diagnosis hypotheses, and tool-selection intent;
-  it does not directly mutate runtime state or repository files.
-- Every tool request is checked against its typed Pydantic argument model before
-  execution.
-- `SemanticReducer` derives hypothesis status, evidence sufficiency, and
-  required gaps from committed evidence. The invariant validator checks the
-  resulting semantic transaction.
-- Invalid model output is isolated through bounded contract repair,
-  sanitization, or deterministic fallback. It is never allowed to pollute the
-  committed semantic state.
+当前主路径面向 Online Boutique / Cloud-OpsBench 风格的微服务故障，也保留通用代码仓库诊断能力。
 
-## Deterministic termination conditions
+典型调查对象包括：
 
-The harness, rather than the LLM, decides when the ReAct loop can stop:
+- Service、Endpoint、Pod、Deployment 与容器端口配置；
+- HTTP / gRPC 健康探针与服务协议；
+- 服务依赖、路由、连接性和错误日志；
+- 运行状态、配置和源码行为之间的因果关系；
+- 代码仓库中的问题定位、源码读取和测试发现。
 
-- **Active success:** finalization is allowed only when the derived hypothesis
-  is `supported` or `confirmed`, has supporting evidence, has
-  `evidence_sufficient=true`, has no contradiction, and has no required gaps.
-- **Semantic convergence:** when `semantic_no_progress_streak` reaches its
-  configured threshold after successful semantic transactions, the harness
-  stops spending effort on unchanged state and moves to conservative
-  finalization. This is not a claim that the diagnosis is supported; the final
-  report preserves any remaining uncertainty.
-- **Resource budget:** exploration is bounded by `max_steps`,
-  `max_llm_calls`, `max_tool_calls`, `max_total_tokens`, and
-  `max_wall_time_seconds`. The shared wall-clock deadline also reserves time
-  for cleanup and reporting.
-- **Failure degradation:** repeated Reflection failures reach the configured
-  `max_consecutive_reflection_failures` limit; repeated invalid Planner
-  contracts reach the configured Planner contract failure limit. The runtime
-  then stops retrying that path and either finalizes from available evidence or
-  returns a bounded failure, according to the current evidence and stage.
+输出是带有组件、故障、机制、证据 ID、置信度和不确定性的诊断候选，不是自动生成或执行的代码补丁。
 
-These are deterministic Harness rules. A model response cannot increase a
-budget, reopen a terminal obligation, bypass an invariant, or force the runtime
-to continue after a terminal condition.
+## Quick start
 
-## Design decision: one agent with a deterministic harness
+### Requirements
 
-The project deliberately uses one ReAct agent coordinated by a deterministic
-harness instead of LangGraph, AutoGen, or a multi-agent topology. Repository
-debugging is primarily a depth-first evidence and causal reasoning chain; the
-individual tool calls are bounded and only selected safe reads may run in
-parallel. Multiple agents would introduce more state reconciliation and make
-the evidence trail and failure diagnosis harder to audit. Keeping planning,
-execution, semantic reduction, and termination under one typed harness makes
-reliability behavior easier to test and reproduce.
+- Python 3.11+
+- Git
+- 一个支持 OpenAI-compatible Chat Completions API 的模型服务（真实模型运行时）
 
-## Installation
+### 1. Install
 
-~~~bash
+```bash
 python -m venv .venv
 source .venv/bin/activate
+
+python -m pip install --upgrade pip
 pip install -e '.[dev,eval]'
+```
+
+也可以使用 Makefile：
+
+```bash
+make install
+```
+
+### 2. Configure the provider
+
+复制配置模板：
+
+```bash
 cp .env.example .env
-~~~
+```
 
-Set the minimum provider configuration in `.env` or the shell environment:
+编辑 `.env`，至少配置以下字段：
 
-~~~bash
-export DEBUG_AGENT_API_KEY=...
-export DEBUG_AGENT_BASE_URL=https://api.openai.com/v1
-export DEBUG_AGENT_MODEL=gpt-5.6
-~~~
+```dotenv
+DEBUG_AGENT_PROVIDER=openai_compatible
+DEBUG_AGENT_API_KEY=your-api-key
+DEBUG_AGENT_BASE_URL=https://api.openai.com/v1
+DEBUG_AGENT_MODEL=your-model-name
+DEBUG_AGENT_CRITIC_MODEL=your-review-model-name
+```
 
-Keep `.env` local and do not commit credentials. This repository does not
-include SWE-bench data or task workspaces. Download and prepare a compatible
-dataset yourself, then process it through the CLI.
+项目也支持不需要网络的 Mock Provider：
 
-## CLI usage
+```bash
+export DEBUG_AGENT_PROVIDER=mock
+```
 
-Use `debug-assistant --help` as the authoritative entry point for all commands
-and options. For example, a prepared task directory can be used for batch work:
+不要把 API Key、`.env` 或其他凭证提交到 Git。
 
-~~~bash
-debug-assistant run-swe --tasks <task_directory> --output <output_dir>
-~~~
+### 3. Run a local smoke test
 
-## Configuration and runtime guarantees
+```bash
+DEBUG_AGENT_PROVIDER=mock make smoke
+```
 
-Runtime settings are controlled by `DEBUG_AGENT_*` environment variables. The
-main limits include bounded steps, tool calls, LLM calls, token accounting, and
-a shared per-task wall-clock deadline. Native typed tool calling and structured
-reflection are enabled by default; providers without native tool support use
-the bounded structured-JSON fallback. Semantic search is optional and requires
-an embedding provider; lexical search remains available without one.
+该命令使用仓库内的示例问题和示例代码仓库，运行结果写入 `runs/smoke/`。
 
-The runtime is read-only by construction: repository paths are scoped to the
-task workspace, git operations are read-only, and test discovery does not
-install packages or mutate the repository. Sensitive provider values are
-redacted from runtime artifacts.
+### 4. Diagnose a local repository
 
-## Traces and metrics
+准备一个问题描述文件和目标仓库目录后执行：
 
-Tasks emit JSONL traces containing lifecycle, tool, evidence, obligation,
-reflection, budget, and finalization events. The evaluation tools separate
-`fix_localization` (based on `recommended_change_points`) from `exploration`
-(based on `likely_files` and trace evidence), alongside runtime health
-indicators such as fallbacks, route rejections, partial results, and forced
-finalization. See [docs/evaluation.md](docs/evaluation.md) for the formal
-schema and metric definitions.
+```bash
+debug-assistant diagnose \
+  --issue examples/issues/example_issue.md \
+  --repo examples/fixture_repo \
+  --output runs/local-diagnosis \
+  --task-id local-example
+```
 
-## Versioned experiments
+真实 Provider 运行时，先完成 `.env` 配置；使用 Mock Provider 时不需要 API Key。
 
-Experiment outputs are managed in versioned directories. Single-task and batch
-experiments can both be run through the CLI; use `debug-assistant --help` for
-the supported command and argument format.
+### 5. Run a CloudOps incident snapshot
 
-## Development checks
+项目提供了基于快照的 Incident Diagnosis 入口：
 
-~~~bash
-python -m pytest -q
-python -m compileall -q src tests
-git diff --check
-~~~
+```bash
+DEBUG_AGENT_PROVIDER=mock python -m debug_assistant.incidents \
+  --runtime-case tests/fixtures/cloudops/case_10/runtime \
+  --output runs/cloudops-diagnosis \
+  --topology data/online_boutique/service_topology.json
+```
+
+如果需要在运行结束后加载本地评测数据，可以额外传入：
+
+```bash
+  --evaluator tests/fixtures/cloudops/case_10/evaluator
+```
+
+Evaluator 只在诊断运行产物写入后加载，不会进入 Agent 的运行时上下文。
+
+### 6. Inspect traces and run metrics
+
+```bash
+debug-assistant trace-metrics \
+  --trace runs/cloudops-diagnosis/traces/<trace-file>.jsonl
+```
+
+一次运行通常会产生运行结果、JSONL Trace 和指标文件，可用于检查工具调用、Evidence、状态转移、预算和终止原因。
+
+### 7. Run tests
+
+```bash
+pytest -q
+```
+
+或：
+
+```bash
+make test
+```
+
+## CLI overview
+
+```bash
+debug-assistant --help
+```
+
+主要命令：
+
+| Command | Purpose |
+|---|---|
+| `diagnose` | 对本地问题描述和仓库执行只读诊断 |
+| `diagnose-task` | 运行一个已准备好的任务目录 |
+| `prepare-swe` | 准备代码仓库诊断任务 |
+| `run-swe` | 批量运行已准备的任务 |
+| `trace-metrics` | 汇总 JSONL Trace 指标 |
+| `eval-localization` | 评估代码定位结果 |
+| `eval-retrieval` | 评估检索结果 |
+
+CloudOps 快照路径使用独立入口：
+
+```bash
+python -m debug_assistant.incidents --help
+```
+
+## Configuration
+
+运行时参数通过环境变量配置，常用配置包括：
+
+| Variable | Description | Default |
+|---|---|---:|
+| `DEBUG_AGENT_MAX_STEPS` | 最大决策步数 | `20` |
+| `DEBUG_AGENT_MAX_TOOL_CALLS` | 最大工具调用数 | `45` |
+| `DEBUG_AGENT_MAX_LLM_CALLS` | 最大模型调用数 | `40` |
+| `DEBUG_AGENT_MAX_TOTAL_TOKENS` | 单任务 Token 预算 | `180000` |
+| `DEBUG_AGENT_MAX_WALL_TIME_SECONDS` | 单任务最大运行时间 | `900` |
+| `DEBUG_AGENT_MAX_CONTEXT_CHARS` | 单轮上下文字符预算 | `50000` |
+| `DEBUG_AGENT_NATIVE_TOOL_CALLING` | 是否启用原生工具调用 | `1` |
+| `DEBUG_AGENT_STRUCTURED_REFLECTION` | 是否启用结构化 Reflection | `1` |
+| `DEBUG_AGENT_SEMANTIC_SEARCH` | 是否启用语义检索 | `1` in template |
+
+完整默认配置见 `.env.example`。如果没有 Embedding Provider，关闭 `DEBUG_AGENT_SEMANTIC_SEARCH` 后仍可使用词法检索和基础诊断能力。
+
+## Repository layout
+
+```text
+src/debug_assistant/
+├── agent/          # Planner、Reflection、Review、Reporter
+├── context/        # Context Manager 与上下文投影
+├── harness/        # Budget、Deadline、Retry、Loop Guard、Trace
+├── incidents/      # CloudOps Incident Runtime
+├── memory/         # Observation、Evidence、Hypothesis 生命周期
+├── tools/          # Repository / Snapshot / Source Tool Registry
+├── evaluation/     # 运行后评测与 Trace 指标
+├── knowledge/      # 可选的领域知识与检索能力
+└── repository/     # 仓库索引、搜索和安全文件访问
+
+tests/              # 单元测试、契约测试和 Runtime 测试
+examples/           # 本地运行示例
+data/               # 本地数据和快照资源
+```
+
+## Safety model
+
+- 模型输出先经过结构化解析和 Pydantic contract 校验；
+- 工具必须存在于 Registry 且参数满足对应 Schema；
+- 仓库访问受路径边界约束，默认只读；
+- Tool、LLM、Token、时间和重复动作都有上限；
+- Provider 超时、契约错误和工具失败会进入有界重试或明确失败；
+- 原始 Observation、可引用 Evidence 和最终 Candidate 分层保存；
+- Gold / Evaluator 数据不参与 Agent 运行时决策。
+
+## Development
+
+```bash
+# 安装开发依赖
+make install
+
+# 运行测试
+make test
+
+# 运行示例 smoke test
+make smoke
+
+# 清理本地运行产物
+make clean
+```
+
+项目适合用于研究 Agent Runtime、上下文工程、证据链、工具调用契约和可审计故障诊断。

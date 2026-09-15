@@ -117,6 +117,54 @@ class ReflectionContradictionReview(BaseModel):
     reason: str = Field(min_length=1)
 
 
+class ReflectionHypothesisDelta(BaseModel):
+    """Provider proposal for a semantic hypothesis change.
+
+    The proposal contains no runtime-owned version or identifier.  The
+    Harness compares its canonical fields with the current hypothesis before
+    accepting it and assigns the next version in the trace.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    claim: str = ""
+    component: str = ""
+    fault: str = ""
+    fault_code: str = ""
+    fault_explanation: str = ""
+    mechanism: str = ""
+    source_mechanism_status: SourceMechanismStatus | None = None
+    supporting_evidence_ids: tuple[EvidenceId, ...] = ()
+    contradicting_evidence_ids: tuple[EvidenceId, ...] = ()
+
+
+class ReflectionEvidenceGapProposal(BaseModel):
+    """A gap proposal without a model-controlled gap ID."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    claim: str = Field(min_length=1)
+    critical: bool = True
+
+
+class ReflectionObligationProposal(BaseModel):
+    """A new obligation proposal; ID and lifecycle status belong to Runtime."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    claim: str = Field(min_length=1)
+    critical: bool = True
+    supporting_evidence_ids: tuple[EvidenceId, ...] = ()
+
+
+class ReflectionContradictionUpdate(BaseModel):
+    """A bounded update to a contradiction keyed by a canonical Evidence ID."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    evidence_id: EvidenceId
+    claim: str = Field(min_length=1)
+    severity: ContradictionSeverity = "BLOCKING"
+    status: ContradictionStatus = "OPEN"
+    reason: str = Field(min_length=1)
+
+
 class ReflectionFeedback(BaseModel):
     """Structured output of the incident Reflection Agent.
 
@@ -132,6 +180,13 @@ class ReflectionFeedback(BaseModel):
     contradicting_evidence_ids: tuple[EvidenceId, ...] = ()
     obligation_reviews: tuple[ReflectionObligationReview, ...] = ()
     contradiction_reviews: tuple[ReflectionContradictionReview, ...] = ()
+    # Structured Delta is additive to the legacy feedback fields.  Runtime
+    # accepts only a real canonical change and owns IDs/status/versioning.
+    hypothesis_delta: ReflectionHypothesisDelta = Field(default_factory=ReflectionHypothesisDelta)
+    proposed_evidence_gaps: tuple[ReflectionEvidenceGapProposal, ...] = ()
+    proposed_obligations: tuple[ReflectionObligationProposal, ...] = ()
+    contradiction_updates: tuple[ReflectionContradictionUpdate, ...] = ()
+    next_action_constraint: str = ""
     hypothesis_stable: bool = False
     highest_information_gain_direction: str = ""
     reason: str = Field(min_length=1)
@@ -344,13 +399,61 @@ class RootCauseCandidate(BaseModel):
         return self
 
 
+class ReviewRecoverability(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    recoverable: bool = False
+    unrecoverable: bool = False
+
+
 class ReviewDecision(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_review_contract(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        result = dict(value)
+        if "decision" not in result:
+            for alias in ("outcome", "status"):
+                if alias in result:
+                    result["decision"] = result.pop(alias)
+                    break
+        decision = str(result.get("decision") or "").strip().upper()
+        result["decision"] = {
+            "ACCEPT": "PASS", "ACCEPTED": "PASS", "PASS": "PASS",
+            "REJECTED": "REJECT", "FAIL": "REJECT", "FAILED": "REJECT",
+        }.get(decision, result.get("decision"))
+        decision = str(result.get("decision") or "").strip().upper()
+        if "blocking_contradictions" not in result and "contradictions" in result:
+            result["blocking_contradictions"] = result["contradictions"]
+        if "contradictions" not in result and "blocking_contradictions" in result:
+            result["contradictions"] = result["blocking_contradictions"]
+        if "targeted_followup" not in result and "suggested_investigation" in result:
+            result["targeted_followup"] = result["suggested_investigation"]
+        if "suggested_investigation" not in result and "targeted_followup" in result:
+            result["suggested_investigation"] = result["targeted_followup"]
+        if "recoverability" not in result:
+            has_followup = decision != "PASS" and bool(
+                result.get("missing_evidence")
+                or result.get("blocking_contradictions")
+                or result.get("targeted_followup")
+                or result.get("suggested_investigation")
+            )
+            result["recoverability"] = {
+                "recoverable": has_followup,
+                "unrecoverable": False,
+            }
+        return result
+
     decision: Literal["PASS", "REJECT"]
     unsupported_claims: tuple[str, ...] = ()
     missing_evidence: tuple[str, ...] = ()
     contradictions: tuple[str, ...] = ()
+    blocking_contradictions: tuple[str, ...] = ()
     suggested_investigation: str = ""
+    targeted_followup: str = ""
+    recoverability: ReviewRecoverability = Field(default_factory=ReviewRecoverability)
     reason: str = Field(min_length=1)
     causal_chain_valid: bool = True
     causal_gaps: tuple[str, ...] = ()
@@ -375,10 +478,14 @@ class IncidentMetrics(BaseModel):
     tool_calls_after_evidence_sufficient: int = 0
     termination_reason: str = ""
     reflection_calls: int = 0
+    reflection_delta_accepts: int = 0
+    reflection_no_delta_count: int = 0
     duplicate_calls: int = 0
     circuit_open_count: int = 0
     blocked_tool_call_count: int = 0
     schema_repair_count: int = 0
+    contract_repair_count: int = 0
+    review_recovery_cycles: int = 0
     obligation_created_count: int = 0
     obligation_blocked_count: int = 0
     blocking_contradiction_count: int = 0

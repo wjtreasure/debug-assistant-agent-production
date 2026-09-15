@@ -78,6 +78,7 @@ class MockLLMClient(LLMClient):
                 return LLMResponse(
                     content=raw.get("content"), structured=raw.get("structured"),
                     tool_calls=tuple(raw_calls), usage=self.last_usage,
+                    raw_output=dict(raw.get("raw_output") or {}),
                 )
         calls=[]
         for index, raw in enumerate(self._tool_calls):
@@ -86,4 +87,15 @@ class MockLLMClient(LLMClient):
             else:
                 calls.append(LLMToolCall(str(raw.get("id", f"mock-call-{index + 1}")),
                                          str(raw["name"]), dict(raw.get("arguments") or {})))
-        return LLMResponse(content="", structured=None, tool_calls=tuple(calls), usage=self.calls[-1])
+        return LLMResponse(
+            content="", structured=None, tool_calls=tuple(calls), usage=self.calls[-1],
+            raw_output={
+                "content": "",
+                "tool_calls": [
+                    {"id": call.id, "type": "function", "function": {
+                        "name": call.name, "arguments": dict(call.arguments),
+                    }}
+                    for call in calls
+                ],
+            },
+        )

@@ -172,6 +172,9 @@ class LLMResponse:
     structured: Any = None
     tool_calls: tuple[LLMToolCall, ...] = field(default_factory=tuple)
     usage: Mapping[str, Any] = field(default_factory=dict)
+    # Bounded provider-safe material for contract audits. Adapters must omit
+    # hidden reasoning fields and credentials.
+    raw_output: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def has_tool_calls(self) -> bool:

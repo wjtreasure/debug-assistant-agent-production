@@ -437,6 +437,59 @@ class ContextManager:
         self._last_selected_ids=current_ids
         self._last_lifecycle={x.context_id:('active' if x.context_id in current_ids else 'cold') for x in items}
 
+        # Quality telemetry is intentionally separate from token reduction. A
+        # shorter context is not an improvement if critical Evidence or an
+        # open verification obligation disappears. The Runtime control prefix
+        # is counted as the authoritative external state when the manager is
+        # called in its split-control mode.
+        current_hypothesis = state.current_hypothesis or {}
+        critical_evidence_ids = set(current_hypothesis.get('supporting_evidence_ids') or [])
+        critical_evidence_ids.update(current_hypothesis.get('contradicting_evidence_ids') or [])
+        for obligation in current_hypothesis.get('verification_obligations') or ():
+            if isinstance(obligation, dict):
+                critical_evidence_ids.update(obligation.get('supporting_evidence_ids') or [])
+        selected_evidence_ids = {
+            str(item.get('id')) for item in selected_meta if item.get('citable')
+        }
+        critical_retained = (
+            len(critical_evidence_ids.intersection(selected_evidence_ids))
+            / len(critical_evidence_ids)
+            if critical_evidence_ids else 1.0
+        )
+        open_obligation_ids = {
+            str(item.get('id')) for item in current_hypothesis.get('verification_obligations') or ()
+            if isinstance(item, dict) and item.get('status') == 'OPEN'
+            and item.get('blocks_finalization')
+        }
+        blocking_contradiction_ids = {
+            str(item.get('evidence_id')) for item in current_hypothesis.get('contradictions') or ()
+            if isinstance(item, dict) and item.get('status') == 'OPEN'
+            and item.get('blocks_finalization')
+        }
+        # In split-control mode these IDs are rendered by the external
+        # AGENT_CONTROL_STATE/PLANNER_STATE prefix, so retention is evaluated
+        # against the complete planner input rather than manager text alone.
+        planner_input_has_external_state = external_context_chars > 0 and not include_agent_control_state
+        obligation_retention = (
+            sum(1 for oid in open_obligation_ids if oid in text or planner_input_has_external_state)
+            / len(open_obligation_ids) if open_obligation_ids else 1.0
+        )
+        contradiction_retention = (
+            sum(1 for cid in blocking_contradiction_ids if cid in text or planner_input_has_external_state)
+            / len(blocking_contradiction_ids) if blocking_contradiction_ids else 1.0
+        )
+        rehydrate_requested_count = len(self._rehydrate_requests)
+        rehydrated_success_count = sum(
+            1 for item in selected_meta
+            if str(item.get('projection_reason', '')).startswith('rehydrated_')
+        )
+        duplicate_observation_count = sum(
+            1 for observation in observation_store.all()
+            if (memory.evidence_for_observation(observation.observation_id) is not None
+                and memory.evidence_for_observation(observation.observation_id).raw_observation_id
+                != observation.observation_id)
+        )
+
         breakdown={
             'issue_chars':len(issue),
             'recent_actions_chars':len(recent_actions),
@@ -455,12 +508,21 @@ class ContextManager:
                 1 for m in selected_meta if m.get('projection_reason','').startswith('rehydrated_')
             ),
             'duplicate_observations_collapsed':sum(
-                1 for observation in observation_store.all()
-                if (memory.evidence_for_observation(observation.observation_id) is not None
-                    and memory.evidence_for_observation(observation.observation_id).raw_observation_id
-                    != observation.observation_id)
+                1 for _ in range(duplicate_observation_count)
             ),
             'manager_control_state_truncated':int(control_state_truncated),
+            'critical_evidence_retention': critical_retained,
+            'open_obligation_retention': obligation_retention,
+            'blocking_contradiction_retention': contradiction_retention,
+            'duplicate_context_ratio': (
+                duplicate_observation_count / max(1, len(observation_store.all()))
+            ),
+            'rehydration_requested_count': rehydrate_requested_count,
+            'rehydration_success_count': rehydrated_success_count,
+            'rehydration_success_rate': (
+                rehydrated_success_count / rehydrate_requested_count
+                if rehydrate_requested_count else 1.0
+            ),
         }
         diagnostic_tokens = max(0, int(estimator(text)))
         breakdown.update({
