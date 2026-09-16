@@ -1,4 +1,5 @@
 from debug_assistant.tools.registry import ToolRegistry
+from debug_assistant.tools.repository import REPOSITORY_SOURCE_MAX_LINES
 
 
 def test_all_tools_have_typed_schema(tmp_path):
@@ -16,7 +17,7 @@ def test_render_exposes_read_file_schema(tmp_path):
     assert 'line_count' in text
     params=ToolRegistry(tmp_path).get('read_file').spec.json_schema()['properties']
     assert 'end_line' not in params
-    assert params['line_count']['maximum']==200
+    assert params['line_count']['maximum']==REPOSITORY_SOURCE_MAX_LINES
     assert 'cost=light' in text
 
 

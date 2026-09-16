@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 import json
 import math
 import multiprocessing
+import inspect
 from hashlib import sha1
 from pathlib import Path
 import time
@@ -50,6 +51,13 @@ from debug_assistant.llm.base import LLMDeadlineExceeded, LLMError, complete_jso
 from debug_assistant.llm.base import ModelCapability
 from debug_assistant.skills.catalog import INCIDENT_SKILLS
 from debug_assistant.tools.cloudops_snapshot import CloudOpsSnapshotToolRegistry
+
+
+# Runtime-owned convergence controls. The provider adapter carries the
+# reasoning limit as a bounded completion envelope for tool-call JSON.
+CONVERGE_MAX_REASONING_TOKENS = 2_000
+CONVERGE_MAX_OUTPUT_TOKENS = 3_000
+CONVERGE_MAX_READ_FILE_CALLS = 3
 
 
 def _safe_planner_metadata_for_trace(exc: Exception) -> dict[str, Any] | None:
@@ -213,10 +221,16 @@ IncidentHarnessConfig = DiagnosisHarnessConfig
 
 
 _OBLIGATION_TRANSITIONS = {
-    "OPEN": {"OPEN", "SATISFIED", "WAIVED_WITH_EVIDENCE", "BLOCKED_BY_CAPABILITY"},
+    "OPEN": {
+        "OPEN", "SATISFIED", "BLOCKED_BY_CAPABILITY",
+        "NOT_APPLICABLE_BY_CAPABILITY",
+    },
     "SATISFIED": {"SATISFIED"},
-    "WAIVED_WITH_EVIDENCE": {"WAIVED_WITH_EVIDENCE"},
-    "BLOCKED_BY_CAPABILITY": {"BLOCKED_BY_CAPABILITY", "WAIVED_WITH_EVIDENCE"},
+    "BLOCKED_BY_CAPABILITY": {
+        "BLOCKED_BY_CAPABILITY",
+        "NOT_APPLICABLE_BY_CAPABILITY",
+    },
+    "NOT_APPLICABLE_BY_CAPABILITY": {"NOT_APPLICABLE_BY_CAPABILITY"},
 }
 _CONTRADICTION_TRANSITIONS = {
     "OPEN": {"OPEN", "RESOLVED", "EXPLAINED"},
@@ -232,8 +246,17 @@ _SOURCE_MECHANISM_OBLIGATION_CLAIM = (
 )
 
 
+def _is_source_mechanism_obligation(obligation: VerificationObligation) -> bool:
+    """Identify the one Runtime-owned source obligation by canonical claim."""
+    return obligation.claim.strip().casefold() == _SOURCE_MECHANISM_OBLIGATION_CLAIM.casefold()
+
+
 class ReviewProgressRequired(RuntimeError):
     """The bounded post-review loop tried to submit an unchanged candidate."""
+
+
+class ConvergenceBudgetExhausted(RuntimeError):
+    """A convergence response exhausted its bounded output envelope."""
 
 
 class DiagnosisHarness:
@@ -272,7 +295,6 @@ class DiagnosisHarness:
         # Keep this state aligned with the provider-facing registry projection;
         # hidden repository primitives remain executable but are not advertised
         # as Planner capabilities.
-        available_code_tools = tools.planner_visible_code_tools()
         source_workspace_available = bool(
             getattr(getattr(tools, "source_binding", None), "available", False)
         )
@@ -282,6 +304,12 @@ class DiagnosisHarness:
             domain_rag=self.knowledge_coordinator.domain_rag,
             knowledge_store=self.knowledge_coordinator.knowledge_store,
             static_graph=self.knowledge_coordinator.static_graph,
+        )
+        # The registry remains the execution authority; the snapshot is the
+        # provider-facing capability projection and starts fail-closed.
+        available_code_tools = tuple(
+            name for name in tools.planner_visible_code_tools()
+            if capabilities.capability_state("application_code") == "AVAILABLE"
         )
         router_decision = HybridRouter().route(case, entities, capabilities)
         query_builder = KnowledgeQueryBuilder()
@@ -365,6 +393,7 @@ class DiagnosisHarness:
         run_started = time.monotonic()
         runtime_phase = "INIT"
         state_transition_count = 0
+        converge_read_file_calls = 0
 
         def transition_phase(target: str, reason: str, **metadata: Any) -> None:
             """Record the only Runtime-owned PLAN/REFLECT/FINALIZE/REVIEW edges."""
@@ -772,6 +801,21 @@ class DiagnosisHarness:
                 },
             )
 
+        def update_capability_state(tool_name: str, observation: ToolObservation) -> None:
+            nonlocal capabilities
+            previous_states = dict(capabilities.states)
+            capabilities = capabilities.observe_tool(tool_name, observation)
+            changed = {
+                key: value for key, value in capabilities.states.items()
+                if previous_states.get(key) != value
+            }
+            if changed:
+                trace.record("CAPABILITY_STATE_UPDATED", {
+                    "tool": tool_name,
+                    "states": changed,
+                    "observation_id": observation.observation_id,
+                })
+
         def execute_tool(tool, arguments: dict[str, Any], tool_name: str) -> ToolObservation:
             nonlocal blocked_tool_call_count
             if not tool_circuit.before_call(tool_name):
@@ -780,7 +824,9 @@ class DiagnosisHarness:
                     "tool": tool_name,
                     "health": tool_circuit.summary().get(tool_name, {}),
                 })
-                return tool_circuit.blocked_observation(tool_name)
+                observation = tool_circuit.blocked_observation(tool_name)
+                update_capability_state(tool_name, observation)
+                return observation
             admit("tool")
             policy = RetryPolicy(
                 max_attempts=self.config.tool_retry_attempts,
@@ -817,13 +863,22 @@ class DiagnosisHarness:
                         "tool": tool_name,
                         "health": tool_circuit.summary().get(tool_name, {}),
                     })
+                update_capability_state(tool_name, observation)
                 return observation
+            normalization_action = (observation.metadata or {}).get("normalization_action")
+            if isinstance(normalization_action, dict):
+                trace.record("PATH_NORMALIZED", {
+                    "tool": tool_name,
+                    "normalization_action": dict(normalization_action),
+                    "observation_id": observation.observation_id,
+                })
             transition = tool_circuit.observe(tool_name, observation)
             if transition == "opened":
                 trace.record("TOOL_CIRCUIT_OPEN", {
                     "tool": tool_name,
                     "health": tool_circuit.summary().get(tool_name, {}),
                 })
+            update_capability_state(tool_name, observation)
             return observation
 
         def incident_evidence() -> tuple[IncidentEvidence, ...]:
@@ -863,13 +918,126 @@ class DiagnosisHarness:
             known_ids = {item.evidence_id for item in evidence_memory.pinned}
             old = hypotheses[-1] if hypotheses else None
 
+            # Source-obligation lifecycle is Runtime-owned.  The provider may
+            # propose a status for audit purposes, but it cannot close or waive
+            # this obligation.  Keep the capability decision deterministic and
+            # reuse EvidenceMemory's canonical read_file/CODE predicate.
+            source_ids = source_evidence_ids()
+            cited_source_ids = tuple(
+                evidence_id for evidence_id in source_ids
+                if evidence_id in set(selection.supporting_evidence_ids)
+            )
+            source_capability_gaps: list[str] = []
+            if not source_workspace_available:
+                source_capability_gaps.append("source_workspace")
+            if "application_code" not in case.evidence_sources:
+                source_capability_gaps.append("application_code")
+            if "read_file" not in available_code_tools:
+                source_capability_gaps.append("read_file")
+            source_capability_gaps = list(dict.fromkeys(source_capability_gaps))
+            source_capability_available = not source_capability_gaps
+
             supplied = list(selection.verification_obligations or ())
             next_obligations: dict[str, VerificationObligation] = {}
             for obligation in supplied:
+                if _is_source_mechanism_obligation(obligation):
+                    # Providers may regenerate the source row with a fresh ID.
+                    # The claim, not the model-chosen ID, is the canonical key.
+                    canonical_source = next(
+                        (
+                            item for item in (*next_obligations.values(), *obligation_state.values())
+                            if _is_source_mechanism_obligation(item)
+                        ),
+                        None,
+                    )
+                    if canonical_source is not None and obligation.id != canonical_source.id:
+                        trace.record("SOURCE_OBLIGATION_ID_NORMALIZED", {
+                            "proposed_id": obligation.id,
+                            "canonical_id": canonical_source.id,
+                            "reason": "runtime_owned_source_obligation_identity",
+                        })
+                        obligation = obligation.model_copy(update={"id": canonical_source.id})
                 prior = obligation_state.get(obligation.id)
+                if _is_source_mechanism_obligation(obligation):
+                    proposed_status = obligation.status
+                    if source_capability_available:
+                        prior_source_ids = tuple(
+                            evidence_id for evidence_id in (prior.supporting_evidence_ids if prior else ())
+                            if evidence_id in set(source_ids)
+                        )
+                        runtime_status = "SATISFIED" if (cited_source_ids or prior_source_ids) else "OPEN"
+                        runtime_support = tuple(dict.fromkeys(
+                            cited_source_ids or prior_source_ids
+                        ))
+                        runtime_blocked = ()
+                    else:
+                        runtime_status = "NOT_APPLICABLE_BY_CAPABILITY"
+                        runtime_support = ()
+                        runtime_blocked = tuple(source_capability_gaps)
+                    obligation = obligation.model_copy(update={
+                        "claim": _SOURCE_MECHANISM_OBLIGATION_CLAIM,
+                        "critical": True,
+                        "status": runtime_status,
+                        "supporting_evidence_ids": runtime_support,
+                        "blocked_capabilities": runtime_blocked,
+                    })
+                    if (
+                        proposed_status != runtime_status
+                        or (prior is not None and prior.status != runtime_status)
+                    ):
+                        trace.record("SOURCE_OBLIGATION_STATUS_OVERRIDDEN", {
+                            "obligation_id": obligation.id,
+                            "proposed_status": proposed_status,
+                            "previous_runtime_status": prior.status if prior else None,
+                            "runtime_status": runtime_status,
+                            "capability_available": source_capability_available,
+                            "capability_gaps": list(source_capability_gaps),
+                            "cited_source_evidence_ids": list(cited_source_ids),
+                            "reason": "runtime_owned_source_obligation",
+                        })
+                    # Do not apply generic transition/terminal checks to a
+                    # source obligation. A stale provider projection is
+                    # normalized to the Runtime-owned OPEN/SATISFIED/N/A state.
+                    if obligation.id not in obligation_state:
+                        obligation_created_count += 1
+                        trace.record("OBLIGATION_CREATED", obligation.model_dump())
+                    elif prior != obligation:
+                        trace.record("OBLIGATION_TRANSITION", {
+                            "obligation_id": obligation.id,
+                            "from": prior.status if prior else None,
+                            "to": obligation.status,
+                            "reason": "runtime_source_obligation_normalization",
+                        })
+                    next_obligations[obligation.id] = obligation
+                    continue
                 if (
                     prior is not None
-                    and prior.status in {"SATISFIED", "WAIVED_WITH_EVIDENCE"}
+                    and prior.status == "SATISFIED"
+                    and obligation.status == prior.status
+                    and (
+                        not obligation.supporting_evidence_ids
+                        or any(
+                            evidence_id not in known_ids
+                            or not evidence_id.startswith("ev-")
+                            for evidence_id in obligation.supporting_evidence_ids
+                        )
+                    )
+                ):
+                    # Terminal state and its Evidence are Runtime-owned. A
+                    # later provider turn may repeat a stale, incomplete
+                    # compatibility projection while requesting a new tool.
+                    trace.record("OBLIGATION_TERMINAL_REPLAY_REJECTED", {
+                        "obligation_id": obligation.id,
+                        "status": obligation.status,
+                        "reason": "terminal_runtime_state_preserved",
+                        "invalid_supporting_evidence_ids": list(
+                            obligation.supporting_evidence_ids
+                        ),
+                    })
+                    obligation = prior
+                if (
+                    prior is not None
+                    and prior.status == "SATISFIED"
                     and obligation.status == "OPEN"
                 ):
                     # Planner outputs are a semantic proposal, but terminal
@@ -887,7 +1055,7 @@ class DiagnosisHarness:
                     raise RuntimeError(
                         f"invalid obligation status transition {prior.status}->{obligation.status}"
                     )
-                if obligation.status in {"SATISFIED", "WAIVED_WITH_EVIDENCE"}:
+                if obligation.status == "SATISFIED":
                     if not obligation.supporting_evidence_ids or any(
                         evidence_id not in known_ids or not evidence_id.startswith("ev-")
                         for evidence_id in obligation.supporting_evidence_ids
@@ -916,7 +1084,7 @@ class DiagnosisHarness:
                     continue
                 # VerificationObligation is canonical when the Planner emits
                 # both representations. Never let the compatibility gap
-                # projection overwrite a structured SATISFIED/WAIVED state
+                # projection overwrite a structured SATISFIED state
                 # (or erase structured supporting Evidence) in this turn.
                 structured_match = next(
                     (item for item in next_obligations.values()
@@ -936,7 +1104,7 @@ class DiagnosisHarness:
                     # Legacy required_gaps are an input projection, not a
                     # command to reopen a terminal obligation. A capability
                     # block must remain visible until the Planner explicitly
-                    # supplies a legal WAIVED_WITH_EVIDENCE transition.
+                    # supplies a legal Runtime transition.
                     next_obligations[oid] = prior
                     continue
                 obligation = VerificationObligation(
@@ -957,96 +1125,78 @@ class DiagnosisHarness:
                     })
                 next_obligations[oid] = obligation
 
-            # Source coverage is a semantic decision emitted by Planner (or
-            # Reflection) plus deterministic runtime checks.  The Harness does
-            # not infer a code fault from a label or from a symptom.  It only
-            # ensures that an application-level mechanism is not finalized
-            # without a source capability and a cited bounded source read.
-            source_status = getattr(selection, "source_mechanism_status", "unknown") or "unknown"
-            source_ids = source_evidence_ids()
-            cited_source_ids = tuple(
-                evidence_id for evidence_id in source_ids
-                if evidence_id in set(selection.supporting_evidence_ids)
+            # Source coverage is a Runtime-owned capability/evidence decision.
+            # The LLM field is retained for audit only and cannot close the
+            # source obligation or declare it not applicable.
+            proposed_source_status = getattr(
+                selection, "source_mechanism_status", "unknown"
+            ) or "unknown"
+            source_status = (
+                "not_applicable" if not source_capability_available
+                else "sufficient" if cited_source_ids else "gap"
             )
+            if proposed_source_status != source_status:
+                trace.record("SOURCE_MECHANISM_STATUS_OVERRIDDEN", {
+                    "proposed_status": proposed_source_status,
+                    "runtime_status": source_status,
+                    "capability_available": source_capability_available,
+                    "capability_gaps": list(source_capability_gaps),
+                    "cited_source_evidence_ids": list(cited_source_ids),
+                    "reason": "runtime_owned_source_coverage",
+                })
             source_obligation = next(
                 (
                     item for item in (*next_obligations.values(), *obligation_state.values())
-                    if item.claim.casefold() == _SOURCE_MECHANISM_OBLIGATION_CLAIM.casefold()
+                    if _is_source_mechanism_obligation(item)
                 ),
                 None,
             )
-            source_closure_allowed = True
-            if (
-                "application_code" in case.evidence_sources
-                and source_workspace_available
-                and selection.candidate_mechanism.strip()
-            ):
-                # Older incident providers do not emit the additive status.
-                # Once they cite a real read_file Evidence item, promote the
-                # compatibility ``unknown`` projection to covered. Explicit
-                # ``gap`` remains a semantic gap and is never guessed away.
-                if source_status == "unknown" and cited_source_ids:
-                    source_status = "sufficient"
-                elif source_status == "sufficient" and not cited_source_ids:
-                    source_status = "gap"
-                elif source_status == "blocked" and "read_file" in available_code_tools:
-                    source_status = "gap"
-
-                source_needs_verification = source_status in {"unknown", "gap"}
-                if source_status == "sufficient" and not cited_source_ids:
-                    source_needs_verification = True
-                if source_needs_verification:
-                    source_closure_allowed = False
-                    if source_obligation is not None and source_obligation.status in {
-                        "SATISFIED", "WAIVED_WITH_EVIDENCE",
-                    }:
-                        # Terminal obligation state is canonical and cannot be
-                        # reopened by a stale/older semantic projection.
-                        source_status = "sufficient"
-                        source_closure_allowed = True
-                    else:
-                        desired_status = (
-                            "OPEN" if "read_file" in available_code_tools
-                            else "BLOCKED_BY_CAPABILITY"
-                        )
-                        if source_obligation is None:
-                            source_obligation = VerificationObligation(
-                                id=_obligation_id(_SOURCE_MECHANISM_OBLIGATION_CLAIM),
-                                claim=_SOURCE_MECHANISM_OBLIGATION_CLAIM,
-                                critical=True,
-                                status=desired_status,
-                                supporting_evidence_ids=(),
-                                blocked_capabilities=(
-                                    () if desired_status == "OPEN" else ("read_file",)
-                                ),
-                            )
-                            obligation_created_count += 1
-                            trace.record("OBLIGATION_CREATED", source_obligation.model_dump())
-                        elif source_obligation.status != desired_status:
-                            allowed = _OBLIGATION_TRANSITIONS[source_obligation.status]
-                            if desired_status not in allowed:
-                                raise RuntimeError(
-                                    "invalid source verification obligation transition "
-                                    f"{source_obligation.status}->{desired_status}"
-                                )
-                            updated = source_obligation.model_copy(update={
-                                "status": desired_status,
-                                "blocked_capabilities": (
-                                    source_obligation.blocked_capabilities
-                                    if desired_status == "OPEN" else
-                                    tuple(dict.fromkeys((*source_obligation.blocked_capabilities, "read_file")))
-                                ),
-                            })
-                            trace.record("OBLIGATION_TRANSITION", {
-                                "obligation_id": source_obligation.id,
-                                "from": source_obligation.status,
-                                "to": desired_status,
-                                "reason": "source_capability_check",
-                            })
-                            source_obligation = updated
-                        next_obligations[source_obligation.id] = source_obligation
-
-            source_obligation_id = source_obligation.id if source_obligation else None
+            source_should_track = bool(
+                source_obligation is not None
+                or selection.candidate_mechanism.strip()
+            )
+            if source_should_track:
+                desired_status = (
+                    "SATISFIED" if source_status == "sufficient"
+                    else "NOT_APPLICABLE_BY_CAPABILITY"
+                    if source_status == "not_applicable" else "OPEN"
+                )
+                desired_support = tuple(cited_source_ids) if desired_status == "SATISFIED" else ()
+                desired_blocked = (
+                    tuple(source_capability_gaps)
+                    if desired_status == "NOT_APPLICABLE_BY_CAPABILITY" else ()
+                )
+                if source_obligation is None:
+                    source_obligation = VerificationObligation(
+                        id=_obligation_id(_SOURCE_MECHANISM_OBLIGATION_CLAIM),
+                        claim=_SOURCE_MECHANISM_OBLIGATION_CLAIM,
+                        critical=True,
+                        status=desired_status,
+                        supporting_evidence_ids=desired_support,
+                        blocked_capabilities=desired_blocked,
+                    )
+                    obligation_created_count += 1
+                    trace.record("OBLIGATION_CREATED", source_obligation.model_dump())
+                elif (
+                    source_obligation.status != desired_status
+                    or source_obligation.supporting_evidence_ids != desired_support
+                    or source_obligation.blocked_capabilities != desired_blocked
+                ):
+                    updated = source_obligation.model_copy(update={
+                        "claim": _SOURCE_MECHANISM_OBLIGATION_CLAIM,
+                        "critical": True,
+                        "status": desired_status,
+                        "supporting_evidence_ids": desired_support,
+                        "blocked_capabilities": desired_blocked,
+                    })
+                    trace.record("OBLIGATION_TRANSITION", {
+                        "obligation_id": source_obligation.id,
+                        "from": source_obligation.status,
+                        "to": desired_status,
+                        "reason": "source_capability_and_evidence_check",
+                    })
+                    source_obligation = updated
+                next_obligations[source_obligation.id] = source_obligation
 
             # When the Planner explicitly closes all required gaps and has
             # evidence, close prior obligations deterministically. The Harness
@@ -1057,9 +1207,14 @@ class DiagnosisHarness:
                 for oid, prior in obligation_state.items():
                     if oid in next_obligations or prior.status not in {"OPEN", "BLOCKED_BY_CAPABILITY"}:
                         continue
-                    if oid == source_obligation_id and not source_closure_allowed:
+                    if _is_source_mechanism_obligation(prior):
+                        # Source status is decided only by the deterministic
+                        # capability/evidence branch above; generic completion
+                        # must never close or waive it.
                         continue
-                    status = "WAIVED_WITH_EVIDENCE" if prior.status == "BLOCKED_BY_CAPABILITY" else "SATISFIED"
+                    if prior.status == "BLOCKED_BY_CAPABILITY":
+                        continue
+                    status = "SATISFIED"
                     updated = prior.model_copy(update={
                         "status": status,
                         "supporting_evidence_ids": tuple(selection.supporting_evidence_ids),
@@ -1371,6 +1526,31 @@ class DiagnosisHarness:
                 if obligation.status != "OPEN":
                     updated_obligations.append(obligation)
                     continue
+                if _is_source_mechanism_obligation(obligation):
+                    updated = obligation.model_copy(update={
+                        "status": "NOT_APPLICABLE_BY_CAPABILITY",
+                        "blocked_capabilities": tuple(dict.fromkeys(
+                            (*obligation.blocked_capabilities, tool_name)
+                        )),
+                    })
+                    updated_obligations.append(updated)
+                    changed = True
+                    trace.record("SOURCE_OBLIGATION_STATUS_OVERRIDDEN", {
+                        "obligation_id": obligation.id,
+                        "proposed_status": obligation.status,
+                        "runtime_status": "NOT_APPLICABLE_BY_CAPABILITY",
+                        "capability_gaps": list(updated.blocked_capabilities),
+                        "reason": "source_tool_capability_lost",
+                        "tool": tool_name,
+                    })
+                    trace.record("OBLIGATION_TRANSITION", {
+                        "obligation_id": obligation.id,
+                        "from": obligation.status,
+                        "to": "NOT_APPLICABLE_BY_CAPABILITY",
+                        "reason": "tool_circuit_open",
+                        "tool": tool_name,
+                    })
+                    continue
                 updated = obligation.model_copy(update={
                     "status": "BLOCKED_BY_CAPABILITY",
                     "blocked_capabilities": tuple(dict.fromkeys(
@@ -1392,6 +1572,15 @@ class DiagnosisHarness:
             current = current.model_copy(update={
                 "verification_obligations": tuple(updated_obligations),
                 "required_gaps": tuple(item.claim for item in updated_obligations if item.blocks_finalization),
+                "source_mechanism_status": (
+                    "not_applicable"
+                    if any(
+                        _is_source_mechanism_obligation(item)
+                        and item.status == "NOT_APPLICABLE_BY_CAPABILITY"
+                        for item in updated_obligations
+                    )
+                    else current.source_mechanism_status
+                ),
             })
             obligation_state.clear()
             obligation_state.update({item.id: item for item in updated_obligations})
@@ -1852,6 +2041,43 @@ class DiagnosisHarness:
                     ),
                 })
             if hypothesis is not None:
+                source_obligation = next(
+                    (
+                        item for item in hypothesis.verification_obligations
+                        if _is_source_mechanism_obligation(item)
+                    ),
+                    None,
+                )
+                if source_obligation is not None:
+                    source_capability_gaps = []
+                    if not source_workspace_available:
+                        source_capability_gaps.append("source_workspace")
+                    if "application_code" not in case.evidence_sources:
+                        source_capability_gaps.append("application_code")
+                    if "read_file" not in available_code_tools:
+                        source_capability_gaps.append("read_file")
+                    source_capability_available = not source_capability_gaps
+                    cited_source_ids = tuple(
+                        evidence_id for evidence_id in source_evidence_ids()
+                        if evidence_id in set(source_obligation.supporting_evidence_ids)
+                    )
+                    source_state_valid = (
+                        source_obligation.status == "SATISFIED" and bool(cited_source_ids)
+                        if source_capability_available
+                        else source_obligation.status == "NOT_APPLICABLE_BY_CAPABILITY"
+                    )
+                    if not source_state_valid:
+                        trace.record("FINALIZATION_REJECTED", {
+                            "source": source,
+                            "reason": "source_obligation_not_runtime_validated",
+                            "obligation": source_obligation.model_dump(),
+                            "capability_available": source_capability_available,
+                            "capability_gaps": source_capability_gaps,
+                            "cited_source_evidence_ids": list(cited_source_ids),
+                        })
+                        raise RuntimeError(
+                            "source verification obligation is not Runtime-validated"
+                        )
                 if self.config.features.finalization_gate and not hypothesis.can_finalize(known_evidence_ids):
                     raise RuntimeError("final candidate is not supported by a complete hypothesis")
                 omitted_support = tuple(
@@ -1897,6 +2123,7 @@ class DiagnosisHarness:
                         review_evidence_ids: frozenset[str] = frozenset(),
                         review_hypothesis: IncidentHypothesis | None = None) -> RootCauseCandidate:
             nonlocal active_skill, evidence_sufficient_step, evidence_sufficient_tool_calls
+            nonlocal converge_read_file_calls
             nonlocal final_candidate_step, termination_reason
             nonlocal duplicate_calls
             nonlocal planner_contract_retry_used
@@ -1933,21 +2160,20 @@ class DiagnosisHarness:
                 """Expose a capability/stage slice without changing authority.
 
                 The registry remains the permission and validation authority.
-                This only reduces the provider's choice set after the first
-                Skill transition; the initial turn still sees the full catalog.
+                Capability state is applied on the initial turn as well; a
+                later Skill transition can further reduce the already-valid
+                surface without changing execution authority.
                 """
+                allowed = set(capabilities.planner_tool_names(tools))
                 if not self.config.features.lightweight_skills or not active_skill:
-                    return None
+                    return tuple(sorted(allowed))
                 skill_spec = INCIDENT_SKILLS.get(active_skill)
                 names = set(skill_spec.suggested_tools if skill_spec else ())
+                names.update(available_code_tools)
                 names.add("finalize_diagnosis")
                 if knowledge_enabled:
                     names.add("knowledge_retrieval")
-                # Code is a handoff capability when a source workspace is
-                # actually bound. It is not advertised for snapshot-only runs.
-                if source_workspace_available:
-                    names.update(available_code_tools)
-                return tuple(sorted(names))
+                return tuple(sorted(names.intersection(allowed)))
 
             def ensure_review_progress(candidate: RootCauseCandidate,
                                         current_hypothesis: IncidentHypothesis | None) -> None:
@@ -2092,6 +2318,8 @@ class DiagnosisHarness:
                     available_evidence_sources=case.evidence_sources,
                     source_workspace_available=source_workspace_available,
                     available_code_tools=available_code_tools,
+                    capability_states=capabilities.states,
+                    visible_tool_names=visible_tool_names(),
                     source_evidence_ids=source_evidence_ids(),
                     reflection_feedback=reflection_feedback,
                     tool_health=tool_circuit.summary(),
@@ -2104,7 +2332,7 @@ class DiagnosisHarness:
                     compact=self.config.features.planner_state_envelope,
                 )
                 exposed_tools = visible_tool_names()
-                if exposed_tools is not None:
+                if exposed_tools is not None and (active_skill or state.step > 0):
                     trace.record("TOOL_EXPOSURE_SLICE", {
                         "step": state.step + 1,
                         "active_skill": active_skill,
@@ -2196,6 +2424,29 @@ class DiagnosisHarness:
                         "reason": "active_context_projection",
                     })
                 planner_call_context = context
+                planner_phase = budget_snapshot("planner_start").phase
+                converge_budget_kwargs: dict[str, Any] = {}
+                if planner_phase == "converge":
+                    remaining_reads = max(
+                        0, CONVERGE_MAX_READ_FILE_CALLS - converge_read_file_calls
+                    )
+                    planner_call_context += (
+                        "\n\nRUNTIME_CONVERGENCE_CONTROL: This is a Runtime-enforced convergence turn. "
+                        f"Keep hidden reasoning within {CONVERGE_MAX_REASONING_TOKENS} tokens, "
+                        f"use at most {remaining_reads} further read_file call(s), and close the "
+                        "current evidence gap or finalize; do not open a new investigation branch."
+                    )
+                    converge_budget_kwargs["max_output_tokens"] = CONVERGE_MAX_OUTPUT_TOKENS
+                    trace.record("CONVERGE_BUDGET_APPLIED", {
+                        "step": state.step + 1,
+                        "phase": planner_phase,
+                        "max_reasoning_tokens": CONVERGE_MAX_REASONING_TOKENS,
+                        "provider_completion_cap_tokens": CONVERGE_MAX_OUTPUT_TOKENS,
+                        "max_read_file_calls": CONVERGE_MAX_READ_FILE_CALLS,
+                        "read_file_calls_used": converge_read_file_calls,
+                        "read_file_calls_remaining": remaining_reads,
+                        "enforcement": "runtime_adapter_completion_cap_and_action_gate",
+                    })
                 prompt_budget_retry = False
                 contract_retry_for_step = False
                 while True:
@@ -2211,10 +2462,26 @@ class DiagnosisHarness:
                             allow_targeted_recovery=contract_retry_for_step,
                         )
                         planner_timeout = provider_timeout(self.config.planner_llm_timeout_seconds)
+                        planner_kwargs = dict(converge_budget_kwargs)
+                        if planner_kwargs:
+                            try:
+                                planner_parameters = inspect.signature(planner.propose).parameters
+                                accepts_kwargs = any(
+                                    item.kind is inspect.Parameter.VAR_KEYWORD
+                                    for item in planner_parameters.values()
+                                )
+                                if (
+                                    "max_output_tokens" not in planner_parameters
+                                    and not accepts_kwargs
+                                ):
+                                    planner_kwargs.clear()
+                            except (TypeError, ValueError):
+                                planner_kwargs.clear()
                         result = self._provider_call(
                             planner.propose,
                             state, planner_call_context,
                             logical_timeout_seconds=planner_timeout,
+                            **planner_kwargs,
                             prompt_budget=dynamic_budget,
                             visible_tool_names=exposed_tools,
                             hard_timeout_seconds=planner_timeout,
@@ -2380,7 +2647,34 @@ class DiagnosisHarness:
                         "model": model_capability.model or self.model,
                         **dict(audit),
                     })
+                if planner_phase == "converge":
+                    usage = dict(result.response.usage or {})
+                    completion_details = usage.get("completion_tokens_details") or {}
+                    reasoning_tokens = completion_details.get("reasoning_tokens")
+                    if reasoning_tokens is not None and int(reasoning_tokens) > CONVERGE_MAX_REASONING_TOKENS:
+                        trace.record("CONVERGE_REASONING_LIMIT_EXCEEDED", {
+                            "step": state.step,
+                            "reasoning_tokens": int(reasoning_tokens),
+                            "max_reasoning_tokens": CONVERGE_MAX_REASONING_TOKENS,
+                            "provider_completion_cap_tokens": CONVERGE_MAX_OUTPUT_TOKENS,
+                            "tool_call_count": len(result.tool_calls),
+                            "reason": "provider usage exceeded Runtime convergence reasoning limit",
+                        })
+                        raise ConvergenceBudgetExhausted(
+                            "convergence planner reasoning limit exceeded"
+                        )
                 if not result.tool_calls:
+                    if budget_snapshot("converge_empty_response").phase == "converge":
+                        trace.record("CONVERGE_OUTPUT_CAP_EXHAUSTED", {
+                            "step": state.step,
+                            "provider_completion_cap_tokens": CONVERGE_MAX_OUTPUT_TOKENS,
+                            "max_reasoning_tokens": CONVERGE_MAX_REASONING_TOKENS,
+                            "reason": "provider returned no executable action after bounded completion envelope",
+                            "hypothesis": hypotheses[-1].model_dump() if hypotheses else None,
+                        })
+                        raise ConvergenceBudgetExhausted(
+                            "convergence planner response contained no executable action"
+                        )
                     raise RuntimeError("Diagnosis Agent returned no action")
                 if len(result.tool_calls) != len(result.skill_selections):
                     raise RuntimeError("every incident action must carry a Skill selection")
@@ -2558,6 +2852,29 @@ class DiagnosisHarness:
                         "repair_attempted": repair_attempted,
                         "repair": repair_result_for_admission,
                     })
+                    if (
+                        budget_snapshot("converge_read_gate").phase == "converge"
+                        and call.name == "read_file"
+                        and converge_read_file_calls >= CONVERGE_MAX_READ_FILE_CALLS
+                    ):
+                        rejection = {
+                            "step": state.step,
+                            "tool": call.name,
+                            "reason": "converge_read_file_budget_exhausted",
+                            "limit": CONVERGE_MAX_READ_FILE_CALLS,
+                            "calls_used": converge_read_file_calls,
+                        }
+                        trace.record("CONVERGE_READ_FILE_REJECTED", rejection)
+                        fallback = best_candidate_from_hypothesis()
+                        if fallback is not None:
+                            termination_reason = "converge_read_file_budget_sufficient_hypothesis"
+                            ensure_review_progress(fallback, hypotheses[-1])
+                            return finalize_candidate(
+                                fallback, termination_reason, hypothesis=hypotheses[-1],
+                            )
+                        raise ConvergenceBudgetExhausted(
+                            "convergence read_file budget exhausted before a complete hypothesis"
+                        )
                     if call.name != "finalize_diagnosis" and state.tool_calls - start_tools >= tool_limit:
                         trace.record("ACTION_REJECTED", {
                             "reason": "tool_budget_exhausted", "tool": call.name,
@@ -2659,6 +2976,7 @@ class DiagnosisHarness:
                                 obligations=(hypotheses[-1].verification_obligations if hypotheses else ()),
                                 contradictions=(hypotheses[-1].contradictions if hypotheses else ()),
                                 review_feedback=review_feedback,
+                                meaningful_progress=False,
                             )
                         if self.config.features.no_progress_detection and state.no_progress_count >= self.config.max_no_progress:
                             reflected = trigger_reflection("semantic_no_progress")
@@ -2695,6 +3013,11 @@ class DiagnosisHarness:
                             candidate, "explicit_finalize", hypothesis=hypothesis,
                         )
                     tool = tools.get(call.name)
+                    if (
+                        budget_snapshot("converge_read_file_execute").phase == "converge"
+                        and call.name == "read_file"
+                    ):
+                        converge_read_file_calls += 1
                     observation = execute_tool(tool, validated, call.name)
                     state.tool_calls += 1
                     state.observations.append(observation)
@@ -2841,6 +3164,9 @@ class DiagnosisHarness:
                             obligations=(hypotheses[-1].verification_obligations if hypotheses else ()),
                             contradictions=(hypotheses[-1].contradictions if hypotheses else ()),
                             review_feedback=review_feedback,
+                            meaningful_progress=action["action_class"] not in {
+                                "zero_information_gain", "failed",
+                            },
                         )
                     if self.config.features.no_progress_detection and state.no_progress_count >= self.config.max_no_progress:
                         reflected = trigger_reflection("semantic_no_progress")
@@ -3305,6 +3631,27 @@ class DiagnosisHarness:
                 "tool_calls": state.tool_calls,
             })
             error_type, error_message = type(exc).__name__, str(exc)
+        except ConvergenceBudgetExhausted as exc:
+            status = "INCONCLUSIVE"
+            termination_reason = "converge_output_budget_exhausted"
+            trace.record("PROVISIONAL_CANDIDATE", {
+                "candidate": candidate.model_dump() if candidate is not None else None,
+                "reason": "convergence response exhausted the Runtime output envelope before producing an action",
+                "hypothesis": hypotheses[-1].model_dump() if hypotheses else None,
+                "open_obligations": [
+                    item.model_dump() for item in (
+                        hypotheses[-1].verification_obligations if hypotheses else ()
+                    ) if item.blocks_finalization
+                ],
+            })
+            trace.record("INCIDENT_INCONCLUSIVE", {
+                "error_type": type(exc).__name__,
+                "failure_category": termination_reason,
+                "message": str(exc),
+                "step": state.step,
+                "tool_calls": state.tool_calls,
+            })
+            error_type, error_message = type(exc).__name__, str(exc)
         except ReflectionContractExhausted as exc:
             status = "INCONCLUSIVE"
             termination_reason = "reflection_contract_exhausted"
@@ -3691,6 +4038,8 @@ class DiagnosisHarness:
                                next_action_constraint: str = "",
                                entities: Any | None = None,
                                capabilities: Any | None = None,
+                               capability_states: dict[str, str] | None = None,
+                               visible_tool_names=(),
                                router_decision: Any | None = None,
                                prior_context: Any | None = None,
                                compact: bool = False) -> dict[str, Any]:
@@ -3703,6 +4052,8 @@ class DiagnosisHarness:
             "INCIDENT": {"summary": case.summary, "system": case.system, "namespace": case.namespace},
             "ENTITIES": entities.model_dump(mode="json") if hasattr(entities, "model_dump") else {},
             "CAPABILITIES": capabilities.model_dump(mode="json") if hasattr(capabilities, "model_dump") else {},
+            "CAPABILITY_STATES": dict(capability_states or {}),
+            "VISIBLE_TOOL_NAMES": list(visible_tool_names),
             "ROUTER_DECISION": router_decision.model_dump(mode="json") if hasattr(router_decision, "model_dump") else {},
             "PRIOR_KNOWLEDGE": (
                 prior_context.model_dump(mode="json") if hasattr(prior_context, "model_dump") else None

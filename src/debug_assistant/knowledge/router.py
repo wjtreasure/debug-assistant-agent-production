@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Deterministic Incident capability detection, routing, and query building."""
 
-from typing import Any
+from typing import Any, Literal
 import re
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -10,6 +10,30 @@ from pydantic import BaseModel, ConfigDict, Field
 from .contracts import KnowledgeQuery, KnowledgeSource, PriorContext
 from .rag import DomainKnowledgeRetriever
 from .static_graph import InMemoryStaticGraph, StaticKnowledgeGraphTools
+
+
+CapabilityState = Literal["AVAILABLE", "EMPTY", "UNAVAILABLE", "FAILED"]
+
+
+_TOOL_CAPABILITY_REQUIREMENTS: dict[str, tuple[str, ...]] = {
+    "check_service_connectivity": ("service_connectivity",),
+    "get_service_topology": ("structured_service_topology",),
+    "get_resources": ("kubernetes_resources",),
+    "get_app_yaml": ("application_yaml",),
+    "describe_resource": ("resource_descriptions",),
+    "get_alerts": ("telemetry",),
+    "get_error_logs": ("telemetry",),
+    "get_service_dependencies": ("structured_service_topology",),
+    "check_node_service_status": ("resource_descriptions",),
+    "get_cluster_configuration": ("resource_descriptions",),
+    "list_code_files": ("application_code",),
+    "repo_tree": ("application_code",),
+    "grep": ("application_code",),
+    "read_file": ("application_code",),
+    "symbol_search": ("application_code",),
+    "code_search": ("application_code",),
+    "inspect_symbol_context": ("application_code",),
+}
 
 
 class IncidentEntities(BaseModel):
@@ -37,6 +61,103 @@ class CapabilitySnapshot(BaseModel):
     static_kg_available: bool = False
     available_code_tools: tuple[str, ...] = ()
     available_knowledge_sources: tuple[KnowledgeSource, ...] = ()
+    # Runtime-visible lifecycle state.  The legacy booleans above remain as a
+    # compatibility projection for callers that only need capability presence.
+    # ``states`` is the authoritative planner/evaluation surface.
+    states: dict[str, CapabilityState] = Field(default_factory=dict)
+
+    def capability_state(self, capability: str) -> CapabilityState:
+        """Return a fail-closed state for a named data capability."""
+        explicit = self.states.get(str(capability))
+        if explicit is not None:
+            return explicit
+        # Compatibility instances created by older callers do not have the
+        # state map.  Presence is still represented truthfully; no implicit
+        # EMPTY/AVAILABLE claim is made for an unknown capability.
+        legacy = {
+            "domain_rag": self.domain_rag_available,
+            "incident_memory": self.incident_memory_available,
+            "static_kg": self.static_kg_available,
+            "application_code": bool(self.available_code_tools),
+        }
+        if capability in legacy:
+            return "AVAILABLE" if legacy[capability] else "UNAVAILABLE"
+        return "UNAVAILABLE"
+
+    def planner_tool_names(self, tools: Any) -> tuple[str, ...]:
+        """Return only tools backed by currently AVAILABLE capabilities.
+
+        ``finalize_diagnosis`` is a control operation, not a data capability,
+        and is always visible.  A tool whose source is EMPTY, UNAVAILABLE, or
+        FAILED is omitted so the Planner cannot turn a known boundary into a
+        business conclusion or a repeated low-value call.
+        """
+        names: list[str] = []
+        for spec in tools.specs():
+            name = str(spec.name)
+            if name == "finalize_diagnosis":
+                names.append(name)
+                continue
+            if name == "knowledge_retrieval":
+                if any(self.capability_state(source) == "AVAILABLE"
+                       for source in self.available_knowledge_sources):
+                    names.append(name)
+                continue
+            required = _TOOL_CAPABILITY_REQUIREMENTS.get(name)
+            if required is None:
+                # Unknown optional tools are not advertised by default.  This
+                # keeps a new registry addition fail-closed until its source
+                # semantics are explicitly mapped.
+                continue
+            if all(self.capability_state(source) == "AVAILABLE" for source in required):
+                if name not in {"list_code_files", "inspect_symbol_context"}:
+                    names.append(name)
+                elif name in self.available_code_tools:
+                    names.append(name)
+        return tuple(dict.fromkeys(names))
+
+    def observe_tool(self, tool_name: str, observation: Any) -> "CapabilitySnapshot":
+        """Update one capability from a real tool Observation.
+
+        A successful empty result is ``EMPTY``.  A missing snapshot record is
+        ``UNAVAILABLE``; other execution/provider failures are ``FAILED``.
+        Neither state is converted into a causal negative claim.
+        """
+        metadata = dict(getattr(observation, "metadata", {}) or {})
+        if str(tool_name) == "knowledge_retrieval":
+            diagnostics = dict(metadata.get("knowledge_diagnostics") or {})
+            requested = tuple(str(item) for item in diagnostics.get("requested_sources", ()))
+            if not requested:
+                return self
+            counts = dict(diagnostics.get("per_source_count") or {})
+            reasons = str(diagnostics.get("reason") or "")
+            states = dict(self.states)
+            for source in requested:
+                if f"{source}_unavailable" in reasons:
+                    state: CapabilityState = "UNAVAILABLE"
+                elif f"{source}_failed" in reasons:
+                    state = "FAILED"
+                elif not counts.get(source, 0):
+                    state = "EMPTY"
+                else:
+                    state = "AVAILABLE"
+                states[source] = state
+            return self.model_copy(update={"states": states})
+        required = _TOOL_CAPABILITY_REQUIREMENTS.get(str(tool_name))
+        if not required:
+            return self
+        if metadata.get("status") == "UNAVAILABLE" or getattr(observation, "error_type", None) == "snapshot_unavailable":
+            state: CapabilityState = "UNAVAILABLE"
+        elif metadata.get("semantic_negative") is True:
+            state = "EMPTY"
+        elif bool(getattr(observation, "ok", False)):
+            state = "AVAILABLE"
+        else:
+            state = "FAILED"
+        states = dict(self.states)
+        for capability in required:
+            states[capability] = state
+        return self.model_copy(update={"states": states})
 
     @classmethod
     def detect(cls, case: Any, tools: Any, *, source_workspace_available: bool = False,
@@ -48,26 +169,52 @@ class CapabilitySnapshot(BaseModel):
             name for name in ("repo_tree", "grep", "read_file", "symbol_search", "code_search")
             if get(name)
         ) if source_workspace_available else ()
-        logs = bool({"telemetry", "logs", "error_logs"} & evidence_sources) and (get("get_error_logs") or get("get_alerts"))
-        metrics = bool({"telemetry", "metrics", "alerts"} & evidence_sources) and get("get_alerts")
-        trace = bool({"telemetry", "trace", "traces"} & evidence_sources)
-        k8s = bool({"kubernetes_resources", "resource_descriptions", "application_yaml"} & evidence_sources) and get("get_resources")
-        code = "application_code" in evidence_sources and source_workspace_available and bool(code_tools)
+        def source_state(source_names: set[str], tool_names: tuple[str, ...]) -> CapabilityState:
+            if not source_names.intersection(evidence_sources):
+                return "UNAVAILABLE"
+            return "AVAILABLE" if any(get(name) for name in tool_names) else "FAILED"
+
+        states: dict[str, CapabilityState] = {
+            "structured_service_topology": source_state({"structured_service_topology"}, ("get_service_topology",)),
+            "service_connectivity": source_state({"service_connectivity"}, ("check_service_connectivity",)),
+            "kubernetes_resources": source_state({"kubernetes_resources"}, ("get_resources",)),
+            "resource_descriptions": source_state({"resource_descriptions"}, ("describe_resource", "check_node_service_status", "get_cluster_configuration")),
+            "application_yaml": source_state({"application_yaml"}, ("get_app_yaml",)),
+            "telemetry": source_state({"telemetry", "logs", "error_logs", "alerts"}, ("get_alerts", "get_error_logs")),
+            "logs": source_state({"telemetry", "logs", "error_logs"}, ("get_error_logs", "get_alerts")),
+            "metrics": source_state({"telemetry", "metrics", "alerts"}, ("get_alerts",)),
+            "trace": "UNAVAILABLE" if not {"telemetry", "trace", "traces"}.intersection(evidence_sources) else "FAILED",
+            "application_code": (
+                "UNAVAILABLE" if "application_code" not in evidence_sources or not source_workspace_available
+                else ("AVAILABLE" if code_tools else "FAILED")
+            ),
+        }
         knowledge = []
         if domain_rag is not None:
             knowledge.append("domain_rag")
+            states["domain_rag"] = "AVAILABLE"
+        else:
+            states["domain_rag"] = "UNAVAILABLE"
         if knowledge_store is not None:
             knowledge.append("incident_memory")
+            states["incident_memory"] = "AVAILABLE"
+        else:
+            states["incident_memory"] = "UNAVAILABLE"
         if static_graph is not None:
             knowledge.append("static_kg")
+            states["static_kg"] = "AVAILABLE"
+        else:
+            states["static_kg"] = "UNAVAILABLE"
         return cls(
-            logs_available=bool(logs), metrics_available=bool(metrics), trace_available=bool(trace),
-            k8s_available=bool(k8s), code_available=bool(code),
+            logs_available=states["logs"] == "AVAILABLE", metrics_available=states["metrics"] == "AVAILABLE",
+            trace_available=states["trace"] == "AVAILABLE", k8s_available=states["kubernetes_resources"] == "AVAILABLE",
+            code_available=states["application_code"] == "AVAILABLE",
             domain_rag_available=domain_rag is not None,
             incident_memory_available=knowledge_store is not None,
             static_kg_available=static_graph is not None,
             available_code_tools=code_tools,
             available_knowledge_sources=tuple(dict.fromkeys(knowledge)),
+            states=states,
         )
 
 

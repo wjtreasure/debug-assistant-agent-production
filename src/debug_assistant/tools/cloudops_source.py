@@ -10,6 +10,7 @@ diagnosis, or add another runtime lifecycle.
 
 import re
 import json
+import posixpath
 from pathlib import Path
 from typing import Any
 
@@ -57,33 +58,119 @@ class CloudOpsSourceBinding:
 _ABSOLUTE_PATH = re.compile(r"^(?:/|[A-Za-z]:[\\/]|//|\\\\)")
 _PATH_ARGUMENTS = {"repo_tree": "path", "grep": "glob", "read_file": "path"}
 _DISCOVERY_TOOLS = frozenset({"repo_tree", "grep", "symbol_search", "code_search", "inspect_symbol_context"})
+_PATH_NORMALIZATION_RULES = frozenset({
+    "stripped_bound_root_name",
+    "abs_to_rel",
+    "already_relative",
+    "rejected_out_of_root",
+})
 
 
-def _reject_model_path(raw: Any) -> str | None:
-    """Reject absolute and traversal spellings before repository resolution."""
-    value = str(raw or "").strip().strip("'\"`").replace("\\", "/")
+def _path_contract_result(
+    *, original_path: Any, normalized_path: str, rule_applied: str, result: str,
+) -> dict[str, str]:
+    if rule_applied not in _PATH_NORMALIZATION_RULES:
+        raise ValueError(f"unknown path normalization rule: {rule_applied}")
+    return {
+        "original_path": str(original_path),
+        "normalized_path": normalized_path,
+        "rule_applied": rule_applied,
+        "result": result,
+    }
+
+
+def _normalize_bound_path(
+    raw: Any, *, source_root: Path, bound_root_name: str,
+) -> tuple[str | None, dict[str, str], str | None]:
+    """Normalize one source-tool path against the already-bound source root."""
+    original = str(raw)
+    value = original.strip().strip("'\"`").replace("\\", "/")
     if not value:
-        return None
-    if _ABSOLUTE_PATH.match(value):
-        return "absolute source paths are not accepted; use a path relative to code/"
-    parts = [part for part in value.split("/") if part not in {"", "."}]
-    if ".." in parts:
-        return "source path traversal is not accepted"
-    return None
+        value = "."
+    raw_parts = [part for part in value.split("/") if part not in {"", "."}]
+    if ".." in raw_parts:
+        action = _path_contract_result(
+            original_path=original,
+            normalized_path=value,
+            rule_applied="rejected_out_of_root",
+            result="rejected",
+        )
+        return None, action, "source path escapes the bound code root"
+    value = posixpath.normpath(re.sub(r"/{2,}", "/", value))
+    while value.startswith("./"):
+        value = value[2:]
+    value = value or "."
+
+    is_absolute = bool(_ABSOLUTE_PATH.match(value)) or Path(value).is_absolute()
+    if is_absolute:
+        try:
+            candidate = Path(value).resolve(strict=False)
+            relative = candidate.relative_to(source_root)
+        except (OSError, ValueError):
+            action = _path_contract_result(
+                original_path=original,
+                normalized_path="",
+                rule_applied="rejected_out_of_root",
+                result="rejected",
+            )
+            return None, action, "absolute source path is outside the bound code root"
+        normalized = relative.as_posix() or "."
+        action = _path_contract_result(
+            original_path=original,
+            normalized_path=normalized,
+            rule_applied="abs_to_rel",
+            result="accepted",
+        )
+        return normalized, action, None
+
+    # Strip the bound root name exactly once, only at a segment boundary.
+    if value == bound_root_name:
+        normalized = "."
+        rule = "stripped_bound_root_name"
+    elif value.startswith(bound_root_name + "/"):
+        normalized = value[len(bound_root_name) + 1:] or "."
+        rule = "stripped_bound_root_name"
+    else:
+        normalized = value
+        rule = "already_relative"
+
+    action = _path_contract_result(
+        original_path=original,
+        normalized_path=normalized,
+        rule_applied=rule,
+        result="accepted",
+    )
+    return normalized, action, None
 
 
 class _BoundRepositoryTool(Tool):
-    """Add CloudOps source scope and provenance to an existing repository tool."""
+    """Apply the Runtime-owned bound-source path contract before execution.
 
-    def __init__(self, inner: Tool, *, symbol_index=None):
+    Repository primitives receive paths relative to ``binding.source_root``;
+    this adapter alone interprets the display name ``code`` and emits the
+    normalization metadata used by the Incident trace.
+    """
+
+    def __init__(self, inner: Tool, *, binding: CloudOpsSourceBinding, symbol_index=None):
         self.inner = inner
         self.spec = inner.spec
+        self.binding = binding
         self.symbol_index = symbol_index
 
     def execute(self, **kwargs: Any) -> ToolObservation:
         argument_name = _PATH_ARGUMENTS.get(self.spec.name)
-        if argument_name:
-            reason = _reject_model_path(kwargs.get(argument_name))
+        normalized_kwargs = dict(kwargs)
+        normalization_action = None
+        default_path = {
+            "repo_tree": ".",
+            "grep": "*",
+        }.get(self.spec.name)
+        if argument_name and (argument_name in kwargs or default_path is not None):
+            normalized, normalization_action, reason = _normalize_bound_path(
+                kwargs.get(argument_name, default_path),
+                source_root=self.binding.source_root or self.binding.case_root,
+                bound_root_name=Path(self.binding.relative_root).name,
+            )
             if reason:
                 return ToolObservation(
                     tool=self.spec.name,
@@ -93,13 +180,17 @@ class _BoundRepositoryTool(Tool):
                         "arguments": dict(kwargs),
                         "source_scope": "code",
                         "source_relative_root": "code",
+                        "normalization_action": normalization_action,
                         "retryable": False,
                         "planner_retryable": False,
                     },
-                    error_type="path_rejected",
+                    error_type="path_contract_error",
                 )
-        observation = self.inner.execute(**kwargs)
+            normalized_kwargs[argument_name] = normalized
+        observation = self.inner.execute(**normalized_kwargs)
         metadata = dict(observation.metadata or {})
+        if normalization_action is not None:
+            metadata["normalization_action"] = normalization_action
         metadata.update({
             "source_scope": "code",
             "source_relative_root": "code",
@@ -197,6 +288,7 @@ class CloudOpsSourceToolRegistry:
             name: _BoundRepositoryTool(
                 indexed_repository.get(name) if name in {"code_search", "inspect_symbol_context"}
                 else repository.get(name),
+                binding=binding,
                 symbol_index=self.index,
             )
             for name in self._EXPOSED

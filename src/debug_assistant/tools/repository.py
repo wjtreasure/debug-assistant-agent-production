@@ -13,10 +13,14 @@ from debug_assistant.repository.paths import (
 )
 
 
-# Source-returning repository tools share these bounds.  ``read_file`` and
-# ``symbol_search`` therefore cannot silently grow separate unbounded read
-# paths as their result formats evolve.
-REPOSITORY_SOURCE_MAX_LINES = 200
+# Keep ``read_file`` bounded, but large enough to capture a concrete source file
+# (the incident benchmark's handlers.go is ~600 lines) in one evidence-bearing
+# read.  The same constant is consumed by schema validation, orchestration, and
+# runtime evidence checks so the bound cannot drift between those layers.
+REPOSITORY_SOURCE_MAX_LINES = 800
+# Discovery previews remain intentionally narrow; they are not source Evidence
+# and should continue to point the planner toward a subsequent read_file call.
+REPOSITORY_SYMBOL_SOURCE_MAX_LINES = 200
 REPOSITORY_SOURCE_MAX_CHARS = 12000
 REPOSITORY_SYMBOL_MAX_RESULTS = 12
 
@@ -74,11 +78,12 @@ class _RepositoryTool(Tool):
 
 def _numbered_source_context(
     lines: list[str], start_line: int, end_line: int, *, max_chars: int,
+    max_lines: int = REPOSITORY_SYMBOL_SOURCE_MAX_LINES,
 ) -> tuple[str, int | None, int | None, bool]:
     """Return a complete-line, bounded source slice with trustworthy coverage."""
     start = max(1, int(start_line))
     requested_end = max(start, int(end_line))
-    bounded_end = min(len(lines), requested_end, start + REPOSITORY_SOURCE_MAX_LINES - 1)
+    bounded_end = min(len(lines), requested_end, start + int(max_lines) - 1)
     rendered: list[str] = []
     used = 0
     truncated = bounded_end < requested_end
@@ -154,6 +159,7 @@ def _symbol_match(
 ) -> dict:
     context, context_start, context_end, source_truncated = _numbered_source_context(
         lines, start_line, end_line, max_chars=max_source_chars,
+        max_lines=REPOSITORY_SYMBOL_SOURCE_MAX_LINES,
     )
     signature = lines[start_line - 1].strip() if 0 < start_line <= len(lines) else ""
     return {

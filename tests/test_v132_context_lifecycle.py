@@ -1,6 +1,7 @@
 from pathlib import Path
 from debug_assistant.config import ContextConfig
 from debug_assistant.context.manager import ContextManager
+from debug_assistant.context.projection import IncidentProjectionPolicy
 from debug_assistant.memory.evidence_memory import EvidenceMemory
 from debug_assistant.memory.observation_store import ObservationStore
 from debug_assistant.models import AgentState, TaskSpec, ToolObservation
@@ -67,3 +68,38 @@ def test_overlapping_rehydrate_requests_are_coalesced(tmp_path):
     r=mgr.build(state,memory,store,max_context_chars=15000)
     assert r.text.count('350 | A_350') == 1
     assert mgr.is_visible_range('a.py',320,380)
+
+
+def test_read_file_ledger_survives_code_evidence_compaction(tmp_path):
+    state=AgentState(TaskSpec('t','issue',str(tmp_path))); store=ObservationStore(); memory=EvidenceMemory()
+    for path, marker in (('frontend/handlers.go', 'H'), ('frontend/rpc.go', 'R')):
+        obs=read_obs(path,1,200,marker)
+        obs.metadata.update({'context_kind':'CODE','information_source':'source_read',
+                             'requested_line_count':200})
+        add(state,store,memory,obs)
+    duplicate=read_obs('frontend/handlers.go',1,200,'H')
+    duplicate.metadata.update({'context_kind':'CODE','information_source':'source_read',
+                               'requested_line_count':200})
+    add(state,store,memory,duplicate)
+    mgr=ContextManager(ContextConfig(max_item_chars=300,safety_margin_chars=300,
+                                     fallback_recent_count=0,known_index_max_chars=1000,
+                                     target_active_items=1,hard_active_items=2))
+    result=mgr.build(state,memory,store,max_context_chars=2500)
+    assert 'READ_FILE_LEDGER' in result.text
+    assert 'frontend/handlers.go L1-200 already read' in result.text
+    assert 'frontend/rpc.go L1-200 already read' in result.text
+    assert result.breakdown['read_ledger_count'] == 2
+    assert len(result.text) <= 2500
+
+
+def test_incident_projection_keeps_read_file_ledger_in_items_catalog(tmp_path):
+    state=AgentState(TaskSpec('t','issue',str(tmp_path))); store=ObservationStore(); memory=EvidenceMemory()
+    obs=read_obs('frontend/main.go',1,20,'M')
+    obs.metadata.update({'context_kind':'CODE','information_source':'source_read',
+                         'requested_line_count':20})
+    add(state,store,memory,obs)
+    mgr=ContextManager(ContextConfig(known_index_max_chars=500),
+                       projection_policy=IncidentProjectionPolicy())
+    result=mgr.build(state,memory,store,max_context_chars=12000)
+    assert result.breakdown['read_ledger_count'] == 1
+    assert 'frontend/main.go L1-20 already read' in result.text

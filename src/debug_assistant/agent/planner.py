@@ -9,11 +9,12 @@ from pydantic import ValidationError
 from debug_assistant.models import ActionProposal, ActionKind, AgentState
 from debug_assistant.contracts import (AgentActionContract, PlannerIntent, QuestionType, compact_validation_error,
                                        render_contract, render_contract_compact)
-from debug_assistant.llm.base import complete_json_compat
+from debug_assistant.llm.base import complete_json_compat, extract_json
 from debug_assistant.llm.base import LLMOutputError, LLMResponse, LLMToolCall, ProviderCapabilities
 from debug_assistant.skills.catalog import INCIDENT_SKILLS, SKILLS, render_skill_catalog
 from debug_assistant.skills.loader import SkillLibrary
 from debug_assistant.tools.registry import PARALLEL_ALLOWED_TOOLS
+from debug_assistant.tools.repository import REPOSITORY_SOURCE_MAX_LINES
 from debug_assistant.incidents.contracts import (
     Contradiction, SourceMechanismStatus, VerificationObligation,
 )
@@ -166,7 +167,8 @@ class NativeToolPlanner:
 
     def propose(self, state: AgentState, context: str, *, logical_timeout_seconds=None,
                 on_attempt_started=None, prompt_budget=None,
-                visible_tool_names: Iterable[str] | None = None) -> NativePlannerResult:
+                visible_tool_names: Iterable[str] | None = None,
+                max_output_tokens: int | None = None) -> NativePlannerResult:
         if not getattr(getattr(self.llm, "capabilities", ProviderCapabilities()), "tool_calling", False):
             raise PlannerContractError("provider does not support native tool calling",
                                        validation_errors=["tool_calling=false"])
@@ -210,8 +212,11 @@ class NativeToolPlanner:
                 "When TOOL_BUDGET_REMAINING is zero, do not request another observation tool; use "
                 "finalize_diagnosis if the existing evidence supports a component and mechanism. "
                 "For read_file, always provide start_line plus line_count; line_count is the number "
-                "of requested lines, inclusive of start_line, and must be between 1 and 200. Never "
-                "provide end_line for read_file. "
+                "of requested lines, inclusive of start_line, and must be between 1 and "
+                + str(REPOSITORY_SOURCE_MAX_LINES) + ". For a concrete source file involved in the "
+                "hypothesis, prefer one broad bounded read that covers the relevant file or complete "
+                "implementation region, rather than mechanically splitting a file into 200-line pages. "
+                "Never provide end_line for read_file. "
                 "Use finalize_diagnosis only when the cited evidence supports both component and causal mechanism. "
                 "At finalize_diagnosis, component/fault/mechanism/evidence_ids are compatibility projections; "
                 "the Runtime freezes the already validated current Hypothesis as the Candidate core. "
@@ -293,6 +298,8 @@ class NativeToolPlanner:
             kwargs["logical_timeout_seconds"] = logical_timeout_seconds
         if "on_attempt_started" in parameters or has_varkw:
             kwargs["on_attempt_started"] = on_attempt_started
+        if ("max_output_tokens" in parameters or has_varkw) and max_output_tokens is not None:
+            kwargs["max_output_tokens"] = int(max_output_tokens)
         try:
             response = method(system, user, **kwargs)
         except LLMOutputError as exc:
@@ -311,6 +318,32 @@ class NativeToolPlanner:
                 error_type="provider_contract_mismatch",
                 output={"validation_error": "response_type=" + type(response).__name__},
             )
+
+        # Some OpenAI-compatible providers advertise tool calling but emit the
+        # requested action as ordinary JSON content.  Keep this compatibility
+        # boundary narrow: only an unambiguous tool_name/tool plus an object of
+        # arguments is promoted, and the normal native-tool validation below
+        # remains authoritative.  Natural-language no-tool turns stay intact.
+        if incident_mode and not response.tool_calls and isinstance(response.content, str):
+            try:
+                content_action = extract_json(response.content)
+            except (TypeError, ValueError, LLMOutputError):
+                content_action = None
+            if isinstance(content_action, dict):
+                content_tool = content_action.get("tool_name") or content_action.get("tool")
+                content_arguments = content_action.get("arguments")
+                if isinstance(content_tool, str) and content_tool.strip():
+                    promoted_arguments = dict(content_arguments) if isinstance(content_arguments, dict) else {}
+                    for key, value in content_action.items():
+                        if key not in {"tool_name", "tool", "arguments", "kind"}:
+                            promoted_arguments.setdefault(key, value)
+                    response = LLMResponse(
+                        content=response.content,
+                        structured=content_action,
+                        tool_calls=(LLMToolCall("content-fallback-1", content_tool.strip(), promoted_arguments),),
+                        usage=response.usage,
+                        raw_output=response.raw_output,
+                    )
 
         current_normalized_output: dict[str, Any] = {}
 
@@ -1096,7 +1129,7 @@ def _validate_repair_patch(primary: Any, repaired: Any) -> tuple[dict[str, Any],
     merged.update(patch)
     return merged, None
 
-SYSTEM="""You are the planner inside a read-only software debugging agent. Diagnose the issue; never propose edits, patches, write commands, package installation, network side effects, or repository mutation. Every conclusion must be grounded in repository evidence. Choose one next action, not a workflow plan. You may choose kind="parallel" only for 2-4 independent read-only tool calls that serve the same information need; child arguments must not depend on sibling results. Prefer falsification over confirmation. Do not repeat equivalent calls. High confidence does not grant permission. Tool argument names and constraints are strict: use only fields shown in the tool catalog. For read_file, use start_line plus line_count, where line_count is an integer from 1 through 200. line_count is the number of lines to read, so do not calculate or provide end_line. Context IDs are optional hints: only reference IDs that appear in CONTEXT_CATALOG.
+SYSTEM="""You are the planner inside a read-only software debugging agent. Diagnose the issue; never propose edits, patches, write commands, package installation, network side effects, or repository mutation. Every conclusion must be grounded in repository evidence. Choose one next action, not a workflow plan. You may choose kind="parallel" only for 2-4 independent read-only tool calls that serve the same information need; child arguments must not depend on sibling results. Prefer falsification over confirmation. Do not repeat equivalent calls. High confidence does not grant permission. Tool argument names and constraints are strict: use only fields shown in the tool catalog. For read_file, use start_line plus line_count, where line_count is an integer from 1 through 800. line_count is the number of lines to read, so do not calculate or provide end_line. When a concrete source file is implicated, prefer one broad bounded read covering the relevant file or complete implementation region instead of mechanically splitting it into 200-line pages. Context IDs are optional hints: only reference IDs that appear in CONTEXT_CATALOG.
 
 When another tool call is necessary, describe the unresolved question in both information_need and information_need_structured when possible. Keep structured fields semantically stable across paraphrases. Generic examples:
 - Exact-symbol issue: target="Parser.visit_unknown", question_type="location", evidence_goal="locate unknown-node dispatch implementation".
@@ -1106,7 +1139,7 @@ Do not copy example targets when they are unrelated to the current issue. Reposi
 class Planner:
     def __init__(self,llm,tools,model='',compact_prompt=False,skill_library=None,max_parallel_actions=4): self.llm=llm; self.tools=tools; self.model=model; self.compact_prompt=compact_prompt; self.last_prompt_breakdown={}; self.last_action_normalization=None; self.last_repair_rejection_reason=None; self.skill_library=skill_library or SkillLibrary(); self.max_parallel_actions=max(2,int(max_parallel_actions))
     def propose(self,state:AgentState,context:str,logical_timeout_seconds:float|None=None,
-                prompt_budget=None) -> ActionProposal:
+                prompt_budget=None, max_output_tokens: int | None = None) -> ActionProposal:
         contract=(render_contract_compact(AgentActionContract,"AGENT_ACTION_SCHEMA") if self.compact_prompt else render_contract(AgentActionContract,"AGENT_ACTION_SCHEMA"))
         skills=render_skill_catalog(compact=self.compact_prompt)
         catalog=_runtime_catalog(self.tools)
@@ -1145,7 +1178,9 @@ class Planner:
                 "token_breakdown": dict(decision.breakdown),
             })
         call_started=time.monotonic()
-        data=complete_json_compat(self.llm,SYSTEM,user,model=self.model or None,logical_timeout_seconds=logical_timeout_seconds)
+        data=complete_json_compat(self.llm,SYSTEM,user,model=self.model or None,
+                                  logical_timeout_seconds=logical_timeout_seconds,
+                                  max_output_tokens=max_output_tokens)
         self.last_action_normalization=None
         self.last_repair_rejection_reason=None
         data, normalization = normalize_planner_action(data, max_parallel_actions=self.max_parallel_actions)
@@ -1183,7 +1218,9 @@ repaired without changing intent, return {{"repair_failed": "structural intent c
                         "token_breakdown": dict(repair_decision.breakdown),
                     }
                     self.last_prompt_breakdowns.append(repair_breakdown)
-                repaired=complete_json_compat(self.llm,repair_schema,repair_user,model=self.model or None,logical_timeout_seconds=remaining)
+                repaired=complete_json_compat(self.llm,repair_schema,repair_user,model=self.model or None,
+                                              logical_timeout_seconds=remaining,
+                                              max_output_tokens=max_output_tokens)
                 merged, rejection = _validate_repair_patch(data, repaired)
                 if rejection:
                     self.last_repair_rejection_reason=rejection

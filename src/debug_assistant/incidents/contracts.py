@@ -43,7 +43,8 @@ def _migrate_fault_fields(value: Any) -> Any:
 
 
 ObligationStatus = Literal[
-    "OPEN", "SATISFIED", "WAIVED_WITH_EVIDENCE", "BLOCKED_BY_CAPABILITY",
+    "OPEN", "SATISFIED", "BLOCKED_BY_CAPABILITY",
+    "NOT_APPLICABLE_BY_CAPABILITY",
 ]
 ContradictionSeverity = Literal["WEAK", "BLOCKING"]
 ContradictionStatus = Literal["OPEN", "RESOLVED", "EXPLAINED"]
@@ -56,8 +57,9 @@ class VerificationObligation(BaseModel):
     """Small, incident-scoped verification contract.
 
     This is intentionally not the generic SWE obligation state machine.  The
-    Harness validates IDs and legal status values; semantic equivalence is a
-    Planner/Reflection decision.
+    Harness validates IDs and legal status values.  Source-mechanism
+    obligations are Runtime-owned: ``NOT_APPLICABLE_BY_CAPABILITY`` is only
+    assigned by deterministic capability checks, never by Planner/Reflection.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -311,14 +313,14 @@ class IncidentHypothesis(BaseModel):
                 if not evidence_id.startswith("ev-") or evidence_id not in known_evidence_ids
             ]
             if invalid_ids or (
-                obligation.status in {"SATISFIED", "WAIVED_WITH_EVIDENCE"}
+                obligation.status == "SATISFIED"
                 and not obligation.supporting_evidence_ids
             ):
                 invalid_obligation_evidence.append({
                     "obligation_id": obligation.id,
                     "evidence_ids": sorted(set(invalid_ids)),
                     "terminal_without_evidence": (
-                        obligation.status in {"SATISFIED", "WAIVED_WITH_EVIDENCE"}
+                        obligation.status == "SATISFIED"
                         and not obligation.supporting_evidence_ids
                     ),
                 })

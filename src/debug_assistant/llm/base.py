@@ -194,23 +194,27 @@ class LLMClient(ABC):
         model: str | None = None,
         logical_timeout_seconds: float | None = None,
         on_attempt_started: Callable[[dict[str, Any]], None] | None = None,
+        max_output_tokens: int | None = None,
     ) -> dict[str, Any]: ...
 
     def complete_structured(self, system: str, user: str, *, schema=None, model=None,
-                            logical_timeout_seconds=None, on_attempt_started=None) -> LLMResponse:
+                            logical_timeout_seconds=None, on_attempt_started=None,
+                            max_output_tokens: int | None = None) -> LLMResponse:
         data = complete_json_compat(self, system, user, model=model,
                                     logical_timeout_seconds=logical_timeout_seconds,
-                                    on_attempt_started=on_attempt_started)
+                                    on_attempt_started=on_attempt_started,
+                                    max_output_tokens=max_output_tokens)
         return LLMResponse(content=json.dumps(data, ensure_ascii=False), structured=data,
                            usage=getattr(self, "last_usage", {}) or {})
 
     def complete_with_tools(self, system: str, user: str, *, tools: list[dict[str, Any]],
                             model=None, logical_timeout_seconds=None,
-                            on_attempt_started=None) -> LLMResponse:
+                            on_attempt_started=None, max_output_tokens: int | None = None) -> LLMResponse:
         """Safe default for providers without native tools: use structured JSON fallback."""
         data = self.complete_structured(system, user, schema=None, model=model,
                                         logical_timeout_seconds=logical_timeout_seconds,
-                                        on_attempt_started=on_attempt_started)
+                                        on_attempt_started=on_attempt_started,
+                                        max_output_tokens=max_output_tokens)
         return data
 
 
@@ -222,6 +226,7 @@ def complete_json_compat(
     model: str | None = None,
     logical_timeout_seconds: float | None = None,
     on_attempt_started: Callable[[dict[str, Any]], None] | None = None,
+    max_output_tokens: int | None = None,
 ):
     """Pass V1.4.5 deadline metadata without breaking legacy test/provider doubles."""
     fn = client.complete_json
@@ -246,6 +251,16 @@ def complete_json_compat(
         accepts_callback = False
     if accepts_callback:
         kwargs["on_attempt_started"]=on_attempt_started
+    try:
+        sig = inspect.signature(fn)
+        accepts_output_cap = (
+            "max_output_tokens" in sig.parameters
+            or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        )
+    except (TypeError, ValueError):
+        accepts_output_cap = False
+    if accepts_output_cap and max_output_tokens is not None:
+        kwargs["max_output_tokens"] = int(max_output_tokens)
     return fn(system, user, **kwargs)
 
 

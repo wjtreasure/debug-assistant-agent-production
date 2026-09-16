@@ -1004,7 +1004,7 @@ def _trajectory_metrics(run: IncidentRunResult, trace_events: tuple[dict, ...]) 
     obligations = tuple(hypothesis.verification_obligations) if hypothesis else ()
     contradictions = tuple(hypothesis.contradictions) if hypothesis else ()
     closed_obligations = sum(
-        item.status in {"SATISFIED", "WAIVED_WITH_EVIDENCE"} for item in obligations
+        item.status == "SATISFIED" for item in obligations
     )
     resolved_contradictions = sum(
         item.status in {"RESOLVED", "EXPLAINED"} for item in contradictions

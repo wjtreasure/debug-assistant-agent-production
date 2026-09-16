@@ -191,6 +191,50 @@ class ContextManager:
         self.known_index.rebuild(observation_store)
         return self.known_index.render(max_chars=max_chars or getattr(self.cfg,'known_index_max_chars',3500))
 
+    def read_ledger_text(self, memory, observation_store, max_chars: int | None = None) -> tuple[str, int]:
+        """Render a bounded ledger of source ranges already read by ``read_file``.
+
+        The ledger is deliberately metadata-only.  CODE Evidence may be evicted from
+        the working context to satisfy the token budget, but the planner must still
+        know which immutable source ranges were acquired so it does not rediscover
+        and reread them solely because compaction hid their contents.
+        """
+        limit = max(0, int(max_chars if max_chars is not None else
+                            getattr(self.cfg, 'known_index_max_chars', 3500)))
+        rows = []
+        seen = set()
+        for observation in observation_store.all():
+            if not observation.ok or observation.tool != 'read_file':
+                continue
+            metadata = observation.metadata or {}
+            if str(metadata.get('context_kind') or '').upper() != 'CODE':
+                continue
+            path = str(metadata.get('path') or '').strip()
+            start = metadata.get('start_line')
+            end = metadata.get('end_line')
+            count = metadata.get('requested_line_count')
+            if not path or not isinstance(start, int) or not isinstance(end, int):
+                continue
+            if not isinstance(count, int) or count < 1:
+                count = end - start + 1
+            evidence = memory.evidence_for_observation(observation.observation_id)
+            evidence_id = evidence.evidence_id if evidence is not None else 'unpromoted'
+            key = (path, start, count)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                f"- {path} L{start}-{end} already read; Evidence={evidence_id}\n"
+            )
+        if not rows:
+            return '', 0
+        rendered = ''.join(rows)
+        if limit:
+            rendered, _ = line_safe_truncate(rendered, limit)
+        else:
+            rendered = ''
+        return rendered, len(rows)
+
     def catalog_text(self, items: list[ContextItem], max_chars: int=7000) -> str:
         rows=[]; used=0
         for x in sorted(items,key=lambda i:(i.created_step,i.context_id)):
@@ -271,13 +315,33 @@ class ContextManager:
             known_section=""
         elif getattr(self.projection_policy, 'catalog_mode', 'source_ranges') == 'items':
             known=self.catalog_text(items,max_chars=getattr(self.cfg,'known_index_max_chars',3500))
+            read_ledger, read_ledger_count = self.read_ledger_text(
+                memory, observation_store,
+                max_chars=getattr(self.cfg, 'known_index_max_chars', 3500),
+            )
+            read_ledger_section = (
+                "READ_FILE_LEDGER (bounded metadata; source ranges already acquired; "
+                "do not repeat an equivalent read solely because Evidence is cold):\n"
+                f"{read_ledger or '(none)'}"
+            )
             known_section=("KNOWN_CONTEXT_INDEX (diagnostic pointers; content may be cold):\n"
                            f"{known}\nOnly ev-* identifiers are citable. Raw observations remain internal and can be rehydrated by the Harness.\n")
+            known_section += read_ledger_section
         else:
             known=self.known_context_text(observation_store)
             evidence_catalog=self.catalog_text(items,max_chars=getattr(self.cfg,'known_index_max_chars',3500))
+            read_ledger, read_ledger_count = self.read_ledger_text(
+                memory, observation_store,
+                max_chars=getattr(self.cfg, 'known_index_max_chars', 3500),
+            )
+            read_ledger_section = (
+                "READ_FILE_LEDGER (bounded metadata; source ranges already acquired; "
+                "do not repeat an equivalent read solely because Evidence is cold):\n"
+                f"{read_ledger or '(none)'}"
+            )
             known_section=("KNOWN_CONTEXT_INDEX (compact pointers; content may be cold):\n"
                            f"{known}\nEVIDENCE_CATALOG (only ev-* identifiers are citable):\n{evidence_catalog}"
+                           f"{read_ledger_section}"
                            "If details are needed from a known range, request read_file for the exact range; the Harness can rehydrate it without repository I/O.\n")
         available=max(0,diagnostic_budget-len(fixed)-len(known_section)-self.cfg.safety_margin_chars)
 
@@ -497,6 +561,7 @@ class ContextManager:
             'advisory_chars':len(advisory),
             'state_chars':len(str(state.to_summary())),
             'known_context_chars':len(known_section),
+            'read_ledger_count': read_ledger_count if 'read_ledger_count' in locals() else 0,
             'tool_result_chars':sum(m['chars'] for m in selected_meta if m.get('kind')=='tool_result'),
             'evidence_chars':sum(m['chars'] for m in selected_meta if m.get('kind')=='evidence'),
             'diagnostic_context_chars':len(text),

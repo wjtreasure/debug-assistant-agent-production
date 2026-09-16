@@ -147,8 +147,15 @@ class LoopGuard:
         return json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
 
     def observe_semantic_progress(self, state, *, evidence_ids=(), hypothesis=None,
-                                  obligations=(), contradictions=(), review_feedback="") -> bool:
-        """Observe meaningful state progress without reviving heavy convergence."""
+                                  obligations=(), contradictions=(), review_feedback="",
+                                  meaningful_progress: bool | None = None) -> bool:
+        """Observe meaningful state progress without reviving heavy convergence.
+
+        Runtime callers may explicitly classify a tool result as zero-information
+        gain. That prevents provider-generated wording changes from resetting the
+        no-progress guard when no canonical Evidence or obligation progress was
+        produced.
+        """
         signature = self.semantic_signature(
             evidence_ids=evidence_ids, hypothesis=hypothesis,
             obligations=obligations, contradictions=contradictions,
@@ -161,10 +168,13 @@ class LoopGuard:
                 old_evidence = set(json.loads(self._semantic_signature).get("evidence_ids", []))
             except (TypeError, ValueError, json.JSONDecodeError):
                 old_evidence = set()
-        progressed = self._semantic_signature is None or signature != self._semantic_signature
-        # A new canonical ID is explicitly meaningful, while the same ID with a
-        # changed display projection is not a second fact.
-        progressed = progressed or bool(evidence_set - old_evidence)
+        if meaningful_progress is None:
+            progressed = self._semantic_signature is None or signature != self._semantic_signature
+            # A new canonical ID is explicitly meaningful, while the same ID
+            # with a changed display projection is not a second fact.
+            progressed = progressed or bool(evidence_set - old_evidence)
+        else:
+            progressed = bool(meaningful_progress)
         self._semantic_signature = signature
         if progressed:
             self.no_progress = 0

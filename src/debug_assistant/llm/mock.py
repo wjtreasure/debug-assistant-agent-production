@@ -17,7 +17,7 @@ class MockLLMClient(LLMClient):
         self.model_capability = model_capability or self.capabilities.model_capability()
         self._tool_calls=list(tool_calls or []); self._responses=list(responses or [])
         self._native_responses=list(native_responses or [])
-    def complete_json(self, system: str, user: str, *, model: str | None=None, logical_timeout_seconds: float | None=None) -> dict[str, Any]:
+    def complete_json(self, system: str, user: str, *, model: str | None=None, logical_timeout_seconds: float | None=None, max_output_tokens: int | None=None) -> dict[str, Any]:
         self.n+=1
         self.calls.append({
             "model":"mock","prompt_tokens":0,"completion_tokens":0,"total_tokens":0,
@@ -49,12 +49,13 @@ class MockLLMClient(LLMClient):
 
     def complete_with_tools(self, system: str, user: str, *, tools: list[dict[str, Any]],
                             model: str | None = None, logical_timeout_seconds: float | None = None,
-                            on_attempt_started=None) -> LLMResponse:
+                            on_attempt_started=None, max_output_tokens: int | None = None) -> LLMResponse:
         if not self.capabilities.tool_calling:
             return super().complete_with_tools(
                 system, user, tools=tools, model=model,
                 logical_timeout_seconds=logical_timeout_seconds,
                 on_attempt_started=on_attempt_started,
+                max_output_tokens=max_output_tokens,
             )
         self.n += 1
         self.calls.append({"model":"mock","prompt_tokens":0,"completion_tokens":0,"total_tokens":0,

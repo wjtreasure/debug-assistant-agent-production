@@ -11,9 +11,10 @@ runtime and EvidenceMemory from drifting apart again.
 from typing import Any
 
 from debug_assistant.models import Evidence, ToolObservation
+from debug_assistant.tools.repository import REPOSITORY_SOURCE_MAX_LINES
 
 
-_MAX_SOURCE_LINES = 200
+_MAX_SOURCE_LINES = REPOSITORY_SOURCE_MAX_LINES
 
 
 def is_canonical_source_evidence(

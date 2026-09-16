@@ -9,6 +9,7 @@ from debug_assistant.contracts import ReflectionDecision
 from debug_assistant.harness.obligations import EvidenceObligationTracker
 from debug_assistant.harness.semantic_reducer import SemanticReducer
 from debug_assistant.harness.tool_orchestrator import RequestedToolCall, ToolOrchestrator, ToolPlanningError
+from debug_assistant.tools.repository import REPOSITORY_SOURCE_MAX_LINES
 from debug_assistant.llm.base import LLMInvalidJSON, LLMOutputError, LLMResponse, LLMToolCall, ProviderCapabilities, parse_tool_calls
 from debug_assistant.llm.mock import MockLLMClient
 from debug_assistant.memory.hypothesis import HypothesisManager
@@ -66,12 +67,12 @@ def test_native_planner_unknown_tool_fails_closed(tmp_path):
         )
 
 
-def test_orchestrator_splits_read_file_and_preserves_metadata(tmp_path):
+def test_orchestrator_keeps_in_cap_read_file_and_preserves_metadata(tmp_path):
     orchestrator = ToolOrchestrator(ToolRegistry(tmp_path), max_tool_calls=4)
     plan = orchestrator.build_plan([RequestedToolCall("r", "read_file", {"path": "a.py", "start_line": 200, "line_count": 261}, "N1", ("O1",))])
-    assert [(x.arguments["start_line"], x.arguments["line_count"]) for x in plan.calls] == [(200, 200), (400, 61)]
-    assert all(x.requested_range["line_count"] == 261 for x in plan.calls)
-    assert all(x.request.information_need_id == "N1" and x.request.obligation_ids == ("O1",) for x in plan.calls)
+    assert [(x.arguments["start_line"], x.arguments["line_count"]) for x in plan.calls] == [(200, 261)]
+    assert plan.calls[0].requested_range == {"path": "a.py", "start_line": 200, "line_count": 261}
+    assert plan.calls[0].request.information_need_id == "N1" and plan.calls[0].request.obligation_ids == ("O1",)
 
 
 def test_orchestrator_can_pad_short_source_reads_without_changing_requested_range(tmp_path):
@@ -87,13 +88,13 @@ def test_orchestrator_can_pad_short_source_reads_without_changing_requested_rang
 
 
 def test_orchestrator_execution_keeps_split_linkage_on_each_observation(tmp_path):
-    (tmp_path / "a.py").write_text("value = 1\n" * 401, encoding="utf-8")
+    (tmp_path / "a.py").write_text("value = 1\n" * (REPOSITORY_SOURCE_MAX_LINES + 1), encoding="utf-8")
     orchestrator = ToolOrchestrator(ToolRegistry(tmp_path), max_tool_calls=3)
     plan = orchestrator.build_plan([
-        RequestedToolCall("r", "read_file", {"path": "a.py", "start_line": 1, "line_count": 401}, "N1", ("O1",))
+        RequestedToolCall("r", "read_file", {"path": "a.py", "start_line": 1, "line_count": REPOSITORY_SOURCE_MAX_LINES + 1}, "N1", ("O1",))
     ])
     observations = orchestrator.execute(plan)
-    assert len(observations) == 3
+    assert len(observations) == 2
     assert all(observation.ok for observation in observations)
     assert all(observation.metadata["information_need_id"] == "N1" for observation in observations)
     assert all(observation.metadata["obligation_ids"] == ["O1"] for observation in observations)
@@ -118,7 +119,7 @@ def test_orchestrator_unknown_tool_and_expansion_budget_fail_closed(tmp_path):
     assert unknown.value.error_type == "unknown_tool"
     with pytest.raises(ToolPlanningError) as budget:
         ToolOrchestrator(registry, max_tool_calls=1).build_plan([
-            RequestedToolCall("x", "read_file", {"path": "a.py", "start_line": 1, "line_count": 201})
+            RequestedToolCall("x", "read_file", {"path": "a.py", "start_line": 1, "line_count": REPOSITORY_SOURCE_MAX_LINES + 1})
         ])
     assert budget.value.error_type == "tool_budget_preflight"
 
@@ -379,6 +380,38 @@ def test_native_empty_content_no_tool_turn_is_typed(tmp_path):
     assert result.tool_calls == ()
     assert result.assistant_text is None
     assert result.intent.information_need is None
+
+
+def test_native_incident_json_content_is_promoted_to_one_valid_tool_call(tmp_path):
+    class JsonContentIncidentLLM:
+        capabilities = ProviderCapabilities(tool_calling=True)
+
+        def complete_with_tools(self, system, user, *, tools, **kwargs):
+            return LLMResponse(content=json.dumps({
+                "tool_name": "grep",
+                "arguments": {"query": "needle"},
+                "skill": "runtime_resource_investigation",
+                "skill_reason": "Inspect the captured workload state.",
+                "current_hypothesis": "A workload is not ready.",
+                "evidence_gap": "Identify the affected workload.",
+                "candidate_component": "",
+                "candidate_fault": "",
+                "candidate_mechanism": "",
+                "supporting_evidence_ids": [],
+                "contradicting_evidence_ids": [],
+                "required_evidence_gaps": ["Identify the affected workload."],
+                "evidence_sufficiency": "insufficient",
+                "remaining_evidence_need": "Identify the affected workload.",
+            }))
+
+    state = AgentState(TaskSpec(
+        "t", "inspect incident", str(tmp_path), metadata={"task_kind": "incident"},
+    ))
+    result = NativeToolPlanner(JsonContentIncidentLLM(), ToolRegistry(tmp_path)).propose(
+        state, "context",
+    )
+    assert [call.name for call in result.tool_calls] == ["grep"]
+    assert result.tool_calls[0].arguments["query"] == "needle"
 
 
 def test_native_invalid_intent_metadata_does_not_block_valid_tool(tmp_path):

@@ -123,6 +123,7 @@ class OpenAICompatibleClient(LLMClient):
         tools: list[dict[str, Any]] | None = None,
         response_format: dict[str, Any] | None = None,
         return_response: bool = False,
+        max_output_tokens: int | None = None,
     ) -> dict[str, Any]:
         if not self.api_key:
             raise LLMError("DEBUG_AGENT_API_KEY is empty. Configure it or use DEBUG_AGENT_PROVIDER=mock for smoke tests.")
@@ -139,8 +140,9 @@ class OpenAICompatibleClient(LLMClient):
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "temperature": self.temperature,
         }
-        if self.model_capability.max_output_tokens is not None:
-            base_payload["max_tokens"] = int(self.model_capability.max_output_tokens)
+        output_cap = max_output_tokens or self.model_capability.max_output_tokens
+        if output_cap is not None:
+            base_payload["max_tokens"] = int(output_cap)
         if tools:
             base_payload["tools"] = tools
             base_payload["tool_choice"] = "auto"
@@ -447,6 +449,7 @@ class OpenAICompatibleClient(LLMClient):
         model: str | None = None,
         logical_timeout_seconds: float | None = None,
         on_attempt_started: Callable[[dict[str, Any]], None] | None = None,
+        max_output_tokens: int | None = None,
     ) -> dict[str, Any]:
         try:
             asyncio.get_running_loop()
@@ -456,6 +459,7 @@ class OpenAICompatibleClient(LLMClient):
                     system, user, model=model,
                     logical_timeout_seconds=logical_timeout_seconds,
                     on_attempt_started=on_attempt_started,
+                    max_output_tokens=max_output_tokens,
                 )
             )
         raise LLMClientUsageError(
@@ -467,12 +471,14 @@ class OpenAICompatibleClient(LLMClient):
         self, system: str, user: str, *, tools: list[dict[str, Any]], model: str | None = None,
         logical_timeout_seconds: float | None = None,
         on_attempt_started: Callable[[dict[str, Any]], None] | None = None,
+        max_output_tokens: int | None = None,
     ) -> LLMResponse:
         if not self.capabilities.tool_calling:
             return super().complete_with_tools(
                 system, user, tools=tools, model=model,
                 logical_timeout_seconds=logical_timeout_seconds,
                 on_attempt_started=on_attempt_started,
+                max_output_tokens=max_output_tokens,
             )
         try:
             asyncio.get_running_loop()
@@ -480,6 +486,7 @@ class OpenAICompatibleClient(LLMClient):
             return asyncio.run(self.acomplete_json(
                 system, user, model=model, logical_timeout_seconds=logical_timeout_seconds,
                 on_attempt_started=on_attempt_started, tools=tools, return_response=True,
+                max_output_tokens=max_output_tokens,
             ))
         raise LLMClientUsageError(
             "Synchronous complete_with_tools() cannot be called from a running event loop"
@@ -489,6 +496,7 @@ class OpenAICompatibleClient(LLMClient):
         self, system: str, user: str, *, schema=None, model: str | None = None,
         logical_timeout_seconds: float | None = None,
         on_attempt_started: Callable[[dict[str, Any]], None] | None = None,
+        max_output_tokens: int | None = None,
     ) -> LLMResponse:
         response_format = None
         if schema is not None and self.capabilities.json_schema:
@@ -502,7 +510,7 @@ class OpenAICompatibleClient(LLMClient):
             return asyncio.run(self.acomplete_json(
                 system, user, model=model, logical_timeout_seconds=logical_timeout_seconds,
                 on_attempt_started=on_attempt_started, response_format=response_format,
-                return_response=True,
+                return_response=True, max_output_tokens=max_output_tokens,
             ))
         raise LLMClientUsageError(
             "Synchronous complete_structured() cannot be called from a running event loop"

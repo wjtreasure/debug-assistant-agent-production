@@ -27,7 +27,7 @@ _KUBERNETES_RESOURCE_TYPES = Literal[
     "ingresses", "jobs", "namespaces", "networkpolicies", "nodes",
     "persistentvolumeclaims", "persistentvolumes", "pods", "replicasets",
     "resourcequota", "rolebindings", "secrets", "serviceaccounts", "services",
-    "statefulsets", "storageclasses",
+    "statefulsets", "storageclasses", "horizontalpodautoscalers",
 ]
 
 
@@ -345,7 +345,7 @@ def _incident_context_metadata(tool_name: str, arguments: dict[str, Any]) -> dic
         "persistentvolumeclaims": "PVC", "persistentvolumes": "PV", "replicasets": "REPLICASET",
         "resourcequota": "RESOURCEQUOTA", "rolebindings": "ROLEBINDING",
         "secrets": "SECRET", "serviceaccounts": "SERVICEACCOUNT", "statefulsets": "STATEFULSET",
-        "storageclasses": "STORAGECLASS",
+        "storageclasses": "STORAGECLASS", "horizontalpodautoscalers": "HPA",
     }
     if tool_name == "get_app_yaml":
         kind = "CONFIG"

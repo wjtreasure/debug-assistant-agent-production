@@ -223,6 +223,9 @@ class IncidentLLMOutputNormalizer:
         # first telemetry call even though the live schema describes them as
         # empty-string-compatible. Required context such as skill_reason,
         # current_hypothesis, and evidence_gap remains strict and fail-closed.
+        control_envelope_present = any(
+            field in args for field in INCIDENT_REQUIRED_CONTROL_FIELDS
+        )
         for field in _UNKNOWN_STATE_STRING_CONTROLS:
             if field not in args:
                 args[field] = ""
@@ -231,6 +234,18 @@ class IncidentLLMOutputNormalizer:
             if field in args and args[field] is None:
                 args[field] = ""
                 actions.append(f"{field}:null->empty_string")
+        # Some native providers omit an empty linkage array while emitting the
+        # rest of the incident control envelope.  Filling it with an empty
+        # array preserves the fail-closed meaning (no Evidence is claimed) and
+        # lets the typed Planner validate the remaining semantic fields.
+        if control_envelope_present:
+            for field in (
+                "supporting_evidence_ids", "contradicting_evidence_ids",
+                "required_evidence_gaps",
+            ):
+                if field not in args:
+                    args[field] = []
+                    actions.append(f"{field}:missing->empty_list")
         for field in _OPTIONAL_LIST_CONTROLS:
             if field in args and args[field] is None:
                 args[field] = []
