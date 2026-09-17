@@ -116,7 +116,7 @@ class DynamicBudgetController:
         max_llm_calls: int = 40,
         max_wall_time_seconds: float = 900.0,
         max_cost_per_incident: float | None = None,
-        terminal_reserve_tokens: int = 0,
+        terminal_reserve_tokens: int | None = 0,
         terminal_reserve_llm_calls: int = 3,
         terminal_reserve_seconds: float = 0.0,
         pressure_ratio: float = 0.75,
@@ -131,10 +131,12 @@ class DynamicBudgetController:
         self.max_cost_per_incident = (
             None if max_cost_per_incident is None else max(0.0, float(max_cost_per_incident))
         )
-        derived_reserve = max(1, math.ceil(self.max_total_tokens * 0.15))
-        self.terminal_reserve_tokens = max(
-            1, int(terminal_reserve_tokens) or derived_reserve
-        )
+        # ``0`` is an explicit no-reserve configuration.  Older code treated
+        # it as falsey and silently derived 15% of the run budget, which could
+        # strand the terminal Review call despite ample total budget.
+        if terminal_reserve_tokens is None:
+            terminal_reserve_tokens = math.ceil(self.max_total_tokens * 0.15)
+        self.terminal_reserve_tokens = max(0, int(terminal_reserve_tokens))
         self.terminal_reserve_llm_calls = max(1, int(terminal_reserve_llm_calls))
         self.terminal_reserve_seconds = max(0.0, float(terminal_reserve_seconds))
         self.pressure_ratio = min(0.99, max(0.50, float(pressure_ratio)))
@@ -283,6 +285,8 @@ class DynamicBudgetController:
         tokens_used: int | None = None,
         llm_calls_used: int | None = None,
         cost_used: float | None = None,
+        completion_reserve_tokens: int | None = None,
+        allow_terminal_reserve: bool = False,
     ) -> PromptBudgetDecision:
         if tokens_used is None:
             tokens_used = self.tokens_used
@@ -306,14 +310,16 @@ class DynamicBudgetController:
         # the run's finalization reserve.  Reject the provider call before it
         # starts when the estimated prompt plus declared completion reserve
         # would leave no room for the terminal path.
-        completion_reserve = max(
-            int(self.capability.reserved_output_tokens),
-            int(self.capability.max_output_tokens or 0),
+        completion_reserve = (
+            max(0, int(completion_reserve_tokens))
+            if completion_reserve_tokens is not None else max(
+                int(self.capability.reserved_output_tokens),
+                int(self.capability.max_output_tokens or 0),
+            )
         )
         remaining_calls = max(0, self.max_llm_calls - int(llm_calls_used))
-        required_run_tokens = (
-            estimate + completion_reserve + self.terminal_reserve_tokens
-        )
+        terminal_reserve = 0 if allow_terminal_reserve else self.terminal_reserve_tokens
+        required_run_tokens = estimate + completion_reserve + terminal_reserve
         if (
             required_run_tokens > result.remaining_run_tokens
             or (
@@ -337,7 +343,8 @@ class DynamicBudgetController:
                     **result.breakdown,
                     "estimated_prompt_tokens": estimate,
                     "reserved_output_tokens": completion_reserve,
-                    "terminal_reserve_tokens": self.terminal_reserve_tokens,
+                    "terminal_reserve_tokens": terminal_reserve,
+                    "allow_terminal_reserve": bool(allow_terminal_reserve),
                     "required_run_tokens": required_run_tokens,
                     "remaining_run_tokens": result.remaining_run_tokens,
                     "remaining_llm_calls": remaining_calls,

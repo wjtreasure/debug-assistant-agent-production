@@ -6,6 +6,81 @@ from debug_assistant.context.indexes import extract_numbered_range
 from debug_assistant.context.models import ContextItem, ContextProjection
 
 
+def _bounded_code_display(content: str, max_chars: int) -> str:
+    """Keep bounded source context while retaining non-local code signals.
+
+    A wide ``read_file`` range is often larger than the model item budget.  A
+    head/tail-only cut can hide the only suspicious allocation or loop in the
+    middle of the file, causing another read and an avoidable convergence loop.
+    This is a source-agnostic projection: it retains small neighborhoods around
+    generic resource/control-flow signals and never invents lines.
+    """
+    if len(content) <= max_chars:
+        return content
+    lines = content.splitlines()
+    signal_terms = (
+        "append(", "make(", "new(", "malloc", "calloc", "realloc",
+        "alloc", "capacity", "runtime.gc", "for ", "while ",
+    )
+    strong = []
+    for index, line in enumerate(lines):
+        lowered = line.lower()
+        score = sum(2 if term in lowered and term in {"append(", "make(", "new(", "malloc", "calloc", "realloc", "alloc", "capacity"} else 1
+                    for term in signal_terms)
+        if score:
+            strong.append((score, index))
+    # Prefer resource-shaped lines, then keep only a bounded number of windows.
+    signal_indices = [index for _, index in sorted(strong, key=lambda item: (-item[0], item[1]))[:10]]
+
+    def take_from_start(limit: int) -> list[int]:
+        used = 0
+        result = []
+        for index, line in enumerate(lines):
+            addition = len(line) + (1 if result else 0)
+            if used + addition > limit:
+                break
+            result.append(index)
+            used += addition
+        return result
+
+    def take_from_end(limit: int) -> list[int]:
+        used = 0
+        result = []
+        for index in range(len(lines) - 1, -1, -1):
+            addition = len(lines[index]) + (1 if result else 0)
+            if used + addition > limit:
+                break
+            result.append(index)
+            used += addition
+        return list(reversed(result))
+
+    selected = set(take_from_start(int(max_chars * 0.32)))
+    selected.update(take_from_end(int(max_chars * 0.20)))
+    for index in signal_indices:
+        selected.update(range(max(0, index - 2), min(len(lines), index + 3)))
+
+    ordered = sorted(selected)
+    rendered = "\n".join(lines[index] for index in ordered)
+    if len(rendered) <= max_chars:
+        return rendered
+
+    # If many generic signals were found, preserve the head/tail and the
+    # highest-priority signal windows until the bound is met.
+    keep = set(take_from_start(int(max_chars * 0.30)))
+    keep.update(take_from_end(int(max_chars * 0.18)))
+    used = len("\n".join(lines[index] for index in sorted(keep)))
+    for index in signal_indices:
+        window = list(range(max(0, index - 2), min(len(lines), index + 3)))
+        addition = len("\n".join(lines[i] for i in window)) + (1 if keep else 0)
+        if used + addition > max_chars - 48:
+            continue
+        before = len(keep)
+        keep.update(window)
+        if len(keep) != before:
+            used = len("\n".join(lines[i] for i in sorted(keep)))
+    return "\n".join(lines[index] for index in sorted(keep))
+
+
 class CodeProjectionPolicy:
     """Existing repository/read-file projection semantics."""
 
@@ -37,6 +112,11 @@ class CodeProjectionPolicy:
                 )
 
         display = item.full_content
+        if (obs.tool == "read_file" and path
+                and str((obs.metadata or {}).get("context_kind") or "").upper() == "CODE"):
+            # Use the immutable Observation when the ContextItem was line-cut;
+            # the projection remains bounded but can retain middle signals.
+            display = _bounded_code_display(obs.content or display, 12000)
         if obs.tool == "read_file" and path:
             numbers = []
             for line in display.splitlines():

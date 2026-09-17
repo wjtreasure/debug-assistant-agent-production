@@ -8,7 +8,7 @@ from typing import Any, Literal
 from pydantic import Field
 
 from debug_assistant.models import ToolObservation
-from debug_assistant.incidents.contracts import CausalChainLink, ClaimEvidenceMapping, EvidenceId
+from debug_assistant.incidents.contracts import CausalChainLink, ClaimEvidenceMapping, EvidenceId, SourceClaim
 from debug_assistant.tools.base import Tool, ToolArgs, ToolSpec
 from debug_assistant.tools.cloudops_source import CloudOpsSourceBinding, CloudOpsSourceToolRegistry
 
@@ -126,6 +126,13 @@ class FinalizeDiagnosisArgs(ToolArgs):
     causal_chain_summary: list[CausalChainLink] = Field(
         default_factory=list,
         description="Optional concise cause/effect chain; never include raw chain-of-thought.",
+    )
+    source_claims: list[SourceClaim] = Field(
+        default_factory=list,
+        description=(
+            "Optional source claims. Each claim must declare the canonical file "
+            "and exact line range covered by cited read_file CODE Evidence."
+        ),
     )
 
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import math
 import multiprocessing
@@ -38,9 +38,10 @@ from debug_assistant.incidents.contracts import (
     Contradiction, IncidentCase, IncidentEvidence, IncidentHypothesis, IncidentMetrics,
     IncidentRunResult, ReflectionFeedback, ReflectionContradictionUpdate,
     ReviewDecision, RootCauseCandidate,
-    VerificationObligation,
+    SourceClaim, VerificationObligation,
 )
 from debug_assistant.models import ActionKind, ActionProposal, AgentState, TaskSpec, ToolObservation
+from debug_assistant.memory.evidence_boundary import is_canonical_source_evidence
 from debug_assistant.memory.evidence_memory import EvidenceMemory
 from debug_assistant.memory.observation_store import ObservationStore
 from debug_assistant.knowledge import (
@@ -58,6 +59,15 @@ from debug_assistant.tools.cloudops_snapshot import CloudOpsSnapshotToolRegistry
 CONVERGE_MAX_REASONING_TOKENS = 2_000
 CONVERGE_MAX_OUTPUT_TOKENS = 3_000
 CONVERGE_MAX_READ_FILE_CALLS = 3
+# L5 v1: DeepSeek-V4's hidden reasoning can consume the entire completion
+# envelope before emitting a native tool call.  Converge turns therefore use
+# the provider's explicit non-thinking mode; exploration behavior is unchanged.
+CONVERGE_ENABLE_THINKING = False
+# L5 v3: once the source-investigation window has reached its bounded
+# convergence turn, do not spend additional LLM calls on reflection branches.
+# This keeps one terminal planner call plus Review inside the hard call budget.
+CONVERGE_START_STEP = 7
+CONVERGE_DISABLE_REFLECTIONS = True
 
 
 def _safe_planner_metadata_for_trace(exc: Exception) -> dict[str, Any] | None:
@@ -124,6 +134,19 @@ class DiagnosisHarnessConfig:
     enable_reflection: bool = True
     max_reflection_calls: int = 2
     max_consecutive_reflection_calls: int = 1
+    converge_disable_reflections: bool = False
+    # Stage-owned output and Review reserve controls.  These are Runtime
+    # policy, not values proposed by the Planner.
+    planner_max_completion_tokens: int = 8_000
+    converge_max_reasoning_tokens: int = CONVERGE_MAX_REASONING_TOKENS
+    converge_max_output_tokens: int = CONVERGE_MAX_OUTPUT_TOKENS
+    converge_max_read_file_calls: int = CONVERGE_MAX_READ_FILE_CALLS
+    source_verify_max_output_tokens: int = 6_000
+    source_verify_max_read_file_calls: int = 6
+    review_max_completion_tokens: int = 8_000
+    review_repair_max_completion_tokens: int = 4_000
+    review_reserve_tokens: int = 24_000
+    review_reserve_calls: int = 2
     enable_review: bool = True
     max_review_recovery_cycles: int = 1
     tool_circuit_failure_threshold: int = 2
@@ -164,6 +187,17 @@ class DiagnosisHarnessConfig:
                 source.reporter_llm_timeout_seconds
                 if review_llm_timeout_seconds is None else review_llm_timeout_seconds
             ),
+            planner_max_completion_tokens=getattr(source, "planner_max_completion_tokens", 8_000),
+            converge_max_reasoning_tokens=getattr(source, "converge_max_reasoning_tokens", CONVERGE_MAX_REASONING_TOKENS),
+            converge_max_output_tokens=getattr(source, "converge_max_output_tokens", CONVERGE_MAX_OUTPUT_TOKENS),
+            converge_max_read_file_calls=getattr(source, "converge_max_read_file_calls", CONVERGE_MAX_READ_FILE_CALLS),
+            converge_disable_reflections=getattr(source, "converge_disable_reflections", False),
+            source_verify_max_output_tokens=getattr(source, "source_verify_max_output_tokens", 6_000),
+            source_verify_max_read_file_calls=getattr(source, "source_verify_max_read_file_calls", 6),
+            review_max_completion_tokens=getattr(source, "review_max_completion_tokens", 8_000),
+            review_repair_max_completion_tokens=getattr(source, "review_repair_max_completion_tokens", 4_000),
+            review_reserve_tokens=getattr(source, "review_reserve_tokens", 24_000),
+            review_reserve_calls=getattr(source, "review_reserve_calls", 2),
             tool_retry_attempts=source.tool_retry_attempts,
             retry_base_delay_seconds=source.retry_base_delay_seconds,
             retry_max_delay_seconds=source.retry_max_delay_seconds,
@@ -192,6 +226,19 @@ class DiagnosisHarnessConfig:
             raise ValueError("LLM timeouts must be positive")
         if self.max_context_chars <= 0:
             raise ValueError("max_context_chars must be positive")
+        if any(value <= 0 for value in (
+            self.planner_max_completion_tokens,
+            self.converge_max_reasoning_tokens,
+            self.converge_max_output_tokens,
+            self.converge_max_read_file_calls,
+            self.source_verify_max_output_tokens,
+            self.source_verify_max_read_file_calls,
+            self.review_max_completion_tokens,
+            self.review_repair_max_completion_tokens,
+            self.review_reserve_tokens,
+            self.review_reserve_calls,
+        )):
+            raise ValueError("stage budget controls must be positive")
         if self.max_llm_calls <= 0 or self.max_total_tokens <= 0 or self.max_wall_time_seconds <= 0:
             raise ValueError("LLM, token, and wall-clock budgets must be positive")
         if self.terminal_reserve_tokens < 0 or self.terminal_reserve_llm_calls <= 0:
@@ -338,7 +385,7 @@ class DiagnosisHarness:
         context_manager = ContextManager(
             self.config.context,
             enable_catalog=self.config.features.context_manager,
-            enable_model_selection=False,
+            enable_model_selection=True,
             enable_budget_packing=self.config.features.context_manager,
             enable_lifecycle=self.config.features.context_manager,
             enable_projection=self.config.features.context_manager,
@@ -564,10 +611,37 @@ class DiagnosisHarness:
                 raise RuntimeError("max_cost_per_incident exceeded after LLM response")
 
         def budget_snapshot(boundary: str) -> Any:
-            return budget.snapshot(
+            snapshot = budget.snapshot(
                 steps=state.step, tool_calls=state.tool_calls,
                 llm_calls=llm_calls, tokens=prompt_tokens + completion_tokens,
             )
+            # The generic ratio-based controller is intentionally conservative,
+            # but a code investigation can spend many low-cost exploration turns
+            # before the provider reaches its ratio threshold.  L5 applies a
+            # Runtime-owned step boundary so the next planner call is bounded
+            # convergence regardless of provider-side token accounting.
+            current = hypotheses[-1] if hypotheses else None
+            source_ready = bool(current is not None and (
+                current.source_mechanism_status in {"sufficient", "not_applicable"}
+                and not any(
+                    _is_source_mechanism_obligation(item)
+                    and item.blocks_finalization
+                    for item in current.verification_obligations
+                )
+            ))
+            if snapshot.phase == "explore" and state.step + 1 >= CONVERGE_START_STEP:
+                if source_ready or not source_workspace_available:
+                    return replace(snapshot, phase="converge")
+                if boundary != "source_verify_hold":
+                    trace.record("INVESTIGATION_PHASE_HELD", {
+                        "boundary": boundary,
+                        "requested_phase": "converge",
+                        "effective_phase": "source_verify",
+                        "reason": "source_relevance_gate_open",
+                        "source_mechanism_status": current.source_mechanism_status if current else "unknown",
+                    })
+                return replace(snapshot, phase="source_verify")
+            return snapshot
 
         def budget_payload(snapshot) -> dict[str, Any]:
             dynamic_state = dynamic_budget.decision(
@@ -629,10 +703,29 @@ class DiagnosisHarness:
                     # callers either finalize an already-valid hypothesis or
                     # terminate INCONCLUSIVE.
                     if (
-                        stage in {"planner", "tool", "reflection", "review", "contract_repair"}
+                        stage in {"planner", "tool", "reflection", "contract_repair"}
                         and not allow_targeted_recovery
                     ):
                         raise RunBudgetAdmissionExceeded(dynamic_state)
+            if stage == "review":
+                remaining_tokens = max(0, self.config.max_total_tokens - (prompt_tokens + completion_tokens))
+                if remaining_tokens < self.config.review_reserve_tokens:
+                    trace.record("REVIEW_RESERVE_EXHAUSTED", {
+                        "remaining_tokens": remaining_tokens,
+                        "required_tokens": self.config.review_reserve_tokens,
+                        "review_calls_used": review_calls,
+                        "review_calls_reserved": self.config.review_reserve_calls,
+                    })
+                    raise RunBudgetAdmissionExceeded(replace(
+                        dynamic_state,
+                        state=BudgetState.HARD_PRESSURE,
+                        reason="review stage reserve unavailable",
+                        breakdown={
+                            **dynamic_state.breakdown,
+                            "remaining_run_tokens": remaining_tokens,
+                            "review_reserve_tokens": self.config.review_reserve_tokens,
+                        },
+                    ))
             if snapshot.tokens_used >= self.config.max_total_tokens:
                 raise RuntimeError("max_total_tokens exceeded")
             if (
@@ -641,6 +734,8 @@ class DiagnosisHarness:
             ):
                 raise RuntimeError("max_cost_per_incident exceeded")
             if count_llm:
+                if stage == "review" and review_calls >= self.config.review_reserve_calls:
+                    raise RunBudgetAdmissionExceeded(dynamic_state)
                 if llm_calls >= self.config.max_llm_calls:
                     raise RuntimeError("max_llm_calls exceeded")
                 llm_calls += 1
@@ -906,6 +1001,77 @@ class DiagnosisHarness:
             """Return canonical CODE Evidence from verified source-reading tools."""
             return evidence_memory.source_evidence_ids()
 
+        def evaluate_source_claims(claims: tuple[SourceClaim, ...] | list[SourceClaim] = ()) -> dict[str, Any]:
+            """Check claim/evidence coverage without judging claim truth.
+
+            A source claim is covered only when every line in its declared file
+            range is contained by the union of its cited canonical ``read_file``
+            CODE Evidence ranges.  This is intentionally an agreement check
+            between the Planner declaration and observed source Evidence; Gold
+            and fault labels never participate.
+            """
+            def canonical_path(value: str) -> str:
+                raw = str(value or "").replace("\\", "/").strip().lstrip("./")
+                # Source tools expose paths relative to the bound ``code`` root.
+                # Accept one explicit root prefix, but never recursively strip it.
+                if raw == "code":
+                    return "."
+                if raw.startswith("code/"):
+                    raw = raw[len("code/"):]
+                return raw or "."
+
+            canonical_by_id = {
+                item.evidence_id: item for item in evidence_memory.pinned
+                if is_canonical_source_evidence(None, item, evidence_memory=evidence_memory)
+            }
+            results: list[dict[str, Any]] = []
+            for claim in tuple(claims or ()):
+                wanted_path = canonical_path(claim.file)
+                intervals: list[tuple[int, int, str]] = []
+                missing_ids: list[str] = []
+                for evidence_id in claim.evidence_ids:
+                    evidence = canonical_by_id.get(str(evidence_id))
+                    if evidence is None:
+                        missing_ids.append(str(evidence_id))
+                        continue
+                    if canonical_path(evidence.file or "") != wanted_path:
+                        missing_ids.append(str(evidence_id))
+                        continue
+                    start = evidence.source_start_line
+                    end = evidence.source_end_line
+                    if not isinstance(start, int) or not isinstance(end, int):
+                        missing_ids.append(str(evidence_id))
+                        continue
+                    intervals.append((start, end, evidence.evidence_id))
+                intervals.sort()
+                cursor = claim.start_line
+                for start, end, _ in intervals:
+                    if end < cursor:
+                        continue
+                    if start > cursor:
+                        break
+                    cursor = max(cursor, end + 1)
+                    if cursor > claim.end_line:
+                        break
+                covered = bool(intervals) and cursor > claim.end_line and not missing_ids
+                results.append({
+                    "file": wanted_path,
+                    "symbol": claim.symbol,
+                    "start_line": claim.start_line,
+                    "end_line": claim.end_line,
+                    "claim": claim.claim,
+                    "evidence_ids": list(claim.evidence_ids),
+                    "covered": covered,
+                    "missing_or_mismatched_evidence_ids": sorted(set(missing_ids)),
+                })
+            return {
+                "claims": results,
+                "claim_count": len(results),
+                "covered_claim_count": sum(1 for item in results if item["covered"]),
+                "all_claims_covered": bool(results) and all(item["covered"] for item in results),
+                "source_evidence_ids": sorted(canonical_by_id),
+            }
+
         obligation_state: dict[str, VerificationObligation] = {}
 
         def _obligation_id(claim: str) -> str:
@@ -1131,9 +1297,26 @@ class DiagnosisHarness:
             proposed_source_status = getattr(
                 selection, "source_mechanism_status", "unknown"
             ) or "unknown"
+            active_source_claims = tuple(getattr(selection, "source_claims", ()) or ())
+            if not active_source_claims and old is not None:
+                active_source_claims = tuple(old.source_claims or ())
+            source_coverage = evaluate_source_claims(active_source_claims)
+            trace.record("SOURCE_MECHANISM_RELEVANCE_EVALUATED", {
+                "capability_available": source_capability_available,
+                "capability_gaps": list(source_capability_gaps),
+                **source_coverage,
+                "reason": "runtime_file_and_complete_line_range_coverage_only",
+            })
+            claim_source_ids = tuple(dict.fromkeys(
+                evidence_id
+                for claim in active_source_claims
+                for evidence_id in claim.evidence_ids
+                if evidence_id in set(source_ids)
+            ))
+            source_support_ids = tuple(dict.fromkeys((*cited_source_ids, *claim_source_ids)))
             source_status = (
                 "not_applicable" if not source_capability_available
-                else "sufficient" if cited_source_ids else "gap"
+                else "sufficient" if source_coverage["all_claims_covered"] else "gap"
             )
             if proposed_source_status != source_status:
                 trace.record("SOURCE_MECHANISM_STATUS_OVERRIDDEN", {
@@ -1141,7 +1324,8 @@ class DiagnosisHarness:
                     "runtime_status": source_status,
                     "capability_available": source_capability_available,
                     "capability_gaps": list(source_capability_gaps),
-                    "cited_source_evidence_ids": list(cited_source_ids),
+                    "cited_source_evidence_ids": list(source_support_ids),
+                    "source_claim_count": len(active_source_claims),
                     "reason": "runtime_owned_source_coverage",
                 })
             source_obligation = next(
@@ -1161,7 +1345,7 @@ class DiagnosisHarness:
                     else "NOT_APPLICABLE_BY_CAPABILITY"
                     if source_status == "not_applicable" else "OPEN"
                 )
-                desired_support = tuple(cited_source_ids) if desired_status == "SATISFIED" else ()
+                desired_support = tuple(source_support_ids) if desired_status == "SATISFIED" else ()
                 desired_blocked = (
                     tuple(source_capability_gaps)
                     if desired_status == "NOT_APPLICABLE_BY_CAPABILITY" else ()
@@ -1292,12 +1476,15 @@ class DiagnosisHarness:
                 fault_code=selection.candidate_fault_code,
                 fault_explanation=selection.candidate_fault_explanation,
                 mechanism=selection.candidate_mechanism,
-                supporting_evidence_ids=selection.supporting_evidence_ids,
+                supporting_evidence_ids=tuple(dict.fromkeys(
+                    (*selection.supporting_evidence_ids, *source_support_ids)
+                )),
                 contradicting_evidence_ids=flat_contradictions,
                 required_gaps=required_projection,
                 evidence_sufficient=selection.evidence_sufficiency == "sufficient",
                 mechanism_category=selection.mechanism_category,
                 source_mechanism_status=source_status,
+                source_claims=active_source_claims,
                 verification_obligations=tuple(obligation_state.values()),
                 contradictions=structured_contradictions,
             )
@@ -1697,6 +1884,17 @@ class DiagnosisHarness:
         def trigger_reflection(reason: str, *, review_feedback_text: str = "") -> str:
             nonlocal reflection_calls, reflection_feedback, reflection_trigger, schema_repair_count
             nonlocal llm_calls, reflection_no_delta_count, consecutive_reflection_no_delta
+            if (
+                CONVERGE_DISABLE_REFLECTIONS
+                and self.config.converge_disable_reflections
+                and state.step + 1 >= CONVERGE_START_STEP
+            ):
+                trace.record("REFLECTION_SKIPPED", {
+                    "reason": "converge_hard_call_budget",
+                    "trigger": reason,
+                    "converge_start_step": CONVERGE_START_STEP,
+                })
+                return ""
             if not self.config.enable_reflection or self.config.max_reflection_calls == 0:
                 return ""
             if consecutive_reflection_no_delta >= self.config.max_consecutive_reflection_calls:
@@ -2061,8 +2259,11 @@ class DiagnosisHarness:
                         evidence_id for evidence_id in source_evidence_ids()
                         if evidence_id in set(source_obligation.supporting_evidence_ids)
                     )
+                    source_relevance = evaluate_source_claims(hypothesis.source_claims)
                     source_state_valid = (
-                        source_obligation.status == "SATISFIED" and bool(cited_source_ids)
+                        source_obligation.status == "SATISFIED"
+                        and bool(cited_source_ids)
+                        and source_relevance["all_claims_covered"]
                         if source_capability_available
                         else source_obligation.status == "NOT_APPLICABLE_BY_CAPABILITY"
                     )
@@ -2074,6 +2275,7 @@ class DiagnosisHarness:
                             "capability_available": source_capability_available,
                             "capability_gaps": source_capability_gaps,
                             "cited_source_evidence_ids": list(cited_source_ids),
+                            "source_relevance": source_relevance,
                         })
                         raise RuntimeError(
                             "source verification obligation is not Runtime-validated"
@@ -2348,6 +2550,29 @@ class DiagnosisHarness:
                 dynamic_context_tokens = dynamic_budget.context_token_budget(
                     state=dynamic_state.state,
                 )
+                closure_ids = tuple(dict.fromkeys(
+                    evidence_id
+                    for evidence_id in (
+                        *(hypotheses[-1].supporting_evidence_ids if hypotheses else ()),
+                        *(
+                            evidence_id
+                            for claim in (hypotheses[-1].source_claims if hypotheses else ())
+                            for evidence_id in claim.evidence_ids
+                        ),
+                        *(
+                            source_evidence_ids()
+                            if runtime_budget.phase in {"source_verify", "converge", "verify_only", "finalize"}
+                            else ()
+                        ),
+                    )
+                    if evidence_id in {item.evidence_id for item in evidence_memory.pinned}
+                ))
+                if runtime_budget.phase in {"source_verify", "converge", "verify_only", "finalize"}:
+                    trace.record("CLOSURE_CONTEXT_PACK", {
+                        "phase": runtime_budget.phase,
+                        "retained_evidence_ids": list(closure_ids),
+                        "reason": "retain hypothesis/source-claim Evidence during bounded closure",
+                    })
                 context_result = context_manager.build(
                     state, evidence_memory, observation_store,
                     max_context_chars=(
@@ -2356,6 +2581,7 @@ class DiagnosisHarness:
                     max_context_tokens=dynamic_context_tokens,
                     token_estimator=dynamic_budget.estimate_tokens,
                     max_steps=step_limit, max_tool_calls=tool_limit,
+                    requested_ids=closure_ids,
                     include_agent_control_state=False,
                     external_context_chars=len(control_prefix),
                     pressure_state=dynamic_state.state.value,
@@ -2426,25 +2652,46 @@ class DiagnosisHarness:
                 planner_call_context = context
                 planner_phase = budget_snapshot("planner_start").phase
                 converge_budget_kwargs: dict[str, Any] = {}
-                if planner_phase == "converge":
+                if planner_phase in {"converge", "source_verify"}:
+                    phase_is_converge = planner_phase == "converge"
+                    phase_reasoning_limit = (
+                        self.config.converge_max_reasoning_tokens
+                        if phase_is_converge else self.config.source_verify_max_output_tokens
+                    )
+                    phase_output_limit = (
+                        self.config.converge_max_output_tokens
+                        if phase_is_converge else self.config.source_verify_max_output_tokens
+                    )
+                    phase_read_limit = (
+                        self.config.converge_max_read_file_calls
+                        if phase_is_converge else self.config.source_verify_max_read_file_calls
+                    )
                     remaining_reads = max(
-                        0, CONVERGE_MAX_READ_FILE_CALLS - converge_read_file_calls
+                        0, phase_read_limit - converge_read_file_calls
                     )
                     planner_call_context += (
-                        "\n\nRUNTIME_CONVERGENCE_CONTROL: This is a Runtime-enforced convergence turn. "
-                        f"Keep hidden reasoning within {CONVERGE_MAX_REASONING_TOKENS} tokens, "
+                        "\n\nRUNTIME_SOURCE_CONTROL: This is a Runtime-enforced bounded source-investigation turn. "
+                        f"Keep hidden reasoning within {phase_reasoning_limit} tokens, "
                         f"use at most {remaining_reads} further read_file call(s), and close the "
                         "current evidence gap or finalize; do not open a new investigation branch."
                     )
-                    converge_budget_kwargs["max_output_tokens"] = CONVERGE_MAX_OUTPUT_TOKENS
+                    converge_budget_kwargs["max_output_tokens"] = phase_output_limit
+                    converge_budget_kwargs["enable_thinking"] = CONVERGE_ENABLE_THINKING
                     trace.record("CONVERGE_BUDGET_APPLIED", {
                         "step": state.step + 1,
                         "phase": planner_phase,
-                        "max_reasoning_tokens": CONVERGE_MAX_REASONING_TOKENS,
-                        "provider_completion_cap_tokens": CONVERGE_MAX_OUTPUT_TOKENS,
-                        "max_read_file_calls": CONVERGE_MAX_READ_FILE_CALLS,
+                        "max_reasoning_tokens": phase_reasoning_limit,
+                        "provider_completion_cap_tokens": phase_output_limit,
+                        "enable_thinking": CONVERGE_ENABLE_THINKING,
+                        "reasoning_mode": "disabled",
+                        "max_read_file_calls": phase_read_limit,
                         "read_file_calls_used": converge_read_file_calls,
                         "read_file_calls_remaining": remaining_reads,
+                        "converge_start_step": CONVERGE_START_STEP,
+                        "reflections_disabled": bool(
+                            CONVERGE_DISABLE_REFLECTIONS
+                            and self.config.converge_disable_reflections
+                        ),
                         "enforcement": "runtime_adapter_completion_cap_and_action_gate",
                     })
                 prompt_budget_retry = False
@@ -2462,21 +2709,22 @@ class DiagnosisHarness:
                             allow_targeted_recovery=contract_retry_for_step,
                         )
                         planner_timeout = provider_timeout(self.config.planner_llm_timeout_seconds)
-                        planner_kwargs = dict(converge_budget_kwargs)
-                        if planner_kwargs:
-                            try:
-                                planner_parameters = inspect.signature(planner.propose).parameters
-                                accepts_kwargs = any(
-                                    item.kind is inspect.Parameter.VAR_KEYWORD
-                                    for item in planner_parameters.values()
-                                )
-                                if (
-                                    "max_output_tokens" not in planner_parameters
-                                    and not accepts_kwargs
-                                ):
-                                    planner_kwargs.clear()
-                            except (TypeError, ValueError):
-                                planner_kwargs.clear()
+                        planner_kwargs = {
+                            "max_output_tokens": self.config.planner_max_completion_tokens,
+                            **dict(converge_budget_kwargs),
+                        }
+                        try:
+                            planner_parameters = inspect.signature(planner.propose).parameters
+                            accepts_kwargs = any(
+                                item.kind is inspect.Parameter.VAR_KEYWORD
+                                for item in planner_parameters.values()
+                            )
+                            planner_kwargs = {
+                                key: value for key, value in planner_kwargs.items()
+                                if key in planner_parameters or accepts_kwargs
+                            }
+                        except (TypeError, ValueError):
+                            planner_kwargs = {}
                         result = self._provider_call(
                             planner.propose,
                             state, planner_call_context,
@@ -2647,16 +2895,24 @@ class DiagnosisHarness:
                         "model": model_capability.model or self.model,
                         **dict(audit),
                     })
-                if planner_phase == "converge":
+                if planner_phase in {"converge", "source_verify"}:
+                    phase_reasoning_limit = (
+                        self.config.converge_max_reasoning_tokens
+                        if planner_phase == "converge" else self.config.source_verify_max_output_tokens
+                    )
+                    phase_output_limit = (
+                        self.config.converge_max_output_tokens
+                        if planner_phase == "converge" else self.config.source_verify_max_output_tokens
+                    )
                     usage = dict(result.response.usage or {})
                     completion_details = usage.get("completion_tokens_details") or {}
                     reasoning_tokens = completion_details.get("reasoning_tokens")
-                    if reasoning_tokens is not None and int(reasoning_tokens) > CONVERGE_MAX_REASONING_TOKENS:
+                    if reasoning_tokens is not None and int(reasoning_tokens) > phase_reasoning_limit:
                         trace.record("CONVERGE_REASONING_LIMIT_EXCEEDED", {
                             "step": state.step,
                             "reasoning_tokens": int(reasoning_tokens),
-                            "max_reasoning_tokens": CONVERGE_MAX_REASONING_TOKENS,
-                            "provider_completion_cap_tokens": CONVERGE_MAX_OUTPUT_TOKENS,
+                            "max_reasoning_tokens": phase_reasoning_limit,
+                            "provider_completion_cap_tokens": phase_output_limit,
                             "tool_call_count": len(result.tool_calls),
                             "reason": "provider usage exceeded Runtime convergence reasoning limit",
                         })
@@ -2664,11 +2920,11 @@ class DiagnosisHarness:
                             "convergence planner reasoning limit exceeded"
                         )
                 if not result.tool_calls:
-                    if budget_snapshot("converge_empty_response").phase == "converge":
+                    if planner_phase in {"converge", "source_verify"}:
                         trace.record("CONVERGE_OUTPUT_CAP_EXHAUSTED", {
                             "step": state.step,
-                            "provider_completion_cap_tokens": CONVERGE_MAX_OUTPUT_TOKENS,
-                            "max_reasoning_tokens": CONVERGE_MAX_REASONING_TOKENS,
+                            "provider_completion_cap_tokens": phase_output_limit,
+                            "max_reasoning_tokens": phase_reasoning_limit,
                             "reason": "provider returned no executable action after bounded completion envelope",
                             "hypothesis": hypotheses[-1].model_dump() if hypotheses else None,
                         })
@@ -2852,16 +3108,22 @@ class DiagnosisHarness:
                         "repair_attempted": repair_attempted,
                         "repair": repair_result_for_admission,
                     })
+                    read_gate_phase = budget_snapshot("converge_read_gate").phase
+                    phase_read_limit = (
+                        self.config.converge_max_read_file_calls
+                        if read_gate_phase == "converge"
+                        else self.config.source_verify_max_read_file_calls
+                    )
                     if (
-                        budget_snapshot("converge_read_gate").phase == "converge"
+                        read_gate_phase in {"converge", "source_verify"}
                         and call.name == "read_file"
-                        and converge_read_file_calls >= CONVERGE_MAX_READ_FILE_CALLS
+                        and converge_read_file_calls >= phase_read_limit
                     ):
                         rejection = {
                             "step": state.step,
                             "tool": call.name,
-                            "reason": "converge_read_file_budget_exhausted",
-                            "limit": CONVERGE_MAX_READ_FILE_CALLS,
+                            "reason": "source_read_file_budget_exhausted",
+                            "limit": phase_read_limit,
                             "calls_used": converge_read_file_calls,
                         }
                         trace.record("CONVERGE_READ_FILE_REJECTED", rejection)
@@ -3014,7 +3276,7 @@ class DiagnosisHarness:
                         )
                     tool = tools.get(call.name)
                     if (
-                        budget_snapshot("converge_read_file_execute").phase == "converge"
+                        budget_snapshot("converge_read_file_execute").phase in {"converge", "source_verify"}
                         and call.name == "read_file"
                     ):
                         converge_read_file_calls += 1
@@ -3319,6 +3581,13 @@ class DiagnosisHarness:
                         "effective_timeout": review_timeout,
                         "remaining_run_deadline": remaining_run_deadline,
                     })
+                    trace.record("REVIEW_RESERVE_APPLIED", {
+                        "round": review_rounds,
+                        "reserve_tokens": self.config.review_reserve_tokens,
+                        "reserve_calls": self.config.review_reserve_calls,
+                        "call_index": review_calls,
+                        "policy": "review_stage_owns_terminal_reserve",
+                    })
                     blocking_contradictions = tuple(
                         item.model_dump()
                         for item in (hypotheses[-1].contradictions if hypotheses else ())
@@ -3331,6 +3600,9 @@ class DiagnosisHarness:
                         source_workspace_available=source_workspace_available,
                         available_code_tools=available_code_tools,
                         source_evidence_ids=source_evidence_ids(),
+                        source_relevance=evaluate_source_claims(
+                            current_hypothesis.source_claims if current_hypothesis else ()
+                        ),
                     )
                     open_critical_obligations = tuple(
                         item.model_dump()
@@ -3359,6 +3631,9 @@ class DiagnosisHarness:
                                 "last_prompt_breakdowns",
                             ),
                             prompt_budget=dynamic_budget,
+                            max_output_tokens=self.config.review_max_completion_tokens,
+                            repair_max_output_tokens=self.config.review_repair_max_completion_tokens,
+                            allow_terminal_reserve=True,
                         )
                     except RunBudgetAdmissionExceeded as exc:
                         # Review is the terminal semantic gate. A run-budget
@@ -3465,7 +3740,7 @@ class DiagnosisHarness:
                         source_context.get("application_code_declared")
                         and source_context.get("workspace_available")
                         and source_context.get("status") in {"unknown", "gap"}
-                        and not source_context.get("cited_source_backed_evidence_ids")
+                        and not source_context.get("source_relevance", {}).get("all_claims_covered")
                     ):
                         review_gate_gaps.append(
                             "The application-level mechanism is not supported by cited source Evidence."
@@ -4128,6 +4403,7 @@ class DiagnosisHarness:
                 "mechanism": current.mechanism,
                 "supporting_evidence_ids": list(current.supporting_evidence_ids),
                 "contradicting_evidence_ids": list(current.contradicting_evidence_ids),
+                "source_claims": [item.model_dump() for item in current.source_claims],
                 "required_gaps": list(current.required_gaps),
                 "evidence_sufficient": current.evidence_sufficient,
                 "source_mechanism_status": current.source_mechanism_status,
@@ -4150,6 +4426,7 @@ class DiagnosisHarness:
         source_workspace_available: bool,
         available_code_tools=(),
         source_evidence_ids=(),
+        source_relevance: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Project source capability and coverage without deciding causality."""
         source_ids = tuple(str(item) for item in source_evidence_ids if str(item).startswith("ev-"))
@@ -4159,6 +4436,8 @@ class DiagnosisHarness:
             "workspace_available": bool(source_workspace_available),
             "available_code_tools": list(available_code_tools),
             "status": hypothesis.source_mechanism_status if hypothesis else "unknown",
+            "source_claims": [item.model_dump() for item in (hypothesis.source_claims if hypothesis else ())],
+            "source_relevance": dict(source_relevance or {}),
             "source_backed_evidence_ids": list(source_ids),
             "cited_source_backed_evidence_ids": sorted(supporting.intersection(source_ids)),
             "open_critical_obligation_ids": [
@@ -4190,6 +4469,7 @@ class DiagnosisHarness:
                     "evidence_ids": hypothesis.supporting_evidence_ids,
                 },
             ),
+            source_claims=hypothesis.source_claims,
         )
 
     @staticmethod
@@ -4232,6 +4512,10 @@ class DiagnosisHarness:
             # These fields remain Planner-authored argumentation metadata.
             claim_evidence_mapping=tuple(proposal.get("claim_evidence_mapping") or ()),
             causal_chain_summary=tuple(proposal.get("causal_chain_summary") or ()),
+            # Source claims are copied from the Runtime-normalized hypothesis;
+            # finalize_diagnosis cannot introduce a new source range at the
+            # terminal boundary after coverage has been evaluated.
+            source_claims=hypothesis.source_claims,
         )
 
     @classmethod

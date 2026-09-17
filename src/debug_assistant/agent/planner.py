@@ -16,7 +16,7 @@ from debug_assistant.skills.loader import SkillLibrary
 from debug_assistant.tools.registry import PARALLEL_ALLOWED_TOOLS
 from debug_assistant.tools.repository import REPOSITORY_SOURCE_MAX_LINES
 from debug_assistant.incidents.contracts import (
-    Contradiction, SourceMechanismStatus, VerificationObligation,
+    Contradiction, SourceClaim, SourceMechanismStatus, VerificationObligation,
 )
 from debug_assistant.agent.output_normalization import (
     INCIDENT_REQUIRED_CONTROL_FIELDS,
@@ -114,6 +114,7 @@ class NativeSkillSelection:
     compatibility_normalizations: tuple[str, ...] = ()
     obligation_id: str = ""
     expected_information_gain: str = ""
+    source_claims: tuple[SourceClaim, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,7 +169,8 @@ class NativeToolPlanner:
     def propose(self, state: AgentState, context: str, *, logical_timeout_seconds=None,
                 on_attempt_started=None, prompt_budget=None,
                 visible_tool_names: Iterable[str] | None = None,
-                max_output_tokens: int | None = None) -> NativePlannerResult:
+                max_output_tokens: int | None = None,
+                enable_thinking: bool | None = None) -> NativePlannerResult:
         if not getattr(getattr(self.llm, "capabilities", ProviderCapabilities()), "tool_calling", False):
             raise PlannerContractError("provider does not support native tool calling",
                                        validation_errors=["tool_calling=false"])
@@ -216,6 +218,16 @@ class NativeToolPlanner:
                 + str(REPOSITORY_SOURCE_MAX_LINES) + ". For a concrete source file involved in the "
                 "hypothesis, prefer one broad bounded read that covers the relevant file or complete "
                 "implementation region, rather than mechanically splitting a file into 200-line pages. "
+                "When RUNTIME_SOURCE_CONTROL is present, use a short source-closure path: if a search "
+                "hit identifies a concrete file and line, read that hit with nearby context on the next "
+                "turn, then finalize if the component and mechanism are supported; do not reopen unrelated "
+                "startup, dependency, or whole-file branches. When a read_file CODE Evidence supports a "
+                "source behavior claim, include source_claims on the same or next finalize_diagnosis call. "
+                "Each source_claim must use the canonical repository-relative file, an exact covered line "
+                "range of at most 200 lines, the cited read_file Evidence ID(s), and a concise claim. "
+                "Keep fixed-size allocations distinct from unbounded retention: describe the observed code "
+                "precisely and do not call a bounded loop a leak unless the Evidence establishes retention "
+                "across requests. "
                 "Never provide end_line for read_file. "
                 "Use finalize_diagnosis only when the cited evidence supports both component and causal mechanism. "
                 "At finalize_diagnosis, component/fault/mechanism/evidence_ids are compatibility projections; "
@@ -274,10 +286,24 @@ class NativeToolPlanner:
                                       "tool_schema_count": len(schemas)}
         self.last_prompt_breakdowns = []
         if prompt_budget is not None:
-            decision = prompt_budget.check_prompt(
-                "planner", system, user, tools=schemas,
-                breakdown={"incident": context},
-            )
+            budget_kwargs = {"tools": schemas, "breakdown": {"incident": context}}
+            try:
+                budget_signature = inspect.signature(prompt_budget.check_prompt)
+                accepts_budget_kwargs = any(
+                    item.kind is inspect.Parameter.VAR_KEYWORD
+                    for item in budget_signature.parameters.values()
+                )
+            except (TypeError, ValueError):
+                budget_signature = None
+                accepts_budget_kwargs = False
+            if max_output_tokens is not None and (
+                accepts_budget_kwargs or (
+                    budget_signature is not None
+                    and "completion_reserve_tokens" in budget_signature.parameters
+                )
+            ):
+                budget_kwargs["completion_reserve_tokens"] = int(max_output_tokens)
+            decision = prompt_budget.check_prompt("planner", system, user, **budget_kwargs)
             self.last_prompt_breakdown.update({
                 "estimated_prompt_tokens": decision.estimated_prompt_tokens,
                 "input_hard_capacity": decision.input_hard_capacity,
@@ -300,6 +326,8 @@ class NativeToolPlanner:
             kwargs["on_attempt_started"] = on_attempt_started
         if ("max_output_tokens" in parameters or has_varkw) and max_output_tokens is not None:
             kwargs["max_output_tokens"] = int(max_output_tokens)
+        if ("enable_thinking" in parameters or has_varkw) and enable_thinking is not None:
+            kwargs["enable_thinking"] = bool(enable_thinking)
         try:
             response = method(system, user, **kwargs)
         except LLMOutputError as exc:
@@ -442,6 +470,7 @@ class NativeToolPlanner:
                 fault_explanation = control.get("candidate_fault_explanation") or ""
                 raw_obligations = control["verification_obligations"]
                 raw_contradictions = control["contradictions"]
+                raw_source_claims = control["source_claims"]
                 if skill not in INCIDENT_SKILLS:
                     raise contract_error(
                         f"unknown skill: {skill}", error_type="unknown_skill",
@@ -498,19 +527,26 @@ class NativeToolPlanner:
                     raw_contradictions, field_name="contradictions",
                     model_type=Contradiction,
                 )
+                source_claim_result = _parse_optional_reasoning_items(
+                    raw_source_claims, field_name="source_claims",
+                    model_type=SourceClaim,
+                )
                 obligations = obligation_result.items
                 structured_contradictions = contradiction_result.items
                 reasoning_metadata_warnings = (
                     *obligation_result.validation_warnings,
                     *contradiction_result.validation_warnings,
+                    *source_claim_result.validation_warnings,
                 )
                 reasoning_metadata_normalizations = (
                     *obligation_result.normalization_actions,
                     *contradiction_result.normalization_actions,
+                    *source_claim_result.normalization_actions,
                 )
                 reasoning_metadata_drops = (
                     *obligation_result.dropped_items,
                     *contradiction_result.dropped_items,
+                    *source_claim_result.dropped_items,
                 )
                 structured_ids = [
                     item.evidence_id for item in structured_contradictions
@@ -518,6 +554,10 @@ class NativeToolPlanner:
                     evidence_id
                     for item in obligations
                     for evidence_id in item.supporting_evidence_ids
+                ] + [
+                    evidence_id
+                    for item in source_claim_result.items
+                    for evidence_id in item.evidence_ids
                 ]
                 invalid_structured_ids = [
                     evidence_id for evidence_id in structured_ids
@@ -583,6 +623,7 @@ class NativeToolPlanner:
                     reasoning_metadata_drops,
                     compatibility_normalizations,
                     obligation_id.strip(), expected_information_gain.strip(),
+                    tuple(source_claim_result.items),
                 ))
             else:
                 sanitized_calls.append(call)
@@ -893,6 +934,15 @@ def _with_incident_skill_controls(schema: dict[str, Any]) -> dict[str, Any]:
             "items": _optional_item_schema(Contradiction),
             "description": "Optional structured contradiction metadata.",
         },
+        "source_claims": {
+            "type": "array",
+            "items": _optional_item_schema(SourceClaim),
+            "description": (
+                "Optional source claims. Runtime checks that each declared "
+                "file and complete line range is covered by cited read_file CODE Evidence; "
+                "it does not compare the claim with Gold."
+            ),
+        },
         "obligation_id": {"type": "string", "description": "Open verification obligation targeted by this action, when known."},
         "expected_information_gain": {"type": "string", "enum": ["low", "medium", "high"], "description": "Expected information gain of this action."},
     })
@@ -1167,10 +1217,23 @@ class Planner:
         user+=f"\n{catalog_text}\n\n{examples}\n\nTOOLS (strict schemas; suggested skill/tool affinity is guidance, not permission):\n{tools_text}\n\n{contract}\n{instruction}"
         self.last_prompt_breakdown={'system_chars':len(SYSTEM),'context_chars':len(context),'skill_catalog_chars':len(skills),'tool_catalog_chars':len(tools_text),'runtime_catalog_chars':len(catalog_text),'active_skill_chars':len(active_skill),'contract_chars':len(contract),'instruction_chars':len(instruction),'valid_skill_count':len(catalog['skills']),'valid_tool_count':len(catalog['tools']),'parallel_tool_count':len(catalog['parallel_tools']),'question_type_count':len(catalog['question_types'])}
         if prompt_budget is not None:
-            decision = prompt_budget.check_prompt(
-                "planner", SYSTEM, user,
-                breakdown={"incident": context, "tools": tools_text},
-            )
+            budget_kwargs = {"breakdown": {"incident": context, "tools": tools_text}}
+            if max_output_tokens is not None:
+                try:
+                    budget_signature = inspect.signature(prompt_budget.check_prompt)
+                    accepts_budget_kwargs = any(
+                        item.kind is inspect.Parameter.VAR_KEYWORD
+                        for item in budget_signature.parameters.values()
+                    )
+                except (TypeError, ValueError):
+                    budget_signature = None
+                    accepts_budget_kwargs = False
+                if accepts_budget_kwargs or (
+                    budget_signature is not None
+                    and "completion_reserve_tokens" in budget_signature.parameters
+                ):
+                    budget_kwargs["completion_reserve_tokens"] = int(max_output_tokens)
+            decision = prompt_budget.check_prompt("planner", SYSTEM, user, **budget_kwargs)
             self.last_prompt_breakdown.update({
                 "estimated_prompt_tokens": decision.estimated_prompt_tokens,
                 "input_hard_capacity": decision.input_hard_capacity,
@@ -1209,6 +1272,7 @@ repaired without changing intent, return {{"repair_failed": "structural intent c
                     repair_decision = prompt_budget.check_prompt(
                         "planner", repair_schema, repair_user,
                         breakdown={"incident": repair_user},
+                        completion_reserve_tokens=max_output_tokens,
                     )
                     repair_breakdown = {
                         "stage": "planner_schema_repair",

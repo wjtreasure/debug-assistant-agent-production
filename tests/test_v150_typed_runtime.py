@@ -352,6 +352,31 @@ async def test_openai_compatible_provider_returns_native_tool_calls():
     assert response.usage["total_tokens"] == 5
 
 
+@pytest.mark.asyncio
+async def test_openai_compatible_provider_can_disable_thinking_for_bounded_tool_turn():
+    class Transport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            body = json.loads(request.content)
+            assert body["enable_thinking"] is False
+            assert body["max_tokens"] == 3000
+            return httpx.Response(200, request=request, json={
+                "choices": [{"message": {"content": "", "tool_calls": [
+                    {"id": "call-1", "function": {"name": "grep", "arguments": '{"query":"needle"}'}}
+                ]}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 12, "total_tokens": 15,
+                          "completion_tokens_details": {"reasoning_tokens": 0}},
+            })
+
+    from debug_assistant.llm.openai_compatible import OpenAICompatibleClient
+    client = OpenAICompatibleClient("https://example.invalid/v1", "key", "model", async_transport=Transport())
+    response = await client.acomplete_json(
+        "s", "u", tools=[{"type": "function", "function": {"name": "grep"}}],
+        return_response=True, logical_timeout_seconds=1, max_output_tokens=3000,
+        enable_thinking=False,
+    )
+    assert response.tool_calls[0].name == "grep"
+
+
 def test_native_no_tool_turn_keeps_natural_language_typed(tmp_path):
     class NoToolLLM:
         capabilities = ProviderCapabilities(tool_calling=True)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import time
 from typing import Any
 
@@ -229,7 +230,10 @@ class FinalReviewAgent:
                source_mechanism_context: dict | None = None,
                open_critical_obligations: tuple[dict, ...] = (),
                logical_timeout_seconds: float | None = None,
-               on_attempt_started=None, prompt_budget=None) -> ReviewDecision:
+               on_attempt_started=None, prompt_budget=None,
+               max_output_tokens: int | None = None,
+               repair_max_output_tokens: int | None = None,
+               allow_terminal_reserve: bool = False) -> ReviewDecision:
         cited = set(candidate.evidence_ids)
         payload = {
             "candidate": candidate.model_dump(),
@@ -272,9 +276,31 @@ class FinalReviewAgent:
 
         def call_stage(stage: str, system: str, user: str):
             if prompt_budget is not None:
+                budget_kwargs = {"breakdown": {"evidence": user}}
+                try:
+                    budget_signature = inspect.signature(prompt_budget.check_prompt)
+                    accepts_budget_kwargs = any(
+                        item.kind is inspect.Parameter.VAR_KEYWORD
+                        for item in budget_signature.parameters.values()
+                    )
+                except (TypeError, ValueError):
+                    budget_signature = None
+                    accepts_budget_kwargs = False
+                if accepts_budget_kwargs or (
+                    budget_signature is not None
+                    and "completion_reserve_tokens" in budget_signature.parameters
+                ):
+                    budget_kwargs["completion_reserve_tokens"] = (
+                        repair_max_output_tokens if stage == "schema_repair"
+                        else max_output_tokens
+                    )
+                if accepts_budget_kwargs or (
+                    budget_signature is not None
+                    and "allow_terminal_reserve" in budget_signature.parameters
+                ):
+                    budget_kwargs["allow_terminal_reserve"] = allow_terminal_reserve
                 budget_decision = prompt_budget.check_prompt(
-                    "review", system, user,
-                    breakdown={"evidence": user},
+                    "review", system, user, **budget_kwargs,
                 )
                 self.last_prompt_breakdown = {
                     "estimated_prompt_tokens": budget_decision.estimated_prompt_tokens,
@@ -308,6 +334,11 @@ class FinalReviewAgent:
                     model=self.model or None,
                     logical_timeout_seconds=timeout,
                     on_attempt_started=on_attempt_started,
+                    max_output_tokens=(
+                        repair_max_output_tokens if stage == "schema_repair"
+                        else max_output_tokens
+                    ),
+                    enable_thinking=False,
                 )
             except BaseException as exc:
                 attempt.update({

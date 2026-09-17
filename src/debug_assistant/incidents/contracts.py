@@ -95,6 +95,31 @@ class ClaimEvidenceMapping(BaseModel):
     evidence_ids: tuple[EvidenceId, ...] = Field(min_length=1)
 
 
+class SourceClaim(BaseModel):
+    """Planner-declared source claim whose coverage is Runtime-checkable.
+
+    Runtime validates only that the declared file/range is fully covered by
+    cited read_file CODE Evidence.  It deliberately does not decide whether
+    the claim is true or matches evaluator Gold.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    file: str = Field(min_length=1)
+    symbol: str = ""
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+    claim: str = Field(min_length=1)
+    evidence_ids: tuple[EvidenceId, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "SourceClaim":
+        if self.end_line < self.start_line:
+            raise ValueError("source claim end_line must be >= start_line")
+        if self.end_line - self.start_line + 1 > 200:
+            raise ValueError("source claim range must not exceed 200 lines")
+        return self
+
+
 class CausalChainLink(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     cause: str = Field(min_length=1)
@@ -242,6 +267,7 @@ class IncidentHypothesis(BaseModel):
     # deterministic source-capability checks to this status; it does not infer
     # whether a runtime symptom is caused by application code.
     source_mechanism_status: SourceMechanismStatus = "unknown"
+    source_claims: tuple[SourceClaim, ...] = ()
     verification_obligations: tuple[VerificationObligation, ...] = ()
     contradictions: tuple[Contradiction, ...] = ()
     stable_rounds: int = Field(default=0, ge=0)
@@ -382,6 +408,7 @@ class RootCauseCandidate(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     claim_evidence_mapping: tuple[ClaimEvidenceMapping, ...] = ()
     causal_chain_summary: tuple[CausalChainLink, ...] = ()
+    source_claims: tuple[SourceClaim, ...] = ()
 
     @model_validator(mode="before")
     @classmethod

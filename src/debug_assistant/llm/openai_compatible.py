@@ -124,6 +124,7 @@ class OpenAICompatibleClient(LLMClient):
         response_format: dict[str, Any] | None = None,
         return_response: bool = False,
         max_output_tokens: int | None = None,
+        enable_thinking: bool | None = None,
     ) -> dict[str, Any]:
         if not self.api_key:
             raise LLMError("DEBUG_AGENT_API_KEY is empty. Configure it or use DEBUG_AGENT_PROVIDER=mock for smoke tests.")
@@ -143,6 +144,11 @@ class OpenAICompatibleClient(LLMClient):
         output_cap = max_output_tokens or self.model_capability.max_output_tokens
         if output_cap is not None:
             base_payload["max_tokens"] = int(output_cap)
+        if enable_thinking is not None:
+            # DashScope's OpenAI-compatible endpoint accepts this provider
+            # extension for hybrid reasoning models.  Keep it opt-in so
+            # ordinary providers retain their existing request shape.
+            base_payload["enable_thinking"] = bool(enable_thinking)
         if tools:
             base_payload["tools"] = tools
             base_payload["tool_choice"] = "auto"
@@ -450,6 +456,7 @@ class OpenAICompatibleClient(LLMClient):
         logical_timeout_seconds: float | None = None,
         on_attempt_started: Callable[[dict[str, Any]], None] | None = None,
         max_output_tokens: int | None = None,
+        enable_thinking: bool | None = None,
     ) -> dict[str, Any]:
         try:
             asyncio.get_running_loop()
@@ -460,6 +467,7 @@ class OpenAICompatibleClient(LLMClient):
                     logical_timeout_seconds=logical_timeout_seconds,
                     on_attempt_started=on_attempt_started,
                     max_output_tokens=max_output_tokens,
+                    enable_thinking=enable_thinking,
                 )
             )
         raise LLMClientUsageError(
@@ -472,6 +480,7 @@ class OpenAICompatibleClient(LLMClient):
         logical_timeout_seconds: float | None = None,
         on_attempt_started: Callable[[dict[str, Any]], None] | None = None,
         max_output_tokens: int | None = None,
+        enable_thinking: bool | None = None,
     ) -> LLMResponse:
         if not self.capabilities.tool_calling:
             return super().complete_with_tools(
@@ -479,6 +488,7 @@ class OpenAICompatibleClient(LLMClient):
                 logical_timeout_seconds=logical_timeout_seconds,
                 on_attempt_started=on_attempt_started,
                 max_output_tokens=max_output_tokens,
+                enable_thinking=enable_thinking,
             )
         try:
             asyncio.get_running_loop()
@@ -487,6 +497,7 @@ class OpenAICompatibleClient(LLMClient):
                 system, user, model=model, logical_timeout_seconds=logical_timeout_seconds,
                 on_attempt_started=on_attempt_started, tools=tools, return_response=True,
                 max_output_tokens=max_output_tokens,
+                enable_thinking=enable_thinking,
             ))
         raise LLMClientUsageError(
             "Synchronous complete_with_tools() cannot be called from a running event loop"
@@ -497,6 +508,7 @@ class OpenAICompatibleClient(LLMClient):
         logical_timeout_seconds: float | None = None,
         on_attempt_started: Callable[[dict[str, Any]], None] | None = None,
         max_output_tokens: int | None = None,
+        enable_thinking: bool | None = None,
     ) -> LLMResponse:
         response_format = None
         if schema is not None and self.capabilities.json_schema:
@@ -511,6 +523,7 @@ class OpenAICompatibleClient(LLMClient):
                 system, user, model=model, logical_timeout_seconds=logical_timeout_seconds,
                 on_attempt_started=on_attempt_started, response_format=response_format,
                 return_response=True, max_output_tokens=max_output_tokens,
+                enable_thinking=enable_thinking,
             ))
         raise LLMClientUsageError(
             "Synchronous complete_structured() cannot be called from a running event loop"

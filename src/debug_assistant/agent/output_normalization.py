@@ -22,7 +22,7 @@ INCIDENT_REQUIRED_CONTROL_FIELDS = (
 INCIDENT_SKILL_CONTROL_FIELDS = INCIDENT_REQUIRED_CONTROL_FIELDS + (
     "candidate_fault_code", "candidate_fault_explanation",
     "source_mechanism_status", "mechanism_category",
-    "verification_obligations", "contradictions", "obligation_id",
+    "verification_obligations", "contradictions", "source_claims", "obligation_id",
     "expected_information_gain",
 )
 
@@ -39,13 +39,15 @@ _UNKNOWN_STATE_STRING_CONTROLS = (
 _OPTIONAL_LIST_CONTROLS = (
     "supporting_evidence_ids", "contradicting_evidence_ids",
     "required_evidence_gaps", "verification_obligations", "contradictions",
+    "source_claims",
 )
 _OPTIONAL_FINALIZATION_METADATA = (
-    "claim_evidence_mapping", "causal_chain_summary",
+    "claim_evidence_mapping", "causal_chain_summary", "source_claims",
 )
 _OPTIONAL_FINALIZATION_METADATA_FIELDS = {
     "claim_evidence_mapping": frozenset({"claim", "evidence_ids"}),
     "causal_chain_summary": frozenset({"cause", "effect", "evidence_ids"}),
+    "source_claims": frozenset({"file", "symbol", "start_line", "end_line", "claim", "evidence_ids"}),
 }
 
 # Keep this registry deliberately explicit.  A new alias must be justified by
@@ -197,6 +199,25 @@ class IncidentLLMOutputNormalizer:
                 dropped_fields.append(field)
                 continue
             expected = _OPTIONAL_FINALIZATION_METADATA_FIELDS[field]
+            if field == "source_claims":
+                valid_items = isinstance(value, list) and all(
+                    isinstance(item, dict)
+                    and set(item) == expected
+                    and isinstance(item.get("file"), str) and item["file"].strip()
+                    and isinstance(item.get("symbol", ""), str)
+                    and isinstance(item.get("claim"), str) and item["claim"].strip()
+                    and isinstance(item.get("start_line"), int) and item["start_line"] >= 1
+                    and isinstance(item.get("end_line"), int) and item["end_line"] >= item["start_line"]
+                    and isinstance(item.get("evidence_ids"), (list, tuple))
+                    and bool(item["evidence_ids"])
+                    and all(isinstance(evidence_id, str) and evidence_id.startswith("ev-") for evidence_id in item["evidence_ids"])
+                    for item in value
+                )
+                if not valid_items:
+                    args.pop(field, None)
+                    actions.append(f"{field}:malformed_optional_metadata_dropped")
+                    dropped_fields.append(field)
+                continue
             if not isinstance(value, list) or not all(
                 isinstance(item, dict)
                 and set(item) == expected

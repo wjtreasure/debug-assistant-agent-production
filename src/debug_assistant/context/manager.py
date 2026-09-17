@@ -364,8 +364,8 @@ class ContextManager:
         target=max(1,int(getattr(self.cfg,'target_active_items',8)))
         hard=max(target,int(getattr(self.cfg,'hard_active_items',12)))
         if self.enable_lifecycle and len(ranked)>target:
-            must=[r for r in ranked if r[-1].pinned]
-            optional=[r for r in ranked if not r[-1].pinned]
+            must=[r for r in ranked if r[-1].pinned or r[-1].context_id in requested]
+            optional=[r for r in ranked if not (r[-1].pinned or r[-1].context_id in requested)]
             keep_optional=max(0,max(target-len(must), min(len(optional),hard-len(must))))
             keep_ids={r[-1].context_id for r in must+optional[:keep_optional]}
             new=[]
@@ -378,7 +378,16 @@ class ContextManager:
 
         selected=[]; used=0; projections=[]
         obs_by_id={o.observation_id:o for o in observation_store.all()}
-        for *_,x in ranked:
+        # Explicit closure items are correctness-critical: source evidence and
+        # the current hypothesis must remain visible during SOURCE_VERIFY/
+        # CONVERGE. Pack them first and permit them to exceed the optional-item
+        # budget; ordinary pinned Evidence still follows the normal packer.
+        ordered = sorted(
+            ranked,
+            key=lambda row: (0 if row[-1].context_id in requested else 1,
+                             row[0], row[1], row[2], row[3]),
+        )
+        for *_,x in ordered:
             projection=None
             if x.raw_observation_id:
                 obs=obs_by_id.get(x.raw_observation_id)
@@ -393,7 +402,8 @@ class ContextManager:
             else:
                 content=x.compact_content + (f"\n{x.full_content}" if x.full_content else '')
             size=len(content)+2
-            if not self.enable_budget_packing or used+size<=available:
+            closure_item = x.context_id in requested
+            if not self.enable_budget_packing or used+size<=available or closure_item:
                 selected.append((x,content,projection)); used+=size
                 if projection: projections.append(projection)
             else:
@@ -433,7 +443,8 @@ class ContextManager:
             while selected_meta and total_tokens(text) > total_token_budget:
                 removable = next(
                     (index for index in range(len(selected_meta) - 1, -1, -1)
-                     if not selected_meta[index].get('pinned')),
+                     if not selected_meta[index].get('pinned')
+                     and selected_meta[index].get('id') not in requested),
                     None,
                 )
                 if removable is None:
@@ -452,7 +463,16 @@ class ContextManager:
         if len(text)>diagnostic_budget:
             # Last-resort: drop selected items from the end; never blind-slice a source projection.
             while selected_meta and len(text)>diagnostic_budget:
-                dropped_id=selected_meta[-1]['id']; selected_meta.pop(); rendered.pop()
+                removable = next(
+                    (index for index in range(len(selected_meta) - 1, -1, -1)
+                     if not selected_meta[index].get('pinned')
+                     and selected_meta[index].get('id') not in requested),
+                    None,
+                )
+                if removable is None:
+                    break
+                dropped_id=selected_meta[removable]['id']
+                selected_meta.pop(removable); rendered.pop(removable)
                 dropped.append({'id':dropped_id,'reason':'defensive_budget_drop','chars':0})
                 working='\n\n'.join(rendered) or '(no active working context yet)'
                 text=f"{fixed}{known_section}\nWORKING_CONTEXT:\n{working}"

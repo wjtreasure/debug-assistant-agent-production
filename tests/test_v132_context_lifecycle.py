@@ -103,3 +103,19 @@ def test_incident_projection_keeps_read_file_ledger_in_items_catalog(tmp_path):
     result=mgr.build(state,memory,store,max_context_chars=12000)
     assert result.breakdown['read_ledger_count'] == 1
     assert 'frontend/main.go L1-20 already read' in result.text
+
+
+def test_code_projection_retains_bounded_middle_signal(tmp_path):
+    state=AgentState(TaskSpec('t','issue',str(tmp_path))); store=ObservationStore(); memory=EvidenceMemory()
+    content='\n'.join(f'{i:5d} | ordinary_{i}' for i in range(1, 646))
+    content=content.replace('  518 | ordinary_518', '  518 | numbers := make([]int, 1, 1)\n  519 | for i := 0; i < 1024*1024*8; i++ {\n  520 | numbers = append(numbers, 1)\n  521 | }')
+    obs=ToolObservation('read_file',True,content,{
+        'path':'frontend/handlers.go','start_line':1,'end_line':645,
+        'context_kind':'CODE','information_source':'source_read',
+    })
+    add(state,store,memory,obs)
+    mgr=ContextManager(ContextConfig(max_item_chars=12000,safety_margin_chars=300),
+                       projection_policy=IncidentProjectionPolicy())
+    result=mgr.build(state,memory,store,max_context_chars=20000)
+    assert '518 | numbers := make' in result.text
+    assert '520 | numbers = append' in result.text
