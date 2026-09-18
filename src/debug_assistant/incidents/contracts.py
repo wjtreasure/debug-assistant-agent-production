@@ -13,6 +13,7 @@ EvidenceId = Annotated[str, StringConstraints(pattern=r"^ev-")]
 
 
 _FAULT_CODE_PATTERN = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*")
+from .fault_taxonomy import is_canonical_fault_code
 
 
 def _migrate_fault_fields(value: Any) -> Any:
@@ -65,10 +66,22 @@ class VerificationObligation(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     id: str = Field(min_length=1)
     claim: str = Field(min_length=1)
+    evidence_requirement: str = ""
     critical: bool = True
     status: ObligationStatus = "OPEN"
     supporting_evidence_ids: tuple[EvidenceId, ...] = ()
     blocked_capabilities: tuple[str, ...] = ()
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_status(cls, value: Any) -> Any:
+        """Read historical traces without reintroducing the old state."""
+        if not isinstance(value, dict):
+            return value
+        result = dict(value)
+        if result.get("status") == "WAIVED_WITH_EVIDENCE":
+            result["status"] = "SATISFIED"
+        return result
 
     @property
     def blocks_finalization(self) -> bool:
@@ -389,6 +402,8 @@ class IncidentHypothesis(BaseModel):
         gaps = self.required_gap_projection()
         if gaps:
             failures["required_gaps"] = list(gaps)
+        if self.fault_code and not is_canonical_fault_code(self.fault_code):
+            failures["invalid_fault_code"] = self.fault_code
         return failures
 
     def can_finalize(self, known_evidence_ids: set[str]) -> bool:
@@ -519,6 +534,14 @@ class IncidentMetrics(BaseModel):
     obligation_blocked_count: int = 0
     blocking_contradiction_count: int = 0
     stable_rounds: int = 0
+    execution_mode: Literal["legacy", "dag"] = "legacy"
+    context_projection_mode: Literal["existing", "task_aware"] = "task_aware"
+    dag_task_count: int = 0
+    dag_satisfied_task_count: int = 0
+    dag_blocked_task_count: int = 0
+    dag_contradicted_task_count: int = 0
+    dag_local_replan_count: int = 0
+    dag_task_closure_rate: float = 0.0
 
 
 class IncidentRunResult(BaseModel):

@@ -25,6 +25,83 @@ class BudgetState(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class BudgetAllocation:
+    """Resolved ownership of a run's token and LLM-call budget."""
+
+    total_tokens: int
+    total_llm_calls: int
+    investigation_tokens: int
+    investigation_llm_calls: int
+    review_tokens: int
+    review_llm_calls: int
+    terminal_tokens: int
+    terminal_llm_calls: int
+    terminal_seconds: float = 0.0
+
+    @classmethod
+    def resolve(
+        cls,
+        *,
+        total_tokens: int,
+        total_llm_calls: int,
+        review_tokens: int = 0,
+        review_llm_calls: int = 0,
+        terminal_tokens: int = 0,
+        terminal_llm_calls: int = 0,
+        terminal_seconds: float = 0.0,
+    ) -> "BudgetAllocation":
+        total_tokens = int(total_tokens)
+        total_llm_calls = int(total_llm_calls)
+        review_tokens = int(review_tokens)
+        review_llm_calls = int(review_llm_calls)
+        terminal_tokens = int(terminal_tokens)
+        terminal_llm_calls = int(terminal_llm_calls)
+        terminal_seconds = float(terminal_seconds)
+        if total_tokens <= 0 or total_llm_calls <= 0:
+            raise ValueError("total budget must be positive")
+        if min(review_tokens, review_llm_calls, terminal_tokens, terminal_llm_calls) < 0:
+            raise ValueError("budget reserves must be non-negative")
+        if review_tokens + terminal_tokens >= total_tokens:
+            raise ValueError("review and terminal token reserves leave no investigation budget")
+        if review_llm_calls + terminal_llm_calls >= total_llm_calls:
+            raise ValueError("review and terminal call reserves leave no investigation budget")
+        if terminal_seconds < 0:
+            raise ValueError("terminal reserve seconds must be non-negative")
+        return cls(
+            total_tokens=total_tokens,
+            total_llm_calls=total_llm_calls,
+            investigation_tokens=total_tokens - review_tokens - terminal_tokens,
+            investigation_llm_calls=total_llm_calls - review_llm_calls - terminal_llm_calls,
+            review_tokens=review_tokens,
+            review_llm_calls=review_llm_calls,
+            terminal_tokens=terminal_tokens,
+            terminal_llm_calls=terminal_llm_calls,
+            terminal_seconds=terminal_seconds,
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "total": {
+                "tokens": self.total_tokens,
+                "llm_calls": self.total_llm_calls,
+            },
+            "investigation": {
+                "tokens": self.investigation_tokens,
+                "llm_calls": self.investigation_llm_calls,
+            },
+            "review": {
+                "tokens": self.review_tokens,
+                "llm_calls": self.review_llm_calls,
+            },
+            "terminal": {
+                "tokens": self.terminal_tokens,
+                "llm_calls": self.terminal_llm_calls,
+                "seconds": self.terminal_seconds,
+            },
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class PromptBudgetDecision:
     stage: str
     estimated_prompt_tokens: int
@@ -119,6 +196,7 @@ class DynamicBudgetController:
         terminal_reserve_tokens: int | None = 0,
         terminal_reserve_llm_calls: int = 3,
         terminal_reserve_seconds: float = 0.0,
+        budget_allocation: BudgetAllocation | None = None,
         pressure_ratio: float = 0.75,
         hard_pressure_ratio: float = 0.95,
         started_at: float | None = None,
@@ -139,6 +217,21 @@ class DynamicBudgetController:
         self.terminal_reserve_tokens = max(0, int(terminal_reserve_tokens))
         self.terminal_reserve_llm_calls = max(1, int(terminal_reserve_llm_calls))
         self.terminal_reserve_seconds = max(0.0, float(terminal_reserve_seconds))
+        self.budget_allocation = budget_allocation or BudgetAllocation.resolve(
+            total_tokens=self.max_total_tokens,
+            total_llm_calls=self.max_llm_calls,
+            terminal_tokens=self.terminal_reserve_tokens,
+            terminal_llm_calls=self.terminal_reserve_llm_calls,
+            terminal_seconds=self.terminal_reserve_seconds,
+        )
+        if self.budget_allocation.total_tokens != self.max_total_tokens:
+            raise ValueError("budget allocation total_tokens must match controller max_total_tokens")
+        if self.budget_allocation.total_llm_calls != self.max_llm_calls:
+            raise ValueError("budget allocation total_llm_calls must match controller max_llm_calls")
+        self.lifecycle_phase = "investigation"
+        self.review_started_tokens: int | None = None
+        self.review_started_llm_calls: int | None = None
+        self.review_calls_used = 0
         self.pressure_ratio = min(0.99, max(0.50, float(pressure_ratio)))
         self.hard_pressure_ratio = min(
             1.0, max(self.pressure_ratio, float(hard_pressure_ratio))
@@ -150,6 +243,56 @@ class DynamicBudgetController:
         self.llm_calls_used = 0
         self.cost_used = 0.0
         self.context_state_override = BudgetState.NORMAL
+
+    def begin_review(self, *, tokens_used: int, llm_calls_used: int) -> None:
+        """Move ownership to the protected Review allocation.
+
+        Investigation admission already prevents crossing its allocation.  A
+        second deterministic check here makes the hand-off explicit and
+        observable rather than relying on a late remaining-total check.
+        """
+        if self.lifecycle_phase == "review":
+            return
+        if (
+            int(tokens_used) > self.budget_allocation.investigation_tokens
+            or int(llm_calls_used) > self.budget_allocation.investigation_llm_calls
+        ):
+            raise ValueError("investigation exceeded its resolved budget allocation")
+        self.lifecycle_phase = "review"
+        self.review_started_tokens = int(tokens_used)
+        self.review_started_llm_calls = int(llm_calls_used)
+
+    def lifecycle_payload(self, *, tokens_used: int, llm_calls_used: int) -> dict[str, Any]:
+        allocation = self.budget_allocation
+        if self.lifecycle_phase == "review" and self.review_started_tokens is not None:
+            phase_tokens_used = max(0, int(tokens_used) - self.review_started_tokens)
+            phase_llm_calls_used = self.review_calls_used
+            phase = "review"
+            phase_total_tokens = allocation.review_tokens
+            phase_total_calls = allocation.review_llm_calls
+        else:
+            phase_tokens_used = max(0, int(tokens_used))
+            phase_llm_calls_used = max(0, int(llm_calls_used))
+            phase = "investigation"
+            phase_total_tokens = allocation.investigation_tokens
+            phase_total_calls = allocation.investigation_llm_calls
+        return {
+            "phase": phase,
+            "allocation": allocation.as_dict(),
+            "phase_usage": {
+                "tokens": phase_tokens_used,
+                "llm_calls": phase_llm_calls_used,
+            },
+            "phase_remaining": {
+                "tokens": max(0, phase_total_tokens - phase_tokens_used),
+                "llm_calls": max(0, phase_total_calls - self.review_calls_used)
+                if phase == "review"
+                else max(0, phase_total_calls - phase_llm_calls_used),
+            },
+        }
+
+    def set_review_calls_used(self, value: int) -> None:
+        self.review_calls_used = max(0, int(value))
 
     @property
     def input_hard_capacity(self) -> int | None:
@@ -306,10 +449,9 @@ class DynamicBudgetController:
         if result.input_hard_capacity is not None and estimate > result.input_hard_capacity:
             self.context_state_override = BudgetState.HARD_PRESSURE
             raise PromptBudgetExceeded(result)
-        # A prompt can fit the model's context window while still consuming
-        # the run's finalization reserve.  Reject the provider call before it
-        # starts when the estimated prompt plus declared completion reserve
-        # would leave no room for the terminal path.
+        # A prompt can fit the model's context window while still consuming a
+        # protected lifecycle allocation. Reject it before the provider call
+        # starts instead of discovering the exhausted Review reserve later.
         completion_reserve = (
             max(0, int(completion_reserve_tokens))
             if completion_reserve_tokens is not None else max(
@@ -320,15 +462,39 @@ class DynamicBudgetController:
         remaining_calls = max(0, self.max_llm_calls - int(llm_calls_used))
         terminal_reserve = 0 if allow_terminal_reserve else self.terminal_reserve_tokens
         required_run_tokens = estimate + completion_reserve + terminal_reserve
+        allocation = self.budget_allocation
+        if self.lifecycle_phase == "review" and self.review_started_tokens is not None:
+            phase = "review"
+            phase_used_tokens = max(0, int(tokens_used) - self.review_started_tokens)
+            # Recovery planner/tool calls are bounded by the global runtime
+            # policy, but do not consume the reserved count of semantic Review
+            # calls. Only the Review agent updates this counter.
+            phase_used_calls = self.review_calls_used if stage == "review" else 0
+            phase_budget_tokens = allocation.review_tokens
+            phase_budget_calls = allocation.review_llm_calls
+        else:
+            phase = "investigation"
+            phase_used_tokens = max(0, int(tokens_used))
+            phase_used_calls = max(0, int(llm_calls_used))
+            phase_budget_tokens = allocation.investigation_tokens
+            phase_budget_calls = allocation.investigation_llm_calls
+        phase_remaining_tokens = max(0, phase_budget_tokens - phase_used_tokens)
+        phase_remaining_calls = max(0, phase_budget_calls - phase_used_calls)
+        required_phase_tokens = estimate + completion_reserve
+        phase_exhausted = (
+            required_phase_tokens > phase_remaining_tokens
+            or phase_used_calls > phase_budget_calls
+        )
         if (
-            required_run_tokens > result.remaining_run_tokens
+            phase_exhausted
+            or required_run_tokens > result.remaining_run_tokens
             or (
                 self.terminal_reserve_seconds > 0
                 and self.max_wall_time_seconds - (time.time() - self.started_at)
                 <= self.terminal_reserve_seconds
             )
         ):
-            reason = "pre-call run budget admission would consume terminal reserve"
+            reason = f"pre-call {phase} budget admission would exceed its protected allocation"
             if (
                 self.terminal_reserve_seconds > 0
                 and self.max_wall_time_seconds - (time.time() - self.started_at)
@@ -341,6 +507,7 @@ class DynamicBudgetController:
                 reason=reason,
                 breakdown={
                     **result.breakdown,
+                    "budget_lifecycle_phase": phase,
                     "estimated_prompt_tokens": estimate,
                     "reserved_output_tokens": completion_reserve,
                     "terminal_reserve_tokens": terminal_reserve,
@@ -348,6 +515,13 @@ class DynamicBudgetController:
                     "required_run_tokens": required_run_tokens,
                     "remaining_run_tokens": result.remaining_run_tokens,
                     "remaining_llm_calls": remaining_calls,
+                    "phase_budget_tokens": phase_budget_tokens,
+                    "phase_used_tokens": phase_used_tokens,
+                    "phase_remaining_tokens": phase_remaining_tokens,
+                    "required_phase_tokens": required_phase_tokens,
+                    "phase_budget_llm_calls": phase_budget_calls,
+                    "phase_used_llm_calls": phase_used_calls,
+                    "phase_remaining_llm_calls": phase_remaining_calls,
                 },
                 compaction_required=True,
             )

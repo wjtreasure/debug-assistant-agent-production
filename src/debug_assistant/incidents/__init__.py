@@ -1,6 +1,16 @@
 """CloudOps diagnosis runtime and compatibility exports."""
 
 from .contracts import IncidentCase, IncidentRunResult, RootCauseCandidate
+from .dag_convergence import DAGFinalizationDecision, evaluate_dag_finalization
+from .verification_dag import (
+    LangGraphUnavailable,
+    LangGraphVerificationAdapter,
+    VerificationDAGError,
+    VerificationDAGHarnessAdapter,
+    VerificationDAGState,
+    VerificationTask,
+    VerificationTaskExecution,
+)
 
 
 def __getattr__(name):
@@ -32,4 +42,8 @@ __all__ = [
     "IncidentCase", "DiagnosisHarness", "DiagnosisHarnessConfig",
     "IncidentHarness", "IncidentHarnessConfig",
     "IncidentRunResult", "RootCauseCandidate",
+    "VerificationTask", "VerificationTaskExecution", "VerificationDAGState",
+    "VerificationDAGHarnessAdapter", "LangGraphVerificationAdapter",
+    "VerificationDAGError", "LangGraphUnavailable",
+    "DAGFinalizationDecision", "evaluate_dag_finalization",
 ]

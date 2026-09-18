@@ -130,7 +130,19 @@ class AppConfig:
 
     @classmethod
     def from_env(cls) -> "AppConfig":
-        get=os.getenv
+        raw_get = os.getenv
+
+        def get(name: str, default: str) -> str:
+            """Normalize shell-loaded values before typed config parsing.
+
+            This is deliberately done at the configuration boundary: a CRLF
+            ``.env`` sourced by a shell must not place ``\r`` in a URL, model,
+            API key, path, or boolean value.  ``python-dotenv`` already handles
+            normal loading, but explicit shell exports can override it.
+            """
+            value = raw_get(name)
+            return str(default if value is None else value).strip()
+
         cfg=cls(
             model=ModelConfig(
                 provider=get("DEBUG_AGENT_PROVIDER", "openai_compatible"),

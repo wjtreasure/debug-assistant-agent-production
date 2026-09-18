@@ -4,6 +4,7 @@ from debug_assistant.context.models import ContextItem, ContextBuildResult, Cont
 from debug_assistant.context.indexes import DisplayCoverageIndex, KnownContextIndex, merge_ranges
 from debug_assistant.context.packing import line_safe_truncate
 from debug_assistant.context.projection import CodeProjectionPolicy
+from debug_assistant.context.task_projection import project_verification_tasks
 from debug_assistant.llm.base import estimate_tokens_char4
 
 
@@ -259,7 +260,8 @@ class ContextManager:
               max_context_tokens: int | None = None, token_estimator=None,
               max_steps=None, max_tool_calls=None, requested_ids=None,
               include_agent_control_state: bool=True,
-              external_context_chars: int=0, pressure_state: str = "NORMAL") -> ContextBuildResult:
+              external_context_chars: int=0, pressure_state: str = "NORMAL",
+              verification_dag_state=None) -> ContextBuildResult:
         if external_context_chars < 0:
             raise ValueError("external_context_chars must be non-negative")
         if max_context_chars is None and max_context_tokens is None:
@@ -275,7 +277,13 @@ class ContextManager:
             budget_chars = int(max_context_chars)
             diagnostic_budget=max(0,budget_chars-external_context_chars)
             diagnostic_token_budget = None
+        task_context = project_verification_tasks(
+            verification_dag_state,
+            max_chars=getattr(self.cfg, 'known_index_max_chars', 3_500),
+        )
         requested_ids=list(requested_ids or []) if self.enable_model_selection else []
+        requested_ids.extend(task_context.linked_evidence_ids)
+        requested_ids=list(dict.fromkeys(requested_ids))
         # Evidence-aware projection: compact Evidence excerpts may truthfully represent only
         # the beginning of a larger read_file observation. If a truncated read is currently
         # hypothesis support, re-project its immutable raw source range instead of letting the
@@ -283,14 +291,20 @@ class ContextManager:
         # normal context packer and never performs repository I/O.
         hyp0=state.current_hypothesis or {}
         support0=set(hyp0.get('supporting_evidence_ids') or [])
-        if (self.enable_projection and support0
+        source_projection_ids = support0 | set(task_context.linked_evidence_ids)
+        if (self.enable_projection and source_projection_ids
                 and getattr(self.projection_policy, 'supports_source_ranges', False)):
             for ev in memory.pinned:
-                if (ev.evidence_id in support0 and ev.source == 'read_file' and ev.excerpt_truncated
+                if (ev.evidence_id in source_projection_ids and ev.source == 'read_file' and ev.excerpt_truncated
                         and ev.raw_observation_id and ev.file
                         and isinstance(ev.source_start_line,int) and isinstance(ev.source_end_line,int)):
                     self.rehydrate(ev.raw_observation_id,path=ev.file,start_line=ev.source_start_line,
-                                   end_line=ev.source_end_line,information_need='hypothesis_support_projection')
+                                   end_line=ev.source_end_line,
+                                   information_need=(
+                                       'verification_task_projection'
+                                       if ev.evidence_id in task_context.linked_evidence_ids
+                                       else 'hypothesis_support_projection'
+                                   ))
         items=self.catalog(state,memory,observation_store)
         by_id={x.context_id:x for x in items}
         invalid=[x for x in requested_ids if x not in by_id]
@@ -304,11 +318,23 @@ class ContextManager:
         if include_agent_control_state and max_tool_calls is not None:
             budget += [f"tool_calls={state.tool_calls}/{max_tool_calls}",f"remaining_tool_calls={max(0,max_tool_calls-state.tool_calls)}"]
         hyp=state.current_hypothesis or {}
+        if verification_dag_state is not None:
+            # DAG task state owns the active verification question. Do not
+            # spend planner context on the legacy gap/obligation projections.
+            hyp = dict(hyp)
+            for key in ("evidence_gap", "required_gaps", "verification_obligations"):
+                hyp.pop(key, None)
+        state_summary = state.to_summary()
+        if verification_dag_state is not None:
+            summary_hypothesis = dict(state_summary.get("current_hypothesis") or {})
+            for key in ("evidence_gap", "required_gaps", "verification_obligations"):
+                summary_hypothesis.pop(key, None)
+            state_summary["current_hypothesis"] = summary_hypothesis
         advisory=(state.termination_advisory or '').strip() if include_agent_control_state else ''
         fixed=((f"TASK_ID: {state.task.task_id}\nISSUE:\n{issue}\n\nRECENT_ACTIONS:\n{recent_actions}\n\n"
                f"RUNTIME_BUDGET: {', '.join(budget) or 'not configured'}\n"
                f"CURRENT_HYPOTHESIS: {hyp if hyp else '(none)'}\n"
-               f"TERMINATION_ADVISORY: {advisory or '(none)'}\nSTATE: {state.to_summary()}\n\n")
+               f"TERMINATION_ADVISORY: {advisory or '(none)'}\nSTATE: {state_summary}\n\n")
                if include_agent_control_state else '')
 
         if not self.enable_catalog:
@@ -343,6 +369,11 @@ class ContextManager:
                            f"{known}\nEVIDENCE_CATALOG (only ev-* identifiers are citable):\n{evidence_catalog}"
                            f"{read_ledger_section}"
                            "If details are needed from a known range, request read_file for the exact range; the Harness can rehydrate it without repository I/O.\n")
+        # Keep confirmed Evidence/index context ahead of routing metadata. The
+        # external control prefix already carries the stable hypothesis; task
+        # metadata is the compact active-question layer, not a replacement.
+        verification_section=(task_context.text + "\n\n") if task_context.text else ""
+        known_section=known_section + verification_section
         available=max(0,diagnostic_budget-len(fixed)-len(known_section)-self.cfg.safety_margin_chars)
 
         ranked=[]; dropped=[]; active_count=0; cold_count=0
@@ -482,6 +513,21 @@ class ContextManager:
             known_section,_=line_safe_truncate(known_section,known_allow)
             text=f"{fixed}{known_section}{scaffolding}"
         control_state_truncated=False
+        verification_task_context_retained = all(
+            f"task_id={task_id}" in text for task_id in task_context.task_ids
+        )
+        verification_task_context_fail_closed = bool(
+            task_context.task_ids and not verification_task_context_retained
+        )
+        if verification_task_context_fail_closed:
+            # A critical graph-state omission must be visible to the caller;
+            # never let a budget cut look like a valid context projection.
+            marker = (
+                "VERIFICATION_TASK_CONTEXT_UNAVAILABLE: graph task state exceeded the "
+                "context budget; do not finalize until Runtime reprojections succeed."
+            )
+            text = marker[:diagnostic_budget] if diagnostic_budget else ""
+            control_state_truncated = True
         if len(text)>diagnostic_budget:
             # This can occur only when external/control state consumes almost the
             # entire global budget. Source projections were already dropped whole;
@@ -529,6 +575,8 @@ class ContextManager:
         current_hypothesis = state.current_hypothesis or {}
         critical_evidence_ids = set(current_hypothesis.get('supporting_evidence_ids') or [])
         critical_evidence_ids.update(current_hypothesis.get('contradicting_evidence_ids') or [])
+        task_linked_evidence_ids = set(task_context.linked_evidence_ids)
+        critical_evidence_ids.update(task_linked_evidence_ids)
         for obligation in current_hypothesis.get('verification_obligations') or ():
             if isinstance(obligation, dict):
                 critical_evidence_ids.update(obligation.get('supporting_evidence_ids') or [])
@@ -561,6 +609,11 @@ class ContextManager:
         contradiction_retention = (
             sum(1 for cid in blocking_contradiction_ids if cid in text or planner_input_has_external_state)
             / len(blocking_contradiction_ids) if blocking_contradiction_ids else 1.0
+        )
+        task_linked_retention = (
+            len(task_linked_evidence_ids.intersection(selected_evidence_ids))
+            / len(task_linked_evidence_ids)
+            if task_linked_evidence_ids else 1.0
         )
         rehydrate_requested_count = len(self._rehydrate_requests)
         rehydrated_success_count = sum(
@@ -599,6 +652,15 @@ class ContextManager:
             'critical_evidence_retention': critical_retained,
             'open_obligation_retention': obligation_retention,
             'blocking_contradiction_retention': contradiction_retention,
+            'verification_task_count': task_context.task_count,
+            'verification_task_duplicate_count': task_context.duplicate_task_count,
+            'verification_ready_task_count': task_context.ready_task_count,
+            'verification_critical_open_task_count': task_context.critical_open_task_count,
+            'verification_task_context_chars': len(task_context.text),
+            'verification_task_context_retained': int(verification_task_context_retained),
+            'verification_task_context_fail_closed': int(verification_task_context_fail_closed),
+            'task_linked_evidence_count': len(task_linked_evidence_ids),
+            'task_linked_evidence_retention': task_linked_retention,
             'duplicate_context_ratio': (
                 duplicate_observation_count / max(1, len(observation_store.all()))
             ),

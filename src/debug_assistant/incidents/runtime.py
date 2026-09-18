@@ -8,7 +8,7 @@ import inspect
 from hashlib import sha1
 from pathlib import Path
 import time
-from typing import Any
+from typing import Any, Literal
 
 from debug_assistant.agent.final_review import (
     FinalReviewAgent, ReviewSchemaError, enforce_review_consistency,
@@ -21,10 +21,11 @@ from debug_assistant.agent.planner import (
 from debug_assistant.config import ContextConfig
 from debug_assistant.context.manager import ContextManager
 from debug_assistant.context.projection import IncidentProjectionPolicy
+from debug_assistant.context.task_projection import project_verification_tasks
 from debug_assistant.harness.trace import TraceRecorder
 from debug_assistant.harness.budget import BudgetController
 from debug_assistant.harness.dynamic_budget import (
-    BudgetState, DynamicBudgetController, ProgressMarker, PromptBudgetExceeded,
+    BudgetAllocation, BudgetState, DynamicBudgetController, ProgressMarker, PromptBudgetExceeded,
     RunBudgetAdmissionExceeded,
     progress_made, resolve_model_capability,
 )
@@ -38,7 +39,15 @@ from debug_assistant.incidents.contracts import (
     Contradiction, IncidentCase, IncidentEvidence, IncidentHypothesis, IncidentMetrics,
     IncidentRunResult, ReflectionFeedback, ReflectionContradictionUpdate,
     ReviewDecision, RootCauseCandidate,
-    SourceClaim, VerificationObligation,
+    SourceClaim, VerificationObligation, is_canonical_fault_code,
+)
+from debug_assistant.incidents.dag_convergence import evaluate_dag_finalization
+from debug_assistant.incidents.verification_dag import (
+    LangGraphVerificationAdapter,
+    VerificationDAGHarnessAdapter,
+    VerificationDAGState,
+    VerificationTask,
+    VerificationTaskExecution,
 )
 from debug_assistant.models import ActionKind, ActionProposal, AgentState, TaskSpec, ToolObservation
 from debug_assistant.memory.evidence_boundary import is_canonical_source_evidence
@@ -104,6 +113,8 @@ def _safe_planner_metadata_for_trace(exc: Exception) -> dict[str, Any] | None:
 
 @dataclass(frozen=True, slots=True)
 class DiagnosisHarnessConfig:
+    execution_mode: Literal["legacy", "dag"] = "legacy"
+    context_projection_mode: Literal["existing", "task_aware"] = "task_aware"
     max_steps: int = 10
     max_tool_calls: int = 10
     max_review_rounds: int = 2
@@ -166,6 +177,8 @@ class DiagnosisHarnessConfig:
         renamed controls explicit instead of relying on ``**vars(...)``.
         """
         return cls(
+            execution_mode=getattr(source, "execution_mode", "legacy"),
+            context_projection_mode=getattr(source, "context_projection_mode", "task_aware"),
             max_steps=source.max_steps,
             max_tool_calls=source.max_tool_calls,
             max_llm_calls=source.max_llm_calls,
@@ -210,6 +223,10 @@ class DiagnosisHarnessConfig:
         )
 
     def __post_init__(self):
+        if self.execution_mode not in {"legacy", "dag"}:
+            raise ValueError("execution_mode must be legacy or dag")
+        if self.context_projection_mode not in {"existing", "task_aware"}:
+            raise ValueError("context_projection_mode must be existing or task_aware")
         if self.max_steps <= 0 or self.max_tool_calls <= 0:
             raise ValueError("step and tool budgets must be positive")
         if self.max_review_rounds != 2:
@@ -262,6 +279,19 @@ class DiagnosisHarnessConfig:
         if self.tool_circuit_failure_threshold <= 0:
             raise ValueError("tool_circuit_failure_threshold must be positive")
 
+    @property
+    def budget_allocation(self) -> BudgetAllocation:
+        """Return immutable token/call ownership resolved for this run."""
+        return BudgetAllocation.resolve(
+            total_tokens=self.max_total_tokens,
+            total_llm_calls=self.max_llm_calls,
+            review_tokens=self.review_reserve_tokens if self.enable_review else 0,
+            review_llm_calls=self.review_reserve_calls if self.enable_review else 0,
+            terminal_tokens=self.terminal_reserve_tokens,
+            terminal_llm_calls=self.terminal_reserve_llm_calls,
+            terminal_seconds=self.finalization_reserve_seconds,
+        )
+
 
 # Kept for callers and tests written against the first Incident vertical slice.
 IncidentHarnessConfig = DiagnosisHarnessConfig
@@ -306,6 +336,10 @@ class ConvergenceBudgetExhausted(RuntimeError):
     """A convergence response exhausted its bounded output envelope."""
 
 
+class DAGFinalizationBlocked(RuntimeError):
+    """The integrated DAG convergence predicate rejected finalization."""
+
+
 class DiagnosisHarness:
     """Bounded CloudOps diagnosis runtime with a separate final-review boundary.
 
@@ -335,7 +369,15 @@ class DiagnosisHarness:
             Path(__file__).resolve().parents[3] / "data" / "online_boutique" / "service_topology.json"
         )
 
-    def run(self, case: IncidentCase) -> IncidentRunResult:
+    def run(
+        self,
+        case: IncidentCase,
+        *,
+        mode: Literal["legacy", "dag"] | None = None,
+    ) -> IncidentRunResult:
+        execution_mode = mode or self.config.execution_mode
+        if execution_mode not in {"legacy", "dag"}:
+            raise ValueError("mode must be legacy or dag")
         tools = CloudOpsSnapshotToolRegistry(
             case.runtime_data_dir, self.topology_path, search_engine=self.search_engine,
         )
@@ -441,6 +483,20 @@ class DiagnosisHarness:
         runtime_phase = "INIT"
         state_transition_count = 0
         converge_read_file_calls = 0
+        dag_harness = VerificationDAGHarnessAdapter() if execution_mode == "dag" else None
+        dag_state: VerificationDAGState | None = None
+        dag_graph: LangGraphVerificationAdapter | None = None
+        dag_action_registry: dict[str, tuple[Any, dict[str, Any], str]] = {}
+        dag_observations: dict[str, ToolObservation] = {}
+        dag_replan_pending = False
+        dag_task_sequence = 0
+        dag_task_metrics = {
+            "planned": 0,
+            "satisfied": 0,
+            "blocked": 0,
+            "contradicted": 0,
+            "local_replans": 0,
+        }
 
         def transition_phase(target: str, reason: str, **metadata: Any) -> None:
             """Record the only Runtime-owned PLAN/REFLECT/FINALIZE/REVIEW edges."""
@@ -466,6 +522,7 @@ class DiagnosisHarness:
             finalization_reserve_seconds=math.floor(self.config.finalization_reserve_seconds),
             started_at=state.started_at,
         )
+        budget_allocation = self.config.budget_allocation
         model_capability = resolve_model_capability(self.llm, model=self.model)
         dynamic_budget = DynamicBudgetController(
             model_capability,
@@ -477,6 +534,7 @@ class DiagnosisHarness:
             terminal_reserve_tokens=self.config.terminal_reserve_tokens,
             terminal_reserve_llm_calls=self.config.terminal_reserve_llm_calls,
             terminal_reserve_seconds=self.config.finalization_reserve_seconds,
+            budget_allocation=budget_allocation,
             pressure_ratio=self.config.context_pressure_ratio,
             hard_pressure_ratio=self.config.hard_pressure_ratio,
             started_at=state.started_at,
@@ -484,8 +542,11 @@ class DiagnosisHarness:
         trace.record("INCIDENT_STARTED", {
             "case_id": case.case_id, "summary": case.summary, "system": case.system,
             "namespace": case.namespace, "evidence_sources": case.evidence_sources,
+            "execution_mode": execution_mode,
+            "context_projection_mode": self.config.context_projection_mode,
             "model_capability": model_capability.as_dict(),
             "terminal_reserve": dynamic_budget.terminal_reserve_payload(),
+            "budget_lifecycle": budget_allocation.as_dict(),
         })
         transition_phase("PLAN", "incident_started")
         if knowledge_enabled:
@@ -645,7 +706,7 @@ class DiagnosisHarness:
 
         def budget_payload(snapshot) -> dict[str, Any]:
             dynamic_state = dynamic_budget.decision(
-                "runtime", tokens_used=prompt_tokens, llm_calls_used=llm_calls,
+                "runtime", tokens_used=prompt_tokens + completion_tokens, llm_calls_used=llm_calls,
                 cost_used=run_cost,
             )
             return {
@@ -664,12 +725,43 @@ class DiagnosisHarness:
                 "remaining_run_cost": dynamic_state.remaining_run_cost,
                 "terminal_reserve_tokens": dynamic_state.terminal_reserve_tokens,
                 "terminal_reserve_llm_calls": dynamic_state.terminal_reserve_llm_calls,
+                "budget_lifecycle": dynamic_budget.lifecycle_payload(
+                    tokens_used=prompt_tokens,
+                    llm_calls_used=llm_calls,
+                ),
             }
 
         def admit(stage: str, *, count_llm: bool = False,
                   allow_targeted_recovery: bool = False) -> None:
             nonlocal llm_calls, planner_calls, review_calls
             deadline.check()
+            if stage == "review":
+                try:
+                    dynamic_budget.begin_review(
+                        tokens_used=prompt_tokens + completion_tokens,
+                        llm_calls_used=llm_calls,
+                    )
+                except ValueError as exc:
+                    lifecycle = dynamic_budget.lifecycle_payload(
+                        tokens_used=prompt_tokens + completion_tokens,
+                        llm_calls_used=llm_calls,
+                    )
+                    trace.record("BUDGET_LIFECYCLE_VIOLATION", {
+                        "stage": stage,
+                        "message": str(exc),
+                        "budget_lifecycle": lifecycle,
+                    })
+                    raise RunBudgetAdmissionExceeded(replace(
+                        dynamic_budget.decision(
+                            stage,
+                            tokens_used=prompt_tokens + completion_tokens,
+                            llm_calls_used=llm_calls,
+                            cost_used=run_cost,
+                        ),
+                        state=BudgetState.HARD_PRESSURE,
+                        reason="review handoff exceeded resolved investigation allocation",
+                        breakdown={"budget_lifecycle": lifecycle},
+                    )) from exc
             snapshot = budget_snapshot("pre_" + stage)
             dynamic_budget.set_run_usage(
                 tokens_used=prompt_tokens + completion_tokens,
@@ -707,25 +799,6 @@ class DiagnosisHarness:
                         and not allow_targeted_recovery
                     ):
                         raise RunBudgetAdmissionExceeded(dynamic_state)
-            if stage == "review":
-                remaining_tokens = max(0, self.config.max_total_tokens - (prompt_tokens + completion_tokens))
-                if remaining_tokens < self.config.review_reserve_tokens:
-                    trace.record("REVIEW_RESERVE_EXHAUSTED", {
-                        "remaining_tokens": remaining_tokens,
-                        "required_tokens": self.config.review_reserve_tokens,
-                        "review_calls_used": review_calls,
-                        "review_calls_reserved": self.config.review_reserve_calls,
-                    })
-                    raise RunBudgetAdmissionExceeded(replace(
-                        dynamic_state,
-                        state=BudgetState.HARD_PRESSURE,
-                        reason="review stage reserve unavailable",
-                        breakdown={
-                            **dynamic_state.breakdown,
-                            "remaining_run_tokens": remaining_tokens,
-                            "review_reserve_tokens": self.config.review_reserve_tokens,
-                        },
-                    ))
             if snapshot.tokens_used >= self.config.max_total_tokens:
                 raise RuntimeError("max_total_tokens exceeded")
             if (
@@ -743,6 +816,7 @@ class DiagnosisHarness:
                     planner_calls += 1
                 elif stage == "review":
                     review_calls += 1
+                    dynamic_budget.set_review_calls_used(review_calls)
             elif stage == "planner" and state.step >= self.config.max_steps:
                 raise RuntimeError("max_steps exceeded")
             elif stage == "tool" and state.tool_calls >= self.config.max_tool_calls:
@@ -776,6 +850,7 @@ class DiagnosisHarness:
             if repaired_calls == 0 and bool(getattr(reviewer, "last_repair_attempted", False)):
                 repaired_calls = 1
             schema_repair_count += repaired_calls
+            dynamic_budget.set_review_calls_used(review_calls)
 
         def materialize_review_attempts(reviewer: FinalReviewAgent, attempt_count: int,
                                         *, effective_timeout: float,
@@ -975,6 +1050,83 @@ class DiagnosisHarness:
                 })
             update_capability_state(tool_name, observation)
             return observation
+
+        def admit_tool_observation(
+            observation: ToolObservation,
+            *,
+            tool_name: str,
+            arguments: dict[str, Any],
+        ) -> tuple[str, ...]:
+            """Commit one existing Harness observation to the shared ledger.
+
+            This helper is deliberately shared by legacy and DAG execution.
+            The DAG executor calls it from the LangGraph node, while the
+            legacy path calls it immediately after the direct Tool call.
+            Neither path gets a second Tool or Evidence implementation.
+            """
+            if observation.error_type == "tool_circuit_open":
+                mark_blocked_capability(tool_name)
+            state.observations.append(observation)
+            observation_store.add(observation)
+            trace.record("TOOL_OBSERVATION", observation)
+            admitted_ids: list[str] = []
+            if observation.ok:
+                target = self._target(arguments)
+                projected = incident_projection.compact_content(observation)
+                shared_evidence = evidence_memory.add_observation(
+                    observation,
+                    evidence_id=f"ev-{len(evidence_memory.pinned) + 1:03d}",
+                    kind=str(observation.metadata.get("context_kind") or "OBSERVATION"),
+                    source=tool_name,
+                    summary=projected,
+                    excerpt=projected,
+                    target=target,
+                    tags=["task_kind:incident"],
+                    enforce_admission=self.config.features.evidence_lifecycle,
+                    deduplicate=self.config.features.evidence_lifecycle,
+                )
+                if shared_evidence is not None:
+                    admitted_ids.append(shared_evidence.evidence_id)
+                    state.no_progress_count = 0
+                    consecutive_reflection_no_delta = 0
+                    item = IncidentEvidence(
+                        evidence_id=shared_evidence.evidence_id,
+                        source=shared_evidence.source,
+                        target=shared_evidence.target or target,
+                        summary=shared_evidence.summary,
+                        observation_id=(
+                            shared_evidence.raw_observation_id
+                            or observation.observation_id
+                        ),
+                    )
+                    trace.record("EVIDENCE_ADDED", item)
+            return tuple(admitted_ids)
+
+        def execute_dag_task(task: VerificationTask) -> VerificationTaskExecution:
+            """LangGraph callback that crosses back into the existing Harness."""
+            entry = dag_action_registry.get(task.task_id)
+            if entry is None:
+                raise RuntimeError(f"DAG task has no registered Harness action: {task.task_id}")
+            _, arguments, tool_name = entry
+            observation = execute_tool(tools.get(tool_name), arguments, tool_name)
+            state.tool_calls += 1
+            admitted_ids = admit_tool_observation(
+                observation, tool_name=tool_name, arguments=arguments,
+            )
+            dag_observations[task.task_id] = observation
+            if admitted_ids:
+                return VerificationTaskExecution(
+                    task_id=task.task_id,
+                    status="SATISFIED",
+                    evidence_ids=admitted_ids,
+                )
+            return VerificationTaskExecution(task_id=task.task_id, status="BLOCKED")
+
+        if execution_mode == "dag":
+            dag_graph = LangGraphVerificationAdapter(
+                dag_harness,
+                execute_dag_task,
+            )
 
         def incident_evidence() -> tuple[IncidentEvidence, ...]:
             """Project the shared ledger only at Review/serialization boundaries."""
@@ -2132,8 +2284,47 @@ class DiagnosisHarness:
             if hypothesis is None:
                 return False
             if self.config.features.finalization_gate:
-                return hypothesis.can_finalize(known_evidence_ids)
-            return len(set(hypothesis.supporting_evidence_ids)) >= 2
+                base_allowed = hypothesis.can_finalize(known_evidence_ids)
+            else:
+                base_allowed = len(set(hypothesis.supporting_evidence_ids)) >= 2
+            if not base_allowed or execution_mode != "dag":
+                return base_allowed
+            source_obligation = next(
+                (
+                    item for item in hypothesis.verification_obligations
+                    if _is_source_mechanism_obligation(item)
+                ),
+                None,
+            )
+            decision = evaluate_dag_finalization(
+                dag_state or VerificationDAGState(),
+                candidate_complete=all(
+                    bool(str(getattr(hypothesis, field) or "").strip())
+                    for field in ("component", "fault", "mechanism")
+                ) and len(set(hypothesis.supporting_evidence_ids)) >= 2,
+                evidence_sufficient=hypothesis.evidence_sufficient,
+                blocking_contradiction_open=any(
+                    item.blocks_finalization for item in hypothesis.contradictions
+                ),
+                source_requirement_satisfied=(
+                    source_obligation is None
+                    or source_obligation.status in {"SATISFIED", "NOT_APPLICABLE_BY_CAPABILITY"}
+                ),
+                # The existing Runtime's completion predicate already
+                # canonicalizes a newly completed candidate. A zero
+                # ``stable_rounds`` value here means the material hypothesis
+                # changed into its final form on this turn, not that the
+                # candidate is unsafe to route to Review.
+                hypothesis_stable=(hypothesis.stable_rounds >= 1 or base_allowed),
+                runtime_gate_allowed=True,
+            )
+            trace.record("DAG_FINALIZATION_EVALUATED", {
+                "allowed": decision.finalize_allowed,
+                "terminal_status": decision.terminal_status,
+                "reasons": list(decision.reasons),
+                "dag_metrics": (dag_state or VerificationDAGState()).metrics(),
+            })
+            return decision.finalize_allowed
 
         def best_candidate_from_hypothesis() -> RootCauseCandidate | None:
             if not hypotheses:
@@ -2149,8 +2340,19 @@ class DiagnosisHarness:
             """The only candidate-producing boundary before Final Review."""
             transition_phase("FINALIZE", source)
             known_evidence_ids = {item.evidence_id for item in evidence_memory.pinned}
+            if execution_mode == "dag" and hypothesis is not None:
+                if not hypothesis_can_finalize(hypothesis, known_evidence_ids):
+                    raise DAGFinalizationBlocked(
+                        "DAG finalization predicate rejected the candidate"
+                    )
             if any(not evidence_id.startswith("ev-") for evidence_id in candidate.evidence_ids):
                 raise RuntimeError("final candidate may cite only ev-* Evidence IDs")
+            if candidate.fault_code and not is_canonical_fault_code(candidate.fault_code):
+                trace.record("FAULT_TAXONOMY_REJECTED", {
+                    "fault_code": candidate.fault_code,
+                    "reason": "candidate fault code is outside the runtime canonical taxonomy",
+                })
+                raise RuntimeError("final candidate fault_code is not in canonical taxonomy")
             if len(set(candidate.evidence_ids)) < 2:
                 raise RuntimeError("final candidate requires two distinct Evidence IDs")
             if not set(candidate.evidence_ids).issubset(known_evidence_ids):
@@ -2319,6 +2521,123 @@ class DiagnosisHarness:
                 **candidate.model_dump(), "source": source,
             })
             return candidate
+
+        def run_dag_action(call, validated: dict[str, Any], selection) -> ToolObservation:
+            """Route one Planner action through the fixed LangGraph topology."""
+            nonlocal dag_state, dag_replan_pending, dag_task_sequence
+            if dag_graph is None or dag_harness is None:
+                raise RuntimeError("DAG execution mode is not initialized")
+            dag_task_sequence += 1
+            task_id = f"vt-{state.step:04d}-{dag_task_sequence:04d}"
+            obligation_id = str(getattr(selection, "obligation_id", "") or "")
+            if not obligation_id:
+                obligation_id = f"dag-obligation-{task_id}"
+            dependencies: tuple[str, ...] = ()
+            if dag_state is not None and obligation_id:
+                prior_id = next(
+                    (
+                        item.get("task_id")
+                        for item in reversed(actions)
+                        if item.get("obligation_id") == obligation_id
+                        and item.get("dag_task_id")
+                    ),
+                    None,
+                )
+                if prior_id and dag_state.task(prior_id).status == "SATISFIED":
+                    dependencies = (prior_id,)
+            claim = " ".join(
+                str(
+                    getattr(selection, "evidence_gap", "")
+                    or getattr(selection, "current_hypothesis", "")
+                    or f"Acquire canonical evidence through {call.name}."
+                ).split()
+            ).strip()
+            requirement = " ".join(
+                str(
+                    getattr(selection, "evidence_gap", "")
+                    or getattr(selection, "expected_information_gain", "")
+                    or f"A successful {call.name} observation admitted as Evidence."
+                ).split()
+            ).strip()
+            task = VerificationTask(
+                task_id=task_id,
+                claim=claim or f"Acquire evidence through {call.name}.",
+                evidence_requirement=requirement or "Canonical Evidence from the existing Harness.",
+                dependencies=dependencies,
+                # A Planner-selected evidence acquisition task represents the
+                # current verification gap even when an older Provider does
+                # not emit an obligation ID. Keep it critical so successful
+                # task-linked Evidence remains visible to Context projection;
+                # failed acquisition remains fail-closed until replan.
+                critical=True,
+            )
+            dag_action_registry[task_id] = (call, dict(validated), call.name)
+            dag_task_metrics["planned"] += 1
+            trace.record("DAG_TASK_PLANNED", {
+                "task_id": task_id,
+                "claim": task.claim,
+                "evidence_requirement": task.evidence_requirement,
+                "dependencies": list(task.dependencies),
+                "critical": task.critical,
+                "obligation_id": obligation_id,
+                "step": state.step,
+            })
+            replan_requested = False
+            replan_tasks: tuple[VerificationTask, ...] = ()
+            if dag_state is None:
+                dag_state = dag_harness.initialize(
+                    (task,),
+                    known_evidence_ids=(item.evidence_id for item in evidence_memory.pinned),
+                )
+            elif dag_replan_pending and dag_state.local_replan_count < dag_harness.max_local_replans:
+                replan_requested = True
+                replan_tasks = (task,)
+                trace.record("DAG_LOCAL_REPLAN_REQUESTED", {
+                    "task_id": task_id,
+                    "local_replan_count": dag_state.local_replan_count + 1,
+                    "reason": "previous verification task was blocked or contradicted",
+                })
+            else:
+                if dag_replan_pending:
+                    trace.record("DAG_LOCAL_REPLAN_LIMIT_REACHED", {
+                        "task_id": task_id,
+                        "local_replan_count": dag_state.local_replan_count,
+                    })
+                    dag_replan_pending = False
+                dag_state = dag_harness.add_tasks(dag_state, (task,))
+            graph_result = dag_graph.run(
+                dag_state,
+                replan_tasks=replan_tasks,
+                replan_requested=replan_requested,
+            )
+            if graph_result.get("terminal_status") == "FAILED":
+                raise RuntimeError(
+                    "DAG adapter failed: " + str(graph_result.get("error_message") or "unknown error")
+                )
+            dag_state = VerificationDAGState.model_validate(graph_result["dag_state"])
+            completed_task = dag_state.task(task_id)
+            observation = dag_observations.pop(task_id, None)
+            if observation is None:
+                raise RuntimeError(f"DAG task produced no Harness observation: {task_id}")
+            if completed_task.status == "SATISFIED":
+                dag_task_metrics["satisfied"] += 1
+                dag_replan_pending = False
+            elif completed_task.status == "CONTRADICTED":
+                dag_task_metrics["contradicted"] += 1
+                dag_replan_pending = True
+            else:
+                dag_task_metrics["blocked"] += 1
+                dag_replan_pending = True
+            trace.record("DAG_TASK_EXECUTED", {
+                "task_id": task_id,
+                "status": completed_task.status,
+                "evidence_ids": list(
+                    completed_task.supporting_evidence_ids
+                    or completed_task.contradicting_evidence_ids
+                ),
+                "dag_state_metrics": dag_state.metrics(),
+            })
+            return observation
 
         def investigate(step_limit: int, tool_limit: int, review_feedback: str = "",
                         review_baseline: RootCauseCandidate | None = None,
@@ -2532,6 +2851,11 @@ class DiagnosisHarness:
                     router_decision=router_decision,
                     prior_context=bounded_prior,
                     compact=self.config.features.planner_state_envelope,
+                    canonical_task_context=(
+                        execution_mode == "dag"
+                        and self.config.context_projection_mode == "task_aware"
+                    ),
+                    dag_state=dag_state,
                 )
                 exposed_tools = visible_tool_names()
                 if exposed_tools is not None and (active_skill or state.step > 0):
@@ -2585,6 +2909,11 @@ class DiagnosisHarness:
                     include_agent_control_state=False,
                     external_context_chars=len(control_prefix),
                     pressure_state=dynamic_state.state.value,
+                    verification_dag_state=(
+                        dag_state
+                        if self.config.context_projection_mode == "task_aware"
+                        else None
+                    ),
                 )
                 context = control_prefix + context_result.text
                 if dynamic_state.state is not BudgetState.NORMAL:
@@ -3280,18 +3609,21 @@ class DiagnosisHarness:
                         and call.name == "read_file"
                     ):
                         converge_read_file_calls += 1
-                    observation = execute_tool(tool, validated, call.name)
-                    state.tool_calls += 1
-                    state.observations.append(observation)
-                    observation_store.add(observation)
-                    if observation.error_type == "tool_circuit_open":
-                        mark_blocked_capability(call.name)
+                    if execution_mode == "dag":
+                        observation = run_dag_action(call, validated, selection)
+                    else:
+                        observation = execute_tool(tool, validated, call.name)
+                        state.tool_calls += 1
+                        admit_tool_observation(
+                            observation,
+                            tool_name=call.name,
+                            arguments=validated,
+                        )
                     action["observation_id"] = observation.observation_id
                     action["outcome"] = "ok" if observation.ok else "error"
                     action["error_type"] = observation.error_type
                     action["observation_status"] = observation.metadata.get("status")
                     action["semantic_negative"] = observation.metadata.get("semantic_negative")
-                    trace.record("TOOL_OBSERVATION", observation)
                     if call.name == "knowledge_retrieval":
                         retrieved = getattr(knowledge_tool, "last_result", None)
                         retrieved_context = getattr(knowledge_tool, "last_prior_context", None)
@@ -3328,30 +3660,7 @@ class DiagnosisHarness:
                             "matches": retrieval_metadata.get("matches", 0),
                             "candidate_only": retrieval_metadata.get("information_source") == "candidate_retrieval",
                         })
-                    if observation.ok:
-                        target = self._target(validated)
-                        projected = incident_projection.compact_content(observation)
-                        shared_evidence = evidence_memory.add_observation(
-                            observation,
-                            evidence_id=f"ev-{len(evidence_memory.pinned) + 1:03d}",
-                            kind=str(observation.metadata.get("context_kind") or "OBSERVATION"),
-                            source=call.name, summary=projected, excerpt=projected,
-                            target=target,
-                            tags=["task_kind:incident"],
-                            enforce_admission=self.config.features.evidence_lifecycle,
-                            deduplicate=self.config.features.evidence_lifecycle,
-                        )
-                        if shared_evidence is not None:
-                            state.no_progress_count = 0
-                            consecutive_reflection_no_delta = 0
-                            item = IncidentEvidence(
-                                evidence_id=shared_evidence.evidence_id, source=shared_evidence.source,
-                                target=shared_evidence.target or target,
-                                summary=shared_evidence.summary,
-                                observation_id=shared_evidence.raw_observation_id or observation.observation_id,
-                            )
-                            trace.record("EVIDENCE_ADDED", item)
-                    else:
+                    if not observation.ok:
                         trace.record("REFLECTION_TRIGGER", {"reason": "no_progress", "step": state.step})
                     progress_after_action = progress_marker()
                     dynamic_progress = progress_made(
@@ -3633,7 +3942,9 @@ class DiagnosisHarness:
                             prompt_budget=dynamic_budget,
                             max_output_tokens=self.config.review_max_completion_tokens,
                             repair_max_output_tokens=self.config.review_repair_max_completion_tokens,
-                            allow_terminal_reserve=True,
+                            # Review owns its protected allocation; the
+                            # terminal safety reserve remains untouched.
+                            allow_terminal_reserve=False,
                         )
                     except RunBudgetAdmissionExceeded as exc:
                         # Review is the terminal semantic gate. A run-budget
@@ -3641,6 +3952,7 @@ class DiagnosisHarness:
                         # must never be misreported as a Review PASS.
                         llm_calls = max(0, llm_calls - 1)
                         review_calls = max(0, review_calls - 1)
+                        dynamic_budget.set_review_calls_used(review_calls)
                         dynamic_budget.set_run_usage(
                             tokens_used=prompt_tokens + completion_tokens,
                             llm_calls_used=llm_calls,
@@ -3893,6 +4205,18 @@ class DiagnosisHarness:
                     review_evidence_ids=rejected_evidence_ids,
                     review_hypothesis=rejected_hypothesis,
                 )
+        except DAGFinalizationBlocked as exc:
+            status = "INCONCLUSIVE"
+            termination_reason = "dag_finalization_blocked"
+            trace.record("INCIDENT_INCONCLUSIVE", {
+                "error_type": type(exc).__name__,
+                "failure_category": termination_reason,
+                "message": str(exc),
+                "dag_metrics": dag_state.metrics() if dag_state is not None else {},
+                "step": state.step,
+                "tool_calls": state.tool_calls,
+            })
+            error_type, error_message = type(exc).__name__, str(exc)
         except RunBudgetAdmissionExceeded as exc:
             status = "INCONCLUSIVE"
             termination_reason = "pre_call_budget_admission_exceeded"
@@ -4069,10 +4393,16 @@ class DiagnosisHarness:
         else:
             transition_phase("INCONCLUSIVE", termination_reason or "terminal_failure")
         terminal_budget = budget_snapshot("terminal")
+        final_dag_metrics = dag_state.metrics() if dag_state is not None else {}
+        dag_task_count = int(final_dag_metrics.get("task_count", 0) or 0)
+        dag_satisfied_count = int(final_dag_metrics.get("satisfied_task_count", 0) or 0)
         trace.record("INCIDENT_COMPLETED", {
             "status": status, "termination_reason": termination_reason,
             "steps": state.step, "tool_calls": state.tool_calls,
             "budget": budget_payload(terminal_budget),
+            "execution_mode": execution_mode,
+            "context_projection_mode": self.config.context_projection_mode,
+            "dag_metrics": final_dag_metrics,
         })
         trace.record("INCIDENT_FINISHED", {
             "status": status, "termination_reason": termination_reason,
@@ -4112,6 +4442,20 @@ class DiagnosisHarness:
                 obligation_blocked_count=obligation_blocked_count,
                 blocking_contradiction_count=blocking_contradiction_count,
                 stable_rounds=(hypotheses[-1].stable_rounds if hypotheses else 0),
+                execution_mode=execution_mode,
+                context_projection_mode=self.config.context_projection_mode,
+                dag_task_count=dag_task_count,
+                dag_satisfied_task_count=dag_satisfied_count,
+                dag_blocked_task_count=int(final_dag_metrics.get("blocked_task_count", 0) or 0),
+                dag_contradicted_task_count=int(
+                    final_dag_metrics.get("contradicted_task_count", 0) or 0
+                ),
+                dag_local_replan_count=int(
+                    final_dag_metrics.get("local_replan_count", 0) or 0
+                ),
+                dag_task_closure_rate=(
+                    dag_satisfied_count / dag_task_count if dag_task_count else 0.0
+                ),
             ),
             trace_path=str(trace.path),
             error_type=error_type, error_message=error_message,
@@ -4317,8 +4661,46 @@ class DiagnosisHarness:
                                visible_tool_names=(),
                                router_decision: Any | None = None,
                                prior_context: Any | None = None,
-                               compact: bool = False) -> dict[str, Any]:
+                               compact: bool = False,
+                               canonical_task_context: bool = False,
+                               dag_state: Any | None = None) -> dict[str, Any]:
         current = hypotheses[-1] if hypotheses else None
+        canonical_task_claims: set[str] = set()
+        if canonical_task_context and dag_state is not None:
+            task_context = project_verification_tasks(dag_state, max_chars=3_500)
+            raw_tasks = (
+                dag_state.get("tasks", ())
+                if isinstance(dag_state, dict)
+                else getattr(dag_state, "tasks", ())
+            ) or ()
+            for task in raw_tasks:
+                status = str(getattr(task, "status", None) or (
+                    task.get("status") if isinstance(task, dict) else "PENDING"
+                )).upper()
+                critical = bool(getattr(task, "critical", True) if not isinstance(task, dict) else task.get("critical", True))
+                if status == "SATISFIED" or not (status == "READY" or critical or status in {"CONTRADICTED", "BLOCKED"}):
+                    continue
+                claim = getattr(task, "claim", None) if not isinstance(task, dict) else task.get("claim")
+                normalized = " ".join(str(claim or "").split()).casefold()
+                if normalized:
+                    canonical_task_claims.add(normalized)
+
+        def keep_gap(value: str) -> bool:
+            return " ".join(str(value or "").split()).casefold() not in canonical_task_claims
+
+        filtered_obligations = tuple(
+            item for item in (current.verification_obligations if current else ())
+            if keep_gap(item.claim)
+        )
+        filtered_gaps = tuple(
+            value for value in (current.required_gaps if current else ())
+            if keep_gap(value)
+        )
+        current_payload = current.model_dump() if current else None
+        if current_payload is not None and canonical_task_context:
+            current_payload.pop("verification_obligations", None)
+            current_payload.pop("required_gaps", None)
+            current_payload.pop("evidence_gap", None)
         visible_actions = [
             {key: value for key, value in action.items() if key != "observation_id"}
             for action in actions[-8:]
@@ -4339,18 +4721,23 @@ class DiagnosisHarness:
                 "root": "code" if source_workspace_available else None,
             },
             "AVAILABLE_CODE_TOOLS": list(available_code_tools),
-            "CURRENT_HYPOTHESIS": current.model_dump() if current else None,
-            "EVIDENCE_GAP": current.evidence_gap if current else "Identify the affected request path and component.",
+            "CURRENT_HYPOTHESIS": current_payload,
+            "EVIDENCE_GAP": (
+                current.evidence_gap if current and keep_gap(current.evidence_gap)
+                else "See canonical VerificationTask representation."
+                if current and canonical_task_claims
+                else "Identify the affected request path and component."
+            ),
             "SUPPORTING_EVIDENCE_IDS": list(current.supporting_evidence_ids) if current else [],
             "CONTRADICTING_EVIDENCE_IDS": list(current.contradicting_evidence_ids) if current else [],
-            "REQUIRED_EVIDENCE_GAPS": list(current.required_gaps) if current else [],
-            "VERIFICATION_OBLIGATIONS": [item.model_dump() for item in (current.verification_obligations if current else ())],
+            "REQUIRED_EVIDENCE_GAPS": list(filtered_gaps),
+            "VERIFICATION_OBLIGATIONS": [item.model_dump() for item in filtered_obligations],
             "OBLIGATION_SUMMARY": [
                 {
                     "id": item.id, "claim": item.claim, "critical": item.critical,
                     "status": item.status, "blocks_finalization": item.blocks_finalization,
                 }
-                for item in (current.verification_obligations if current else ())
+                for item in filtered_obligations
             ],
             "CONTRADICTIONS": [item.model_dump() for item in (current.contradictions if current else ())],
             "CONTRADICTION_SUMMARY": [
@@ -4385,7 +4772,14 @@ class DiagnosisHarness:
                 available_code_tools=available_code_tools,
                 source_evidence_ids=source_evidence_ids,
             ),
+            "CANONICAL_TASK_CONTEXT": bool(canonical_task_context),
         }
+        if canonical_task_context:
+            for key in (
+                "EVIDENCE_GAP", "REQUIRED_EVIDENCE_GAPS",
+                "VERIFICATION_OBLIGATIONS", "OBLIGATION_SUMMARY",
+            ):
+                payload.pop(key, None)
         if not compact:
             return payload
         # The envelope protocol already carries Planner controls once. Keep
@@ -4404,11 +4798,14 @@ class DiagnosisHarness:
                 "supporting_evidence_ids": list(current.supporting_evidence_ids),
                 "contradicting_evidence_ids": list(current.contradicting_evidence_ids),
                 "source_claims": [item.model_dump() for item in current.source_claims],
-                "required_gaps": list(current.required_gaps),
+                "required_gaps": list(filtered_gaps),
                 "evidence_sufficient": current.evidence_sufficient,
                 "source_mechanism_status": current.source_mechanism_status,
                 "stable_rounds": current.stable_rounds,
             }
+            if canonical_task_context:
+                compact_hypothesis.pop("evidence_gap", None)
+                compact_hypothesis.pop("required_gaps", None)
         compact_payload = dict(payload)
         compact_payload["CURRENT_HYPOTHESIS"] = compact_hypothesis
         for key in (

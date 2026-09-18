@@ -326,6 +326,21 @@ class IncidentOverallQuality(BaseModel):
     unsupported_claim_rate: float
 
 
+class IncidentRcaQuality(BaseModel):
+    """RCA result over fields that have an evaluator contract.
+
+    ``evaluable`` is part of the result so aggregation can exclude missing
+    Gold dimensions instead of treating them as incorrect.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    evaluable: bool
+    correct: bool | None
+    status: str
+    mechanism_included: bool
+
+
 class IncidentGoldMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     case_id: str
@@ -343,13 +358,30 @@ class IncidentEvalResult(BaseModel):
     # Diagnosis quality is measured before the independent Review gate.
     candidate_component_correct: bool
     candidate_fault_correct: bool
+    # Evaluator-only labels used for aggregate macro-F1.  They are never
+    # serialized into runtime context or passed to the agent.
+    candidate_fault_label: str | None = None
+    final_fault_label: str | None = None
+    gold_fault_label: str | None = None
     candidate_mechanism_correct: bool | None = None
+    candidate_fault_explanation_semantic_score: int | None = None
+    candidate_fault_explanation_semantic_status: str = "UNAVAILABLE"
     candidate_evidence_coverage: float
+    candidate_evidence_validity: float = 0.0
+    candidate_evidence_supported: bool = False
+    candidate_required_evidence_coverage: float = 0.0
+    candidate_unsupported_claim_rate: float = 0.0
+    candidate_rca_evaluable: bool = False
+    candidate_rca_correct: bool | None = None
+    candidate_rca_status: str = "NOT_EVALUABLE"
     # Final quality is measured only after Review accepts the candidate.
     review_status: str
     final_component_correct: bool
     final_fault_correct: bool
     final_mechanism_correct: bool | None = None
+    final_rca_evaluable: bool = False
+    final_rca_correct: bool | None = None
+    final_rca_status: str = "NOT_EVALUABLE"
     strict_rca: bool
     component_correct: bool
     fault_correct: bool
@@ -392,6 +424,8 @@ class IncidentEvalResult(BaseModel):
     reliability: IncidentReliabilityQuality
     efficiency: IncidentEfficiencyQuality
     overall: IncidentOverallQuality
+    candidate_rca: IncidentRcaQuality
+    final_rca: IncidentRcaQuality
     gold: IncidentGoldMetadata
     # Existing nested projections are retained so old consumers do not need a
     # flag day migration.
@@ -484,6 +518,7 @@ class IncidentEvaluator:
             field="fault_explanation",
         )
         explanation_score = explanation_grade.score
+        candidate_explanation_score = candidate_explanation_grade.score
 
         candidate_mechanism_evaluated = False
         candidate_mechanism_correct: bool | None = None
@@ -573,6 +608,43 @@ class IncidentEvaluator:
             if material_claims else 0.0
         )
 
+        provisional_cited_ids = (
+            set(provisional_candidate.evidence_ids)
+            if provisional_candidate else set()
+        )
+        provisional_valid_cited_ids = {
+            evidence_id for evidence_id in provisional_cited_ids
+            if evidence_id.startswith("ev-") and evidence_id in known_ids
+        }
+        provisional_evidence = tuple(
+            item for item in observed
+            if item.evidence_id in provisional_cited_ids
+        )
+        provisional_group_matches = tuple(
+            _evidence_group_satisfied(group, provisional_evidence)
+            for group in groups
+        )
+        provisional_required_coverage = (
+            sum(provisional_group_matches) / len(groups) if groups else 1.0
+        )
+        provisional_evidence_validity = (
+            len(provisional_valid_cited_ids) / len(provisional_cited_ids)
+            if provisional_cited_ids else 0.0
+        )
+        provisional_evidence_supported = bool(
+            provisional_candidate
+            and len(provisional_cited_ids) >= 2
+            and len(provisional_valid_cited_ids) == len(provisional_cited_ids)
+        )
+        provisional_material_claims, provisional_supported_claims = _claim_support_counts(
+            provisional_candidate, provisional_valid_cited_ids,
+        )
+        provisional_unsupported_claim_rate = (
+            (provisional_material_claims - provisional_supported_claims)
+            / provisional_material_claims
+            if provisional_material_claims else 0.0
+        )
+
         skill_path = tuple(dict.fromkeys(
             str(action.get("skill")) for action in run.actions if action.get("skill")
         ))
@@ -614,6 +686,30 @@ class IncidentEvaluator:
             and required_coverage == 1.0
             and unsupported_claim_rate == 0.0
         )
+        candidate_rca_evaluable, candidate_rca_correct, candidate_rca_status = _rca_quality(
+            candidate_present=candidate_present,
+            component_correct=candidate_component_correct,
+            fault_correct=candidate_fault_correct,
+            explanation_grade=candidate_explanation_grade,
+            explanation_score=candidate_explanation_score,
+            evidence_supported=provisional_evidence_supported,
+            required_coverage=provisional_required_coverage,
+            unsupported_claim_rate=provisional_unsupported_claim_rate,
+            mechanism_evaluated=candidate_mechanism_evaluated,
+            mechanism_correct=candidate_mechanism_correct,
+        )
+        final_rca_evaluable, final_rca_correct, final_rca_status = _rca_quality(
+            candidate_present=candidate_accepted,
+            component_correct=component_correct,
+            fault_correct=fault_code_correct,
+            explanation_grade=explanation_grade,
+            explanation_score=explanation_score,
+            evidence_supported=evidence_supported,
+            required_coverage=required_coverage,
+            unsupported_claim_rate=unsupported_claim_rate,
+            mechanism_evaluated=mechanism_evaluated,
+            mechanism_correct=mechanism_correct,
+        )
         root_cause_correct = bool(
             candidate
             and component_correct
@@ -628,12 +724,27 @@ class IncidentEvaluator:
             candidate_accepted=candidate_accepted,
             candidate_component_correct=candidate_component_correct,
             candidate_fault_correct=candidate_fault_correct,
+            candidate_fault_label=(provisional_fault_code or None),
+            final_fault_label=(candidate_fault_code or None),
+            gold_fault_label=(truth_fault_code or None),
             candidate_mechanism_correct=candidate_mechanism_correct,
-            candidate_evidence_coverage=required_coverage,
+            candidate_fault_explanation_semantic_score=candidate_explanation_score,
+            candidate_fault_explanation_semantic_status=candidate_explanation_grade.status,
+            candidate_evidence_coverage=provisional_required_coverage,
+            candidate_evidence_validity=provisional_evidence_validity,
+            candidate_evidence_supported=provisional_evidence_supported,
+            candidate_required_evidence_coverage=provisional_required_coverage,
+            candidate_unsupported_claim_rate=provisional_unsupported_claim_rate,
+            candidate_rca_evaluable=candidate_rca_evaluable,
+            candidate_rca_correct=candidate_rca_correct,
+            candidate_rca_status=candidate_rca_status,
             review_status=review_outcome,
             final_component_correct=component_correct,
             final_fault_correct=fault_code_correct,
             final_mechanism_correct=mechanism_correct,
+            final_rca_evaluable=final_rca_evaluable,
+            final_rca_correct=final_rca_correct,
+            final_rca_status=final_rca_status,
             strict_rca=strict_task_success,
             component_correct=component_correct,
             fault_correct=fault_code_correct,
@@ -738,6 +849,18 @@ class IncidentEvaluator:
                 evidence_validity=evidence_validity,
                 required_evidence_coverage=required_coverage,
                 unsupported_claim_rate=unsupported_claim_rate,
+            ),
+            candidate_rca=IncidentRcaQuality(
+                evaluable=candidate_rca_evaluable,
+                correct=candidate_rca_correct,
+                status=candidate_rca_status,
+                mechanism_included=candidate_mechanism_evaluated,
+            ),
+            final_rca=IncidentRcaQuality(
+                evaluable=final_rca_evaluable,
+                correct=final_rca_correct,
+                status=final_rca_status,
+                mechanism_included=mechanism_evaluated,
             ),
             gold=IncidentGoldMetadata(
                 case_id=truth.case_id,
@@ -874,6 +997,42 @@ def _mechanism_is_deterministically_evaluable(truth: CloudOpsGroundTruth) -> boo
         return False
     structured = bool(re.fullmatch(r"[a-z][a-z0-9_]*", value))
     return structured or bool(truth.mechanism_aliases)
+
+
+def _rca_quality(
+    *,
+    candidate_present: bool,
+    component_correct: bool,
+    fault_correct: bool,
+    explanation_grade: SemanticGrade,
+    explanation_score: int | None,
+    evidence_supported: bool,
+    required_coverage: float,
+    unsupported_claim_rate: float,
+    mechanism_evaluated: bool,
+    mechanism_correct: bool | None,
+) -> tuple[bool, bool | None, str]:
+    """Score RCA using only dimensions with an evaluator contract.
+
+    Missing explanation or mechanism Gold is not an automatic RCA failure.
+    The status and eligibility flag make the aggregation denominator explicit.
+    """
+    if not candidate_present:
+        return False, None, "NOT_EVALUABLE"
+
+    checks = [
+        component_correct,
+        fault_correct,
+        evidence_supported,
+        required_coverage == 1.0,
+        unsupported_claim_rate == 0.0,
+    ]
+    if explanation_grade.status == "AVAILABLE":
+        checks.append(explanation_score == 2)
+    if mechanism_evaluated:
+        checks.append(mechanism_correct is True)
+    correct = all(checks)
+    return True, correct, "CORRECT" if correct else "INCORRECT"
 
 
 def _candidate_fault_projection(candidate) -> tuple[str, str, bool]:

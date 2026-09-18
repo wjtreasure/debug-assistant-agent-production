@@ -18,6 +18,7 @@ from debug_assistant.tools.repository import REPOSITORY_SOURCE_MAX_LINES
 from debug_assistant.incidents.contracts import (
     Contradiction, SourceClaim, SourceMechanismStatus, VerificationObligation,
 )
+from debug_assistant.incidents.fault_taxonomy import CANONICAL_FAULT_TYPES
 from debug_assistant.agent.output_normalization import (
     INCIDENT_REQUIRED_CONTROL_FIELDS,
     INCIDENT_SKILL_CONTROL_FIELDS,
@@ -233,8 +234,9 @@ class NativeToolPlanner:
                 "At finalize_diagnosis, component/fault/mechanism/evidence_ids are compatibility projections; "
                 "the Runtime freezes the already validated current Hypothesis as the Candidate core. "
                 "When known, keep candidate_fault_code as a lowercase snake_case taxonomy identifier and "
-                "candidate_fault_explanation as the evidence-grounded natural-language explanation; never "
-                "guess a taxonomy code solely to satisfy a field. "
+                "candidate_fault_explanation as the evidence-grounded natural-language explanation. "
+                "Use only the canonical taxonomy values exposed by the structured contract; never "
+                "invent a code or guess one solely to satisfy a field. "
                 "Use claim_evidence_mapping and causal_chain_summary to explain that frozen diagnosis, and "
                 "keep their Evidence IDs within the Hypothesis supporting Evidence. "
                 "If a bound application source workspace is available and runtime evidence leaves an implementation gap, "
@@ -900,7 +902,11 @@ def _with_incident_skill_controls(schema: dict[str, Any]) -> dict[str, Any]:
         "evidence_gap": {"type": "string", "minLength": 1, "description": "Specific missing evidence this action should obtain."},
         "candidate_component": {"type": "string", "description": "Current root-cause component, or empty when unknown."},
         "candidate_fault": {"type": "string", "description": "Compatibility natural-language fault projection, or empty when unknown."},
-        "candidate_fault_code": {"type": "string", "description": "Structured lowercase snake_case fault taxonomy code, when known; do not invent one."},
+        "candidate_fault_code": {
+            "type": "string",
+            "enum": ["", *sorted(CANONICAL_FAULT_TYPES)],
+            "description": "Canonical fault taxonomy code, or empty when not yet established.",
+        },
         "candidate_fault_explanation": {"type": "string", "description": "Evidence-grounded natural-language explanation of the fault, separate from the taxonomy code."},
         "candidate_mechanism": {"type": "string", "description": "Current causal mechanism, or empty when unknown."},
         "supporting_evidence_ids": {"type": "array", "items": {"type": "string", "pattern": "^ev-"}, "description": "Existing ev-* Evidence IDs supporting the current root cause. Include every fact needed to substantiate the component and causal mechanism because Final Review cannot see uncited evidence."},
