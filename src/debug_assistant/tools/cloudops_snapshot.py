@@ -3,14 +3,22 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar
 
-from pydantic import Field
+from pydantic import Field, model_validator
+from jsonschema import Draft202012Validator
+from debug_assistant._vendor.cloudops_snapshot import (
+    RESOURCE_ALIASES_DB, CLUSTER_SCOPED_RESOURCE_TYPES,
+    LABEL_SELECTOR_SUPPORTED_TYPES, YAML_SNAPSHOT_RESOURCES,
+)
 
 from debug_assistant.models import ToolObservation
 from debug_assistant.incidents.contracts import CausalChainLink, ClaimEvidenceMapping, EvidenceId, SourceClaim
 from debug_assistant.tools.base import Tool, ToolArgs, ToolSpec
-from debug_assistant.tools.cloudops_source import CloudOpsSourceBinding, CloudOpsSourceToolRegistry
+from debug_assistant.tools.cloudops_source import CloudOpsSourceBinding, CloudOpsSourceToolRegistry, SourceCodeArgs, source_provenance_profile
+from debug_assistant.tools.official_cloudops import (
+    OfficialCloudOps, official_result_success,
+)
 
 
 class ServiceNameArgs(ToolArgs):
@@ -22,29 +30,88 @@ class ConnectivityArgs(ServiceNameArgs):
     port: int = Field(ge=1, le=65535)
 
 
-_KUBERNETES_RESOURCE_TYPES = Literal[
-    "configmaps", "daemonsets", "deployments", "endpoints", "events",
-    "ingresses", "jobs", "namespaces", "networkpolicies", "nodes",
-    "persistentvolumeclaims", "persistentvolumes", "pods", "replicasets",
-    "resourcequota", "rolebindings", "secrets", "serviceaccounts", "services",
-    "statefulsets", "storageclasses", "horizontalpodautoscalers",
-]
-
-
 class EmptyArgs(ToolArgs):
     pass
 
 
+def resource_argument_contract(*, projections=False):
+    """Project the pinned backend's protocol, without inspecting snapshot data."""
+    branches = []
+    for cluster, selector, yaml in sorted({(value in CLUSTER_SCOPED_RESOURCE_TYPES,
+            value in LABEL_SELECTOR_SUPPORTED_TYPES, value in YAML_SNAPSHOT_RESOURCES)
+            for value in RESOURCE_ALIASES_DB.values()}):
+        types = [key for key, value in RESOURCE_ALIASES_DB.items() if
+            (value in CLUSTER_SCOPED_RESOURCE_TYPES, value in LABEL_SELECTOR_SUPPORTED_TYPES,
+             value in YAML_SNAPSHOT_RESOURCES) == (cluster, selector, yaml)]
+        scope = {'resource_type': {'enum': types}}
+        if not cluster:
+            scope['namespace'] = {'type': 'string', 'minLength': 1, 'pattern': r'\S'}
+        if not projections:
+            branches.append({'properties': scope})
+            continue
+        ordinary = {**scope, 'output_yaml': {'enum': [False]}}
+        ordinary['label_selector'] = ({'anyOf': [{'type': 'null'},
+            {'type': 'string', 'pattern': r'^[^=]*[^\s=][^=]*=[^=]*[^\s=][^=]*$'}]}
+            if selector else {'type': 'null'})
+        branches.append({'properties': ordinary})
+        if yaml:
+            branches.append({'properties': {**scope, 'output_yaml': {'enum': [True]},
+                'show_labels': {'enum': [False]}, 'output_wide': {'enum': [False]},
+                'label_selector': {'type': 'null'}}})
+    return {'anyOf': branches}
+
+
 class GetResourcesArgs(ToolArgs):
-    resource_type: _KUBERNETES_RESOURCE_TYPES
-    namespace: str = Field(min_length=1)
-    name: str = Field(
-        default="",
+    model_config = {**ToolArgs.model_config, 'json_schema_extra': resource_argument_contract(projections=True)}
+    # Command choices describe the same legal projection as the validator.
+    # Runtime derives low-level flags from an explicit choice, never repairs
+    # an illegal model-generated flag combination.
+    command_choices: ClassVar[dict[str, dict[str, dict[str, bool]]]] = {
+        'presentation': {
+            'STANDARD': {'show_labels': False, 'output_wide': False, 'output_yaml': False},
+            'LABELS': {'show_labels': True, 'output_wide': False, 'output_yaml': False},
+            'WIDE': {'show_labels': False, 'output_wide': True, 'output_yaml': False},
+            'YAML': {'show_labels': False, 'output_wide': False, 'output_yaml': True},
+        }
+    }
+    resource_type: str = Field(min_length=1)
+    namespace: str | None = None
+    name: str | None = Field(
+        default=None,
         description=(
             "Exact captured Kubernetes resource name. This is not a logical "
             "service/app name; leave empty to list resources and obtain an exact name first."
         ),
     )
+    show_labels: bool = Field(
+        default=False,
+        description="Add captured label columns; mutually exclusive with output_wide.",
+    )
+    output_wide: bool = Field(
+        default=False,
+        description="Add captured IP/node/placement columns; mutually exclusive with show_labels.",
+    )
+    output_yaml: bool = False
+    label_selector: str | None = Field(
+        default=None,
+        description=(
+            "Optional simple key=value selector for captured pods, services, "
+            "deployments, or persistentvolumeclaims."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_output_projection(self) -> "GetResourcesArgs":
+        if self.show_labels and self.output_wide:
+            raise ValueError("show_labels and output_wide are mutually exclusive")
+        if self.label_selector is not None and not self.label_selector.strip():
+            raise ValueError("label_selector must be non-empty when provided")
+        arguments = self.model_dump(mode='json')
+        arguments['resource_type'] = self.resource_type.lower()
+        error = next(Draft202012Validator(type(self).model_json_schema()).iter_errors(arguments), None)
+        if error:
+            raise ValueError(error.message)
+        return self
 
 
 class GetAppYAMLArgs(ToolArgs):
@@ -52,12 +119,22 @@ class GetAppYAMLArgs(ToolArgs):
 
 
 class DescribeResourceArgs(ToolArgs):
-    resource_type: _KUBERNETES_RESOURCE_TYPES
-    namespace: str = Field(min_length=1)
+    model_config = {**ToolArgs.model_config, 'json_schema_extra': resource_argument_contract()}
+    resource_type: str = Field(min_length=1)
+    namespace: str | None = None
     name: str = Field(
         min_length=1,
         description="Exact captured Kubernetes resource name returned by a list/query result; logical service/app names are not expanded.",
     )
+
+    @model_validator(mode="after")
+    def validate_scope(self):
+        arguments = self.model_dump(mode='json')
+        arguments['resource_type'] = self.resource_type.lower()
+        error = next(Draft202012Validator(type(self).model_json_schema()).iter_errors(arguments), None)
+        if error:
+            raise ValueError(error.message)
+        return self
 
 
 class ErrorLogsArgs(ToolArgs):
@@ -78,14 +155,14 @@ class FinalizeDiagnosisArgs(ToolArgs):
     component: str = Field(
         min_length=1,
         description=(
-            "Compatibility field. Runtime ignores this value and copies the "
+            "Provider proposal field. Runtime ignores this value and copies the "
             "component from the finalized Incident Hypothesis."
         ),
     )
     fault: str = Field(
         min_length=1,
         description=(
-            "Compatibility field. Runtime ignores this value and copies the "
+            "Provider proposal field. Runtime ignores this value and copies the "
             "fault from the finalized Incident Hypothesis."
         ),
     )
@@ -106,14 +183,14 @@ class FinalizeDiagnosisArgs(ToolArgs):
     mechanism: str = Field(
         min_length=1,
         description=(
-            "Compatibility field. Runtime ignores this value and copies the "
+            "Provider proposal field. Runtime ignores this value and copies the "
             "mechanism from the finalized Incident Hypothesis."
         ),
     )
     evidence_ids: list[EvidenceId] = Field(
         min_length=2,
         description=(
-            "Compatibility Evidence projection. Runtime validates the IDs but "
+            "Provider Evidence projection. Runtime validates the IDs but "
             "uses the finalized Incident Hypothesis supporting Evidence as the "
             "Candidate authority. Final Review cannot see uncited Evidence."
         ),
@@ -136,41 +213,85 @@ class FinalizeDiagnosisArgs(ToolArgs):
     )
 
 
-class _SnapshotTool(Tool):
-    def __init__(self, spec: ToolSpec, records: list[dict[str, Any]]):
-        self.spec = spec
-        self._records = records
+class _OfficialTool(Tool):
+    """Executable adapter; all query semantics belong to KubernetesTools."""
+
+    def __init__(self, spec: ToolSpec, official: OfficialCloudOps, method: str):
+        self.spec, self.official, self.method = spec, official, method
+
+    @property
+    def available(self) -> bool:
+        return self.method != "GetRecentLogs" or self.official.raw_logs_available
+
+    def provenance_profiles(self):
+        if self.spec.name == "get_source_code":
+            return (source_provenance_profile(self.spec.name),)
+        arguments = ({'resource_type': value} for value in RESOURCE_ALIASES_DB.values()) if (
+            'resource_type' in self.spec.args_model.model_fields) else ({},)
+        pairs = {tuple(_incident_context_metadata(self.spec.name, value)[key] for key in
+                       ('context_kind', 'information_source')) for value in arguments}
+        return tuple({'context_kind': kind, 'information_source': source} for kind, source in sorted(pairs))
+
+    def provenance_for_arguments(self, arguments):
+        if self.spec.name == 'get_source_code':
+            return (source_provenance_profile(self.spec.name),)
+        metadata = _incident_context_metadata(self.spec.name, arguments)
+        return ({key: metadata[key] for key in ('context_kind', 'information_source')},)
+
+    def provenance_argument_domains(self, constraints):
+        """Finite backend resource aliases sharing the exact declared output type."""
+        if 'resource_type' not in self.spec.args_model.model_fields:
+            return {}
+        from debug_assistant.tools.provenance import profile_matches_constraints
+        return {'resource_type': tuple(alias for alias in sorted(RESOURCE_ALIASES_DB)
+            if any(profile_matches_constraints({
+                'context_kinds': (profile['context_kind'],),
+                'information_sources': (profile['information_source'],),
+                'source_tools': (self.spec.name,),
+            }, constraints) for profile in self.provenance_for_arguments({'resource_type': alias})))}
+
+    def provenance_categories(self):
+        from debug_assistant.tools.provenance import profile_categories
+        return profile_categories(self.provenance_profiles())
 
     def execute(self, **kwargs: Any) -> ToolObservation:
-        context_metadata = _incident_context_metadata(self.spec.name, kwargs)
-        for record in self._records:
-            if record.get("arguments") == kwargs:
-                output = record.get("output", "")
-                if self.spec.name == "list_code_files":
-                    output = _normalize_code_index_output(output)
-                content = _serialize_snapshot_output(output)
-                empty = _is_semantically_empty(output)
-                return ToolObservation(tool=self.spec.name, ok=True, content=content,
-                                       metadata={
-                                           "arguments": kwargs, "snapshot": True,
-                                           "status": "AVAILABLE", "semantic_negative": empty,
-                                           **context_metadata,
-                                       })
-        return ToolObservation(
-            tool=self.spec.name,
-            ok=False,
-            content=json.dumps({
-                "status": "UNAVAILABLE",
-                "reason": "observation_not_present_in_snapshot",
-                "semantic_negative": False,
-            }),
-            metadata={
-                "arguments": kwargs, "snapshot": True, "status": "UNAVAILABLE",
-                "reason": "observation_not_present_in_snapshot", "semantic_negative": False,
-                **context_metadata,
-            },
-            error_type="snapshot_unavailable",
-        )
+        arguments = dict(kwargs)
+        method = self.method
+        if method == "GetResources":
+            yaml_output = bool(arguments.pop("output_yaml", False))
+            if yaml_output:
+                if arguments.get("label_selector"):
+                    return ToolObservation(self.spec.name, False,
+                                           "YAML and selector use distinct official contracts.",
+                                           {}, "schema_validation")
+                arguments.pop("label_selector", None)
+                arguments["output_yaml"] = True
+                method = "GetResources_v2"
+        metadata = {"arguments": kwargs, "snapshot": True,
+                    **_incident_context_metadata(self.spec.name, kwargs)}
+        try:
+            if method == "GetSourceCode":
+                return ToolObservation(self.spec.name, False, "Source workspace unavailable.",
+                                       {**metadata, "status": "UNAVAILABLE", "semantic_negative": False,
+                                        "reason": "source_workspace_unavailable", "official_invoked": False},
+                                       "source_workspace_unavailable")
+            output, acquired, provenance = self.official.invoke(method, arguments)
+            success = acquired and official_result_success(output)
+            metadata.update(provenance)
+            metadata.update({
+                "status": "AVAILABLE" if success else "UNAVAILABLE",
+                "semantic_negative": success and provenance.get("semantic_negative", False),
+                "negative_observation": success and isinstance(output, str) and output.casefold() == "connection failed",
+            })
+            if not acquired:
+                metadata["reason"] = provenance.get("reason", "observation_not_present_in_snapshot")
+            return ToolObservation(
+                self.spec.name, success, _serialize_snapshot_output(output), metadata,
+                None if success else "snapshot_unavailable" if not acquired else "official_tool_error",
+            )
+        except (ValueError, OSError) as exc:
+            return ToolObservation(self.spec.name, False, str(exc), metadata,
+                                   type(exc).__name__)
 
 
 class _TopologyTool(Tool):
@@ -184,6 +305,15 @@ class _TopologyTool(Tool):
     def __init__(self, topology_path: Path):
         self._topology = json.loads(topology_path.read_text(encoding="utf-8"))["services"]
 
+    _SOURCE_PROFILE = (('context_kind', 'SERVICE'), ('information_source', 'static_kg'))
+
+    def provenance_profiles(self):
+        return (dict(self._SOURCE_PROFILE),)
+
+    def provenance_categories(self):
+        from debug_assistant.tools.provenance import profile_categories
+        return profile_categories(self.provenance_profiles())
+
     def execute(self, **kwargs: Any) -> ToolObservation:
         name = kwargs["service_name"]
         value = self._topology.get(name)
@@ -193,31 +323,33 @@ class _TopologyTool(Tool):
         return ToolObservation(tool=self.spec.name, ok=True, content=json.dumps(value, ensure_ascii=False, sort_keys=True),
                                metadata={
                                    "arguments": kwargs, "structured_topology": True,
-                                   "context_kind": "SERVICE", "context_target": name,
+                                   **dict(self._SOURCE_PROFILE), "context_target": name,
                                })
 
 
 class CloudOpsSnapshotToolRegistry:
     """Read-only replay registry for a runtime-visible Cloud-OpsBench snapshot."""
 
-    # These primitives remain registered and executable for compatibility with
-    # shared repository/SWE callers.  ``code_search`` is a first-class Incident
-    # Planner capability only when a bound source workspace exists; the source
-    # adapter is added below only in that case.
+    # These CloudOps snapshot primitives are always available. ``code_search``
+    # is exposed only when a bound application source workspace exists.
     PLANNER_HIDDEN_TOOLS = frozenset({
         "list_code_files", "inspect_symbol_context",
     })
     PLANNER_CODE_TOOLS = ("repo_tree", "grep", "read_file", "symbol_search", "code_search")
 
     def __init__(self, runtime_data_dir: str | Path, topology_path: str | Path, *, search_engine=None):
-        cache = json.loads((Path(runtime_data_dir) / "tool_cache.json").read_text(encoding="utf-8"))
+        self.official = OfficialCloudOps(runtime_data_dir)
         specs = {
             "check_service_connectivity": ToolSpec(
                 "check_service_connectivity", "Probe a service and port from the captured incident environment.",
                 ConnectivityArgs, capability="incident_read",
             ),
             "get_resources": ToolSpec(
-                "get_resources", "Read captured Kubernetes state. Resource name is exact; omit it to list and discover a captured resource name.",
+                "get_resources",
+                "Read captured Kubernetes state (status, labels, placement, and configuration). "
+                "It does not provide live CPU/memory utilization metrics unless those fields "
+                "are explicitly present in the captured output. Resource name is exact; omit "
+                "it to list and discover a captured resource name.",
                 GetResourcesArgs, capability="incident_read", parallel_safe=True,
             ),
             "get_app_yaml": ToolSpec(
@@ -236,6 +368,14 @@ class CloudOpsSnapshotToolRegistry:
                 "get_error_logs", "Read captured error-log summaries for one service in a namespace.",
                 ErrorLogsArgs, capability="incident_read", parallel_safe=True,
             ),
+            "get_recent_logs": ToolSpec(
+                "get_recent_logs", "Read official captured raw recent logs; unavailable when raw logs are absent.",
+                ErrorLogsArgs, capability="incident_read",
+            ),
+            "get_source_code": ToolSpec(
+                "get_source_code", "Acquire app-scoped source through official GetSourceCode when source is bound.",
+                SourceCodeArgs, capability="source_read",
+            ),
             "list_code_files": ToolSpec(
                 "list_code_files", "Read the captured application source-file inventory and file descriptions.",
                 ListCodeFilesArgs, capability="incident_read", parallel_safe=True,
@@ -253,14 +393,16 @@ class CloudOpsSnapshotToolRegistry:
                 EmptyArgs, capability="incident_read", parallel_safe=True,
             ),
         }
-        records = _snapshot_records(cache)
-        self._tools = {name: _SnapshotTool(spec, records[name]) for name, spec in specs.items()}
+        methods = {local: official for official, local in _OFFICIAL_TOOL_NAMES.items()}
+        self.official_aliases = dict(_OFFICIAL_TOOL_NAMES)
+        self._tools = {name: _OfficialTool(spec, self.official, methods[name])
+                       for name, spec in specs.items()}
         topology = _TopologyTool(Path(topology_path))
         self._tools[topology.spec.name] = topology
         self.source_binding = CloudOpsSourceBinding(runtime_data_dir)
         if self.source_binding.available:
             self._tools.update(CloudOpsSourceToolRegistry(
-                self.source_binding, search_engine=search_engine,
+                self.source_binding, search_engine=search_engine, official=self.official,
             ).tools())
         self._finalize_spec = ToolSpec(
             "finalize_diagnosis", "Submit the evidence-backed final root-cause candidate for review. Final Review sees only the cited evidence_ids, so include every Evidence item required to support the component and mechanism.",
@@ -269,6 +411,12 @@ class CloudOpsSnapshotToolRegistry:
 
     def get(self, name: str):
         return self._tools.get(name)
+
+    @property
+    def decision_tool_aliases(self):
+        # The existing completion/source-coverage path cites read_file. The
+        # public official API adapter remains available for direct callers.
+        return {**self.official_aliases, 'GetSourceCode': 'read_file'}
 
     def register(self, tool: Tool) -> None:
         """Register an optional capability-layer tool on this existing registry."""
@@ -292,16 +440,6 @@ class CloudOpsSnapshotToolRegistry:
                 spec.function_schema(),
                 keep_descriptions=spec.name == "finalize_diagnosis",
             )
-            if spec.name == "code_search":
-                # The incident provider supplies a query and result bound only.
-                # Retrieval mode is an implementation policy selected by the
-                # bound source tool, not a Planner knob.
-                properties = schema["function"]["parameters"].get("properties", {})
-                properties.pop("mode", None)
-                required = schema["function"]["parameters"].get("required", [])
-                schema["function"]["parameters"]["required"] = [
-                    item for item in required if item != "mode"
-                ]
             schemas.append(schema)
         return schemas
 
@@ -318,11 +456,14 @@ class CloudOpsSnapshotToolRegistry:
             return None, {"error_type": "unknown_tool", "message": f"unknown tool: {name}"}
         try:
             normalized = spec.args_model.model_validate(arguments).model_dump()
-            if name == "code_search" and self.get(name) is not None:
-                # Keep the Planner-facing contract high level.  The bound
-                # CodeSearchTool runs hybrid_ast, then reports lexical_ast or
-                # lexical when semantic retrieval is unavailable.
-                normalized["mode"] = "hybrid_ast"
+            if name == "get_resources":
+                # Official cache keys omit false/None projection options but
+                # retain the historical explicit ``name`` field.
+                normalized = {
+                    key: value for key, value in normalized.items()
+                    if key not in {"show_labels", "output_wide", "label_selector"}
+                    or value not in (False, None)
+                }
             return normalized, None
         except Exception as exc:
             return None, {"error_type": "schema_validation", "message": str(exc)}
@@ -335,6 +476,8 @@ _OFFICIAL_TOOL_NAMES = {
     "DescribeResource": "describe_resource",
     "GetAlerts": "get_alerts",
     "GetErrorLogs": "get_error_logs",
+    "GetRecentLogs": "get_recent_logs",
+    "GetSourceCode": "get_source_code",
     "ListCodeFiles": "list_code_files",
     "GetServiceDependencies": "get_service_dependencies",
     "CheckNodeServiceStatus": "check_node_service_status",
@@ -344,6 +487,7 @@ _OFFICIAL_TOOL_NAMES = {
 
 def _incident_context_metadata(tool_name: str, arguments: dict[str, Any]) -> dict[str, str]:
     resource_type = str(arguments.get("resource_type") or "").lower()
+    resource_type = RESOURCE_ALIASES_DB.get(resource_type, resource_type)
     resource_kinds = {
         "pods": "POD", "services": "SERVICE", "endpoints": "ENDPOINT",
         "deployments": "DEPLOYMENT", "events": "EVENT", "nodes": "NODE",
@@ -360,7 +504,7 @@ def _incident_context_metadata(tool_name: str, arguments: dict[str, Any]) -> dic
         kind = "ENDPOINT"
     elif tool_name == "get_alerts":
         kind = "ALERT"
-    elif tool_name == "get_error_logs":
+    elif tool_name in {"get_error_logs", "get_recent_logs"}:
         kind = "LOG"
     elif tool_name == "list_code_files":
         kind = "CODE_INDEX"
@@ -375,7 +519,7 @@ def _incident_context_metadata(tool_name: str, arguments: dict[str, Any]) -> dic
     target = str(arguments.get("name") or arguments.get("app_name")
                   or arguments.get("service_name") or arguments.get("node_name")
                   or ("alerts" if tool_name == "get_alerts" else resource_type))
-    return {"context_kind": kind, "context_target": target}
+    return {"context_kind": kind, "context_target": target, "information_source": "incident_snapshot"}
 
 
 def _serialize_snapshot_output(output: Any) -> str:
@@ -393,8 +537,8 @@ def _compact_provider_schema(schema: dict[str, Any], *, keep_descriptions: bool 
     Pydantic remains the validation source of truth.  Provider-facing tool
     schemas only need names, types, enums, constraints and required fields;
     titles/defaults/examples and long field descriptions are repeated on every
-    Planner call.  The finalization schema keeps descriptions because its
-    Evidence projection is a high-risk compatibility boundary.
+    Planner call. The finalization schema keeps descriptions because its
+    Evidence projection is a high-risk semantic boundary.
     """
     def compact(value):
         if isinstance(value, dict):
@@ -426,60 +570,3 @@ def _compact_provider_schema(schema: dict[str, Any], *, keep_descriptions: bool 
             if description and field_name in compacted_properties:
                 compacted_properties[field_name]["description"] = description
     return compacted
-
-
-def _normalize_code_index_output(output: Any) -> Any:
-    """Make cache paths directly usable with the case-local ``code/`` binding."""
-    if not isinstance(output, dict):
-        return output
-    normalized = dict(output)
-    root = str(normalized.get("root") or "").replace("\\", "/").strip("/")
-    if root == "code":
-        source_root = ""
-    elif root.startswith("code/"):
-        source_root = root[len("code/"):]
-    else:
-        source_root = root
-    if source_root:
-        normalized["root"] = source_root
-    normalized["source_root"] = "code"
-    normalized["source_relative"] = True
-    files = []
-    for item in normalized.get("files") or []:
-        if not isinstance(item, dict):
-            files.append(item)
-            continue
-        file_item = dict(item)
-        path = str(file_item.get("path") or "").replace("\\", "/").lstrip("/")
-        if source_root and path != source_root and not path.startswith(source_root + "/"):
-            path = f"{source_root}/{path}" if path else source_root
-        file_item["path"] = path
-        files.append(file_item)
-    normalized["files"] = files
-    return normalized
-
-
-def _is_semantically_empty(output: Any) -> bool:
-    """An available empty query is a negative observation, not causal evidence."""
-    return output is None or output == {} or output == [] or output == ""
-
-
-def _snapshot_records(cache: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
-    """Read curated fixtures or the official Cloud-OpsBench flat cache unchanged."""
-    records = {name: [] for name in _OFFICIAL_TOOL_NAMES.values()}
-    if any(":" in key for key in cache):
-        for cache_key, output in cache.items():
-            tool_name, separator, raw_arguments = cache_key.partition(":")
-            internal_name = _OFFICIAL_TOOL_NAMES.get(tool_name)
-            if not separator or internal_name is None:
-                continue
-            try:
-                arguments = json.loads(raw_arguments)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(arguments, dict):
-                records[internal_name].append({"arguments": arguments, "output": output})
-        return records
-    for name in records:
-        records[name] = list(cache.get(name) or [])
-    return records

@@ -8,6 +8,17 @@ import json
 import re
 
 
+def strict_response_format(schema, *, for_packing=False) -> dict[str, Any]:
+    """Exact wire representation shared by admission, snapshots and adapter."""
+    render = getattr(schema, 'provider_json_schema', getattr(schema, 'model_json_schema', None))
+    if for_packing:
+        render = getattr(schema, 'packing_json_schema', render)
+    return {'type': 'json_schema', 'json_schema': {
+        'name': getattr(schema, 'name', getattr(schema, '__name__', 'response')),
+        'strict': True,
+        'schema': render() if callable(render) else schema}}
+
+
 class LLMError(RuntimeError):
     pass
 
@@ -118,8 +129,8 @@ class ModelCapability:
         }
 
 
-# Singular spelling used by the Dynamic Budget specification.  Keep the
-# existing plural feature-capability type below for backward compatibility.
+# Singular spelling used by the Dynamic Budget specification. The plural alias
+# remains the public provider capability name used by current adapters.
 ProviderCapability = ModelCapability
 
 
@@ -132,7 +143,8 @@ class ProviderCapabilities:
     tool_calling: bool = False
     parallel_tool_calls: bool = False
     # Optional physical-limit fields are additive. Existing providers that do
-    # not advertise a model window continue to use the legacy context fallback.
+    # not advertise a model window continue to use the deterministic context
+    # fallback.
     provider: str = ""
     model: str = ""
     context_window: int | None = None
@@ -234,7 +246,7 @@ def complete_json_compat(
     max_output_tokens: int | None = None,
     enable_thinking: bool | None = None,
 ):
-    """Pass V1.4.5 deadline metadata without breaking legacy test/provider doubles."""
+    """Pass deadline metadata while keeping provider adapters optional."""
     fn = client.complete_json
     try:
         sig = inspect.signature(fn)
@@ -290,7 +302,10 @@ def extract_json(text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         start = text.find("{"); end = text.rfind("}")
         if start >= 0 and end > start:
-            return json.loads(text[start:end + 1])
+            try:
+                return json.loads(text[start:end + 1])
+            except json.JSONDecodeError as exc:
+                raise LLMInvalidJSON(f"Model did not return valid JSON: {text[:500]}") from exc
         raise LLMInvalidJSON(f"Model did not return valid JSON: {text[:500]}")
 
 

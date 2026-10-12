@@ -11,10 +11,9 @@ runtime and EvidenceMemory from drifting apart again.
 from typing import Any
 
 from debug_assistant.models import Evidence, ToolObservation
-from debug_assistant.tools.repository import REPOSITORY_SOURCE_MAX_LINES
-
-
-_MAX_SOURCE_LINES = REPOSITORY_SOURCE_MAX_LINES
+# CloudOps source reads are bounded at the evidence boundary.  This is a
+# lifecycle limit, not a dependency on the SWE repository-tool package.
+_MAX_SOURCE_LINES = 800
 
 
 def is_canonical_source_evidence(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 from hashlib import sha1
+import json
 import re
 from debug_assistant.models import Evidence, ToolObservation
 from debug_assistant.memory.evidence_boundary import is_canonical_source_evidence
@@ -46,6 +47,17 @@ class EvidenceMemory:
         self._evidence_by_fingerprint: dict[str, Evidence] = {}
         self._evidence_by_observation_id: dict[str, Evidence] = {}
 
+    def publish_staged(self, staged: "EvidenceMemory") -> None:
+        """Publish an already validated, short-lived transaction image.
+
+        Preserve the canonical list identity used by detached Runtime readers.
+        Semantic validation must finish before calling this write boundary.
+        """
+        self.pinned[:] = staged.pinned
+        self._seen = staged._seen
+        self._evidence_by_fingerprint = staged._evidence_by_fingerprint
+        self._evidence_by_observation_id = staged._evidence_by_observation_id
+
     def evidence_for_observation(self, observation_id: str) -> Evidence | None:
         """Return the canonical Evidence representing an immutable Observation.
 
@@ -53,6 +65,47 @@ class EvidenceMemory:
         returned Evidence ID, including when two observations contain the same fact.
         """
         return self._evidence_by_observation_id.get(observation_id)
+
+    def get(self, evidence_id: str | None) -> Evidence | None:
+        return next((item for item in self.pinned if item.evidence_id == evidence_id), None)
+
+    def projection(self, *, facts=(), evidence_ids=(), max_chars: int = 6000) -> list[dict]:
+        """Bounded admitted-Evidence references, not historical raw output.
+
+        Relationship meaning belongs to typed projected facts. Body/provenance
+        stays here; this detached projection is rebuilt for each immutable turn.
+        """
+        facts = tuple(facts)
+        allowed = set(evidence_ids)
+        rows = []
+        for evidence in reversed(self.pinned):
+            if evidence.evidence_id not in allowed:
+                continue
+            relations = [fact for fact in facts if fact.evidence_id == evidence.evidence_id]
+            row = {
+                "evidence_ref": evidence.evidence_id,
+                "claim": (relations[-1].fact if relations else evidence.summary)[:500],
+                "source": evidence.source,
+                "observation_refs": [evidence.raw_observation_id],
+                "provenance": {key: value for key, value in evidence.provenance.items()
+                               if key in {"context_kind", "information_source", "path"}},
+                "confidence": evidence.confidence,
+                "qualification": "ADMITTED",
+                "canonical_source": is_canonical_source_evidence(None, evidence, evidence_memory=self),
+                "relations": [{"hypothesis_id": fact.hypothesis_id,
+                               "hypothesis_scope": fact.hypothesis_fingerprint,
+                               "obligation_id": fact.obligation_id,
+                               "relation": fact.relation,
+                               "hypothesis_relation": fact.hypothesis_relation,
+                               "covered_fact_slots": list(fact.covered_fact_slots),
+                               "reason": fact.reason,
+                               "rationale": fact.rationale,
+                               "source_spans": list(fact.source_spans)}
+                              for fact in relations[-8:]],
+            }
+            if len(json.dumps(rows + [row], ensure_ascii=False, separators=(",", ":"))) <= max_chars:
+                rows.append(row)
+        return rows
 
     def add_observation(self, obs: ToolObservation, *, evidence_id: str | None = None,
                         kind: str | None = None, source: str | None = None,
@@ -65,7 +118,8 @@ class EvidenceMemory:
         # A captured query can be available while returning an empty collection
         # (for example, no error logs). Preserve that raw Observation, but do not
         # promote the absence of records into a citable causal fact.
-        if enforce_admission and (obs.metadata or {}).get('semantic_negative') is True:
+        if enforce_admission and ((obs.metadata or {}).get('semantic_negative') is True
+                or (obs.metadata or {}).get('result_kind') == 'OPERATIONAL_ONLY'):
             return None
         # Retrieval results are candidate locations, not causal evidence. They must be
         # verified by a source-reading observation before entering the evidence ledger.
@@ -75,8 +129,8 @@ class EvidenceMemory:
             'incident_memory', 'domain_rag', 'static_kg',
         }:
             return None
-        # Even if a legacy/custom symbol tool labels its bounded preview as
-        # source_read, symbol lookup is still discovery.  Only read_file is the
+        # Even if a custom symbol tool labels its bounded preview as source_read,
+        # symbol lookup is still discovery. Only read_file is the
         # canonical source-verification observation.
         if enforce_admission and obs.tool == 'symbol_search':
             return None
@@ -109,7 +163,7 @@ class EvidenceMemory:
             evidence_id=evidence_id or f"ev-{key}", kind=kind or obs.tool, source=source or obs.tool,
             summary=summary or obs.content[:700].replace('\n',' '), target=target,
             excerpt=evidence_excerpt,
-            file=meta.get('path'), line_start=source_start, line_end=source_end,
+            file=meta.get('path'),
             raw_observation_id=obs.observation_id,
             source_start_line=source_start, source_end_line=source_end,
             excerpt_start_line=excerpt_start, excerpt_end_line=excerpt_end,

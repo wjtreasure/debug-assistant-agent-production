@@ -1,0 +1,23 @@
+{
+  "schema_version": "1.1",
+  "system": "online-boutique",
+  "services": {
+    "frontend": {
+      "responsibility": "Serves the web UI and orchestrates user-facing requests.",
+      "upstream": ["user-traffic"],
+      "downstream": ["adservice", "cartservice", "checkoutservice", "currencyservice", "productcatalogservice", "recommendationservice", "shippingservice"],
+      "important_dependencies": ["cartservice", "checkoutservice", "productcatalogservice"],
+      "typical_signals": ["HTTP request errors", "downstream RPC status", "request latency"]
+    },
+    "adservice": {"responsibility": "Returns advertisements for the current request context.", "upstream": ["frontend"], "downstream": [], "important_dependencies": [], "typical_signals": ["RPC errors", "request latency", "availability"]},
+    "cartservice": {"responsibility": "Stores and retrieves shopping-cart contents.", "upstream": ["checkoutservice", "frontend"], "downstream": ["redis-cart"], "important_dependencies": ["redis-cart"], "typical_signals": ["RPC errors", "storage errors", "request latency"]},
+    "checkoutservice": {"responsibility": "Orchestrates checkout, charging, shipping, order confirmation and cart completion.", "upstream": ["frontend"], "downstream": ["cartservice", "currencyservice", "emailservice", "paymentservice", "productcatalogservice", "shippingservice"], "important_dependencies": ["cartservice", "paymentservice", "shippingservice"], "typical_signals": ["RPC errors", "dependency availability", "request latency"]},
+    "currencyservice": {"responsibility": "Converts monetary values between currencies.", "upstream": ["checkoutservice", "frontend"], "downstream": [], "important_dependencies": [], "typical_signals": ["RPC errors", "request latency", "availability"]},
+    "emailservice": {"responsibility": "Sends order confirmation email.", "upstream": ["checkoutservice"], "downstream": [], "important_dependencies": [], "typical_signals": ["RPC errors", "delivery errors", "availability"]},
+    "paymentservice": {"responsibility": "Charges payment instruments for checkout orders.", "upstream": ["checkoutservice"], "downstream": [], "important_dependencies": [], "typical_signals": ["RPC errors", "charge failures", "request latency"]},
+    "productcatalogservice": {"responsibility": "Provides product catalog data and product lookup.", "upstream": ["checkoutservice", "frontend", "recommendationservice"], "downstream": [], "important_dependencies": [], "typical_signals": ["RPC errors", "lookup failures", "request latency"]},
+    "recommendationservice": {"responsibility": "Builds product recommendations from catalog data.", "upstream": ["frontend"], "downstream": ["productcatalogservice"], "important_dependencies": ["productcatalogservice"], "typical_signals": ["RPC errors", "dependency availability", "request latency"]},
+    "shippingservice": {"responsibility": "Calculates shipping cost and tracks shipments.", "upstream": ["checkoutservice", "frontend"], "downstream": [], "important_dependencies": [], "typical_signals": ["RPC errors", "request latency", "availability"]},
+    "redis-cart": {"responsibility": "Persists cart data for cartservice.", "upstream": ["cartservice"], "downstream": [], "important_dependencies": [], "typical_signals": ["connection errors", "operation latency", "memory utilization"]}
+  }
+}

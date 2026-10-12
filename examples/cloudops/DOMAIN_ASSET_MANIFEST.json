@@ -1,0 +1,1964 @@
+{
+  "schema_version": "domain-asset-manifest-v2",
+  "audit_revision": "r6.5b-official-tool-integration-2026-10-03",
+  "upstream": {
+    "repository": "LLM4Ops/Cloud-OpsBench",
+    "commit": "d79f1526a4c3315004c09457fbec588eb257dd1c",
+    "local_snapshot_root": "external input; not a Runtime case path",
+    "license": "MIT",
+    "license_url": "https://github.com/LLM4Ops/Cloud-OpsBench/blob/d79f1526a4c3315004c09457fbec588eb257dd1c/LICENSE",
+    "license_sha256": "d19af713964259f9ab5d662bfc706d2c072ee9211495d3d6d4c3c7588f59abbc",
+    "attribution": "Copyright (c) 2026 Yilun Wang"
+  },
+  "generator": {
+    "path": "scripts/build_domain_asset_manifest.py",
+    "source_sha256": "115dbb059667bc54cdf612d8b66a5f50d9afd470435a3960ffc9eb89fadc5ef4",
+    "command": "python scripts/build_domain_asset_manifest.py --check --upstream-root <cloudops_skill_agent>",
+    "deterministic": true
+  },
+  "registry_contract": {
+    "fields": [
+      "skill_id",
+      "objective",
+      "guidance",
+      "allowed_tools",
+      "expected_evidence",
+      "completion_rule",
+      "source",
+      "source_sha256",
+      "derived_sha256",
+      "disposition"
+    ],
+    "owner": "future DomainSkillRegistry; Phase 0 does not inject assets into Runtime",
+    "skill_role": "public domain investigation prior only",
+    "runtime_role": "tool control, Evidence admission, obligation lifecycle, convergence and trace"
+  },
+  "local_tool_catalog": {
+    "source": "src/debug_assistant/tools/cloudops_snapshot.py",
+    "source_sha256": "2e90577002f9cefd3ef40897aa9b137faeed0b0a79ebe0c0ce9f71e6acc4f771",
+    "catalog_sha256": "2e90577002f9cefd3ef40897aa9b137faeed0b0a79ebe0c0ce9f71e6acc4f771",
+    "schema_bundle_sha256": "64b1e0ac968e115342e7e9dafcaedda8b91b9e3efba9c044d989395fec5ce9e7",
+    "runtime_allowed": true,
+    "selector": "snapshot capability; never fault/category metadata"
+  },
+  "official_tools": [
+    {
+      "id": "GetResources",
+      "source": "agents/cloudops_skill_agent/tools/cloudops.py",
+      "source_sha256": "96f0c6bc5c47a52b3d6c270d017d49acd6da33e603712739c7ed96bf9409bffa",
+      "local_mapping": "get_resources",
+      "disposition": "THIN_ADAPTER",
+      "official_schema_variants": [
+        "GetResourcesInput",
+        "GetResourcesV2Input"
+      ],
+      "local_arguments": [
+        "resource_type",
+        "namespace",
+        "name",
+        "show_labels",
+        "output_wide",
+        "label_selector",
+        "output_yaml"
+      ],
+      "adapter_note": "Official KubernetesTools acquisition through a local operational/security wrapper. Recent logs require raw_data/logs.json; source acquisition keeps app/listed-path scope.",
+      "implementation_source": "agents/cloudops_skill_agent/tools/snapshot.py",
+      "implementation_sha256": "9a1178a2e49c2154a7595e219c549edb6870b0896eb0989d53cd5ef38d70f06b",
+      "local_adapter_source": "src/debug_assistant/tools/official_cloudops.py",
+      "local_adapter_sha256": "3ebceb87a8d9ac4147d1ea8a7d196f896af69c51c66ac74335addfea4dc1b929",
+      "derived_sha256": "fec4437aab1d2511de99446e1e5b6a7b1a873ebf3a374ff0a228ccb511a79e74",
+      "runtime_selector": "snapshot_capability_only"
+    },
+    {
+      "id": "DescribeResource",
+      "source": "agents/cloudops_skill_agent/tools/cloudops.py",
+      "source_sha256": "96f0c6bc5c47a52b3d6c270d017d49acd6da33e603712739c7ed96bf9409bffa",
+      "local_mapping": "describe_resource",
+      "disposition": "THIN_ADAPTER",
+      "official_schema_variants": [
+        "DescribeResourceInput"
+      ],
+      "local_arguments": [
+        "resource_type",
+        "namespace",
+        "name"
+      ],
+      "adapter_note": "Official KubernetesTools acquisition through a local operational/security wrapper. Recent logs require raw_data/logs.json; source acquisition keeps app/listed-path scope.",
+      "implementation_source": "agents/cloudops_skill_agent/tools/snapshot.py",
+      "implementation_sha256": "9a1178a2e49c2154a7595e219c549edb6870b0896eb0989d53cd5ef38d70f06b",
+      "local_adapter_source": "src/debug_assistant/tools/official_cloudops.py",
+      "local_adapter_sha256": "3ebceb87a8d9ac4147d1ea8a7d196f896af69c51c66ac74335addfea4dc1b929",
+      "derived_sha256": "c1a5f18d4e7d893632c33904e6512eddfecf40510f11e46f13c1286decc6ef5d",
+      "runtime_selector": "snapshot_capability_only"
+    },
+    {
+      "id": "GetAppYAML",
+      "source": "agents/cloudops_skill_agent/tools/cloudops.py",
+      "source_sha256": "96f0c6bc5c47a52b3d6c270d017d49acd6da33e603712739c7ed96bf9409bffa",
+      "local_mapping": "get_app_yaml",
+      "disposition": "THIN_ADAPTER",
+      "official_schema_variants": [
+        "GetAppYAMLInput"
+      ],
+      "local_arguments": [
+        "app_name"
+      ],
+      "adapter_note": "Official KubernetesTools acquisition through a local operational/security wrapper. Recent logs require raw_data/logs.json; source acquisition keeps app/listed-path scope.",
+      "implementation_source": "agents/cloudops_skill_agent/tools/snapshot.py",
+      "implementation_sha256": "9a1178a2e49c2154a7595e219c549edb6870b0896eb0989d53cd5ef38d70f06b",
+      "local_adapter_source": "src/debug_assistant/tools/official_cloudops.py",
+      "local_adapter_sha256": "3ebceb87a8d9ac4147d1ea8a7d196f896af69c51c66ac74335addfea4dc1b929",
+      "derived_sha256": "078c57f58d09ae860ae99481ae1f82b9c339a41657d7e05f54f893e5f6ce4ce8",
+      "runtime_selector": "snapshot_capability_only"
+    },
+    {
+      "id": "GetRecentLogs",
+      "source": "agents/cloudops_skill_agent/tools/cloudops.py",
+      "source_sha256": "96f0c6bc5c47a52b3d6c270d017d49acd6da33e603712739c7ed96bf9409bffa",
+      "local_mapping": "get_recent_logs",
+      "disposition": "THIN_ADAPTER",
+      "official_schema_variants": [
+        "GetRecentLogsInput"
+      ],
+      "local_arguments": [
+        "namespace",
+        "service_name"
+      ],
+      "adapter_note": "Official KubernetesTools acquisition through a local operational/security wrapper. Recent logs require raw_data/logs.json; source acquisition keeps app/listed-path scope.",
+      "implementation_source": "agents/cloudops_skill_agent/tools/snapshot.py",
+      "implementation_sha256": "9a1178a2e49c2154a7595e219c549edb6870b0896eb0989d53cd5ef38d70f06b",
+      "local_adapter_source": "src/debug_assistant/tools/official_cloudops.py",
+      "local_adapter_sha256": "3ebceb87a8d9ac4147d1ea8a7d196f896af69c51c66ac74335addfea4dc1b929",
+      "derived_sha256": "eccbf447df47bf192082a69669eb7cc4c2eebc4a13fb6976630538eb884e0499",
+      "runtime_selector": "snapshot_capability_only"
+    },
+    {
+      "id": "GetErrorLogs",
+      "source": "agents/cloudops_skill_agent/tools/cloudops.py",
+      "source_sha256": "96f0c6bc5c47a52b3d6c270d017d49acd6da33e603712739c7ed96bf9409bffa",
+      "local_mapping": "get_error_logs",
+      "disposition": "THIN_ADAPTER",
+      "official_schema_variants": [
+        "GetErrorLogsInput"
+      ],
+      "local_arguments": [
+        "namespace",
+        "service_name"
+      ],
+      "adapter_note": "Official KubernetesTools acquisition through a local operational/security wrapper. Recent logs require raw_data/logs.json; source acquisition keeps app/listed-path scope.",
+      "implementation_source": "agents/cloudops_skill_agent/tools/snapshot.py",
+      "implementation_sha256": "9a1178a2e49c2154a7595e219c549edb6870b0896eb0989d53cd5ef38d70f06b",
+      "local_adapter_source": "src/debug_assistant/tools/official_cloudops.py",
+      "local_adapter_sha256": "3ebceb87a8d9ac4147d1ea8a7d196f896af69c51c66ac74335addfea4dc1b929",
+      "derived_sha256": "d7a3452baaa8f8f95a1099787f1456096e06262c7e33dae20dec733c21a6a936",
+      "runtime_selector": "snapshot_capability_only"
+    },
+    {
+      "id": "CheckServiceConnectivity",
+      "source": "agents/cloudops_skill_agent/tools/cloudops.py",
+      "source_sha256": "96f0c6bc5c47a52b3d6c270d017d49acd6da33e603712739c7ed96bf9409bffa",
+      "local_mapping": "check_service_connectivity",
+      "disposition": "THIN_ADAPTER",
+      "official_schema_variants": [
+        "CheckServiceConnectivityInput"
+      ],
+      "local_arguments": [
+        "service_name",
+        "namespace",
+        "port"
+      ],
+      "adapter_note": "Official KubernetesTools acquisition through a local operational/security wrapper. Recent logs require raw_data/logs.json; source acquisition keeps app/listed-path scope.",
+      "implementation_source": "agents/cloudops_skill_agent/tools/snapshot.py",
+      "implementation_sha256": "9a1178a2e49c2154a7595e219c549edb6870b0896eb0989d53cd5ef38d70f06b",
+      "local_adapter_source": "src/debug_assistant/tools/official_cloudops.py",
+      "local_adapter_sha256": "3ebceb87a8d9ac4147d1ea8a7d196f896af69c51c66ac74335addfea4dc1b929",
+      "derived_sha256": "cc6fdf21c59c677506dd7a2f1cc59429a502c6615ead1f65452b7e848fef811c",
+      "runtime_selector": "snapshot_capability_only"
+    },
+    {
+      "id": "GetServiceDependencies",
+      "source": "agents/cloudops_skill_agent/tools/cloudops.py",
+      "source_sha256": "96f0c6bc5c47a52b3d6c270d017d49acd6da33e603712739c7ed96bf9409bffa",
+      "local_mapping": "get_service_dependencies",
+      "disposition": "THIN_ADAPTER",
+      "official_schema_variants": [
+        "GetServiceDependenciesInput"
+      ],
+      "local_arguments": [
+        "service_name"
+      ],
+      "adapter_note": "Official KubernetesTools acquisition through a local operational/security wrapper. Recent logs require raw_data/logs.json; source acquisition keeps app/listed-path scope.",
+      "implementation_source": "agents/cloudops_skill_agent/tools/snapshot.py",
+      "implementation_sha256": "9a1178a2e49c2154a7595e219c549edb6870b0896eb0989d53cd5ef38d70f06b",
+      "local_adapter_source": "src/debug_assistant/tools/official_cloudops.py",
+      "local_adapter_sha256": "3ebceb87a8d9ac4147d1ea8a7d196f896af69c51c66ac74335addfea4dc1b929",
+      "derived_sha256": "a6374940f67bb189a95c154b8a3a25bea15cb44d728fc8c12e7d2ddb17acc409",
+      "runtime_selector": "snapshot_capability_only"
+    },
+    {
+      "id": "GetClusterConfiguration",
+      "source": "agents/cloudops_skill_agent/tools/cloudops.py",
+      "source_sha256": "96f0c6bc5c47a52b3d6c270d017d49acd6da33e603712739c7ed96bf9409bffa",
+      "local_mapping": "get_cluster_configuration",
+      "disposition": "THIN_ADAPTER",
+      "official_schema_variants": [],
+      "local_arguments": [],
+      "adapter_note": "Official KubernetesTools acquisition through a local operational/security wrapper. Recent logs require raw_data/logs.json; source acquisition keeps app/listed-path scope.",
+      "implementation_source": "agents/cloudops_skill_agent/tools/snapshot.py",
+      "implementation_sha256": "9a1178a2e49c2154a7595e219c549edb6870b0896eb0989d53cd5ef38d70f06b",
+      "local_adapter_source": "src/debug_assistant/tools/official_cloudops.py",
+      "local_adapter_sha256": "3ebceb87a8d9ac4147d1ea8a7d196f896af69c51c66ac74335addfea4dc1b929",
+      "derived_sha256": "b66732d835c970eb8214818b8adab1c13b8a0c7b00eb1372d3e7415ba9aeb460",
+      "runtime_selector": "snapshot_capability_only"
+    },
+    {
+      "id": "GetAlerts",
+      "source": "agents/cloudops_skill_agent/tools/cloudops.py",
+      "source_sha256": "96f0c6bc5c47a52b3d6c270d017d49acd6da33e603712739c7ed96bf9409bffa",
+      "local_mapping": "get_alerts",
+      "disposition": "THIN_ADAPTER",
+      "official_schema_variants": [],
+      "local_arguments": [],
+      "adapter_note": "Official KubernetesTools acquisition through a local operational/security wrapper. Recent logs require raw_data/logs.json; source acquisition keeps app/listed-path scope.",
+      "implementation_source": "agents/cloudops_skill_agent/tools/snapshot.py",
+      "implementation_sha256": "9a1178a2e49c2154a7595e219c549edb6870b0896eb0989d53cd5ef38d70f06b",
+      "local_adapter_source": "src/debug_assistant/tools/official_cloudops.py",
+      "local_adapter_sha256": "3ebceb87a8d9ac4147d1ea8a7d196f896af69c51c66ac74335addfea4dc1b929",
+      "derived_sha256": "5e18fc3aca8482509dde240bb11f0b470b169c51e1b962f1f732cd6ff64ff6e0",
+      "runtime_selector": "snapshot_capability_only"
+    },
+    {
+      "id": "CheckNodeServiceStatus",
+      "source": "agents/cloudops_skill_agent/tools/cloudops.py",
+      "source_sha256": "96f0c6bc5c47a52b3d6c270d017d49acd6da33e603712739c7ed96bf9409bffa",
+      "local_mapping": "check_node_service_status",
+      "disposition": "THIN_ADAPTER",
+      "official_schema_variants": [
+        "CheckNodeServiceStatusInput"
+      ],
+      "local_arguments": [
+        "node_name",
+        "service_name"
+      ],
+      "adapter_note": "Official KubernetesTools acquisition through a local operational/security wrapper. Recent logs require raw_data/logs.json; source acquisition keeps app/listed-path scope.",
+      "implementation_source": "agents/cloudops_skill_agent/tools/snapshot.py",
+      "implementation_sha256": "9a1178a2e49c2154a7595e219c549edb6870b0896eb0989d53cd5ef38d70f06b",
+      "local_adapter_source": "src/debug_assistant/tools/official_cloudops.py",
+      "local_adapter_sha256": "3ebceb87a8d9ac4147d1ea8a7d196f896af69c51c66ac74335addfea4dc1b929",
+      "derived_sha256": "9b90fe864a42c8f4b3536de26090acf81a287953439a281debeab2f9477f38b0",
+      "runtime_selector": "snapshot_capability_only"
+    },
+    {
+      "id": "ListCodeFiles",
+      "source": "agents/cloudops_skill_agent/tools/cloudops.py",
+      "source_sha256": "96f0c6bc5c47a52b3d6c270d017d49acd6da33e603712739c7ed96bf9409bffa",
+      "local_mapping": "list_code_files",
+      "disposition": "THIN_ADAPTER",
+      "official_schema_variants": [
+        "ListCodeFilesInput"
+      ],
+      "local_arguments": [
+        "app_name"
+      ],
+      "adapter_note": "Official KubernetesTools acquisition through a local operational/security wrapper. Recent logs require raw_data/logs.json; source acquisition keeps app/listed-path scope.",
+      "implementation_source": "agents/cloudops_skill_agent/tools/snapshot.py",
+      "implementation_sha256": "9a1178a2e49c2154a7595e219c549edb6870b0896eb0989d53cd5ef38d70f06b",
+      "local_adapter_source": "src/debug_assistant/tools/official_cloudops.py",
+      "local_adapter_sha256": "3ebceb87a8d9ac4147d1ea8a7d196f896af69c51c66ac74335addfea4dc1b929",
+      "derived_sha256": "9c1aeace28e52fa3e125226eea63a96384edb53b5c1e418c2a94dbf218197595",
+      "runtime_selector": "snapshot_capability_only"
+    },
+    {
+      "id": "GetSourceCode",
+      "source": "agents/cloudops_skill_agent/tools/cloudops.py",
+      "source_sha256": "96f0c6bc5c47a52b3d6c270d017d49acd6da33e603712739c7ed96bf9409bffa",
+      "local_mapping": "get_source_code",
+      "disposition": "THIN_ADAPTER",
+      "official_schema_variants": [
+        "GetSourceCodeInput"
+      ],
+      "local_arguments": [
+        "app_name",
+        "file_path",
+        "start_line",
+        "line_count"
+      ],
+      "adapter_note": "Official KubernetesTools acquisition through a local operational/security wrapper. Recent logs require raw_data/logs.json; source acquisition keeps app/listed-path scope.",
+      "implementation_source": "agents/cloudops_skill_agent/tools/snapshot.py",
+      "implementation_sha256": "9a1178a2e49c2154a7595e219c549edb6870b0896eb0989d53cd5ef38d70f06b",
+      "local_adapter_source": "src/debug_assistant/tools/official_cloudops.py",
+      "local_adapter_sha256": "3ebceb87a8d9ac4147d1ea8a7d196f896af69c51c66ac74335addfea4dc1b929",
+      "derived_sha256": "e0efef84019ce598aa4d32aba14c9f15995e2e8c20876e3df0174200901c0b15",
+      "runtime_selector": "snapshot_capability_only"
+    }
+  ],
+  "official_skill_assets": [
+    {
+      "id": "application_request_or_response_failure",
+      "path": "agents/cloudops_skill_agent/harness/skills/boutique/application_request_or_response_failure.yaml",
+      "source_sha256": "d4305c5871f2aed3bbfeae57d891d6e3cd7e74523a2549a22ffae6964295fb22",
+      "derived_sha256": "ecece63a941f2b188ecad21d5adad640e9553dbf7b60a2b47bce98aececdd973",
+      "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+      "node_count": 5,
+      "nodes": [
+        {
+          "id": "locate_request_failure_owner",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "de5a2cd2788a78914c98b94fdc5db5ffd126fdcfa021535f4146f083b3aaad7e",
+          "derived_sha256": "3da565d8375186604ec8a47910e5d5fae1b7737889983ae5be35ea5bd64b30e3",
+          "official_tools": [
+            "GetErrorLogs",
+            "GetRecentLogs",
+            "GetServiceDependencies"
+          ]
+        },
+        {
+          "id": "triage_request_source",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "7fcde21f64e185158bd94ef0c7a340c2fe1ac73930f97cc2b9f6d8151260c556",
+          "derived_sha256": "49581013f19d7bada131562009e5c54a54fd0e44df4f7c3ca6d45d3eb6fc8ab9",
+          "official_tools": [
+            "ListCodeFiles",
+            "GetSourceCode"
+          ]
+        },
+        {
+          "id": "confirm_missing_parameter_code",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "8bbf4a78fa7790ec0ca23ed33067309f08340c1a563522f912ee085f6b75f02e",
+          "derived_sha256": "3ca673257746d6c2160b3a7ce823d98def2dc036fa1fa006335ab0d41af60c80",
+          "official_tools": [
+            "ListCodeFiles",
+            "GetSourceCode"
+          ]
+        },
+        {
+          "id": "confirm_wrong_argument_order_code",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "d59e56805d7bc6562ae643b77ac07b04296598821403517a039b2684049cc55d",
+          "derived_sha256": "68e819cb36ae0c68a34226acb35229a7e90d3cd1689ada421962bf3805f65164",
+          "official_tools": [
+            "GetSourceCode"
+          ]
+        },
+        {
+          "id": "confirm_wrong_return_code",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "4a1a16f96fb19867054533d2661260f818e400cea865a126a72de04dcaf357a7",
+          "derived_sha256": "8c4f283f869f4428c2af26f96b5c99733ebdcba62cec912fc45180e05ca51422",
+          "official_tools": [
+            "ListCodeFiles",
+            "GetSourceCode"
+          ]
+        }
+      ],
+      "registry_projection": {
+        "objective": "An application request reaches a service but returns an HTTP, RPC, or business-level error while basic service connectivity remains available.",
+        "allowed_tools": [
+          "get_error_logs",
+          "get_service_dependencies",
+          "list_code_files",
+          "read_file_when_source_workspace_is_bound"
+        ],
+        "expected_evidence": [
+          "symptom_service",
+          "affected_operation",
+          "error_pattern",
+          "request_failure_type",
+          "current_service_role",
+          "upstream_callers",
+          "downstream_callee",
+          "code_owner_candidate",
+          "connectivity_available",
+          "source_file_list",
+          "primary_source_file",
+          "request_construction_site",
+          "missing_parameter_candidate",
+          "wrong_argument_order_candidate",
+          "wrong_return_candidate",
+          "no_supported_request_code_defect",
+          "source_code_evidence",
+          "required_parameter",
+          "parameter_cleared_or_omitted",
+          "code_missing_parameter_confirmed",
+          "request_or_call_site",
+          "swapped_arguments",
+          "code_wrong_argument_order_confirmed",
+          "valid_inputs_reach_return_path",
+          "incorrect_return_statement_or_response",
+          "code_wrong_return_confirmed"
+        ],
+        "completion_rule": {
+          "owner": "runtime",
+          "rule": "current incident EvidenceSet satisfies the active VerificationObligation",
+          "skill_text_can_close_obligation": false
+        }
+      }
+    },
+    {
+      "id": "image_pull_startup_failure",
+      "path": "agents/cloudops_skill_agent/harness/skills/boutique/image_pull_startup_failure.yaml",
+      "source_sha256": "3471cf7b0a157ee51484dc63e7113350c436ae564599c1d8af7b65844a15799f",
+      "derived_sha256": "df631c5c5180f02f6586c269a3ee9318c06a905930566445b0fc3c3082abb57e",
+      "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+      "node_count": 5,
+      "nodes": [
+        {
+          "id": "locate_failing_startup_pod",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "382a38087ae5b3116b9af36e7e02b4d415cbe2996217eb2d8f5bdf0bcba886ad",
+          "derived_sha256": "8f9d859119a2ab45fe4aef76ce99506dad9b2ea65ed36efba64a056d5c394aaf",
+          "official_tools": [
+            "GetResources"
+          ]
+        },
+        {
+          "id": "classify_image_pull_failure",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "5f1e2b742d50045ed3c157e60f762e57a0ccc23ffa1b81af974a685bae1a4aa1",
+          "derived_sha256": "290d084acd726376135836fa072485f257391e59c0ce9ccb54d358aa768047a3",
+          "official_tools": [
+            "DescribeResource"
+          ]
+        },
+        {
+          "id": "confirm_registry_dns_failure",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "cebe31566e83a0f2170159655133aa1e3f4f0666b89a39ea9817da0c1dacbe50",
+          "derived_sha256": "a0fe2215a2b8e976ba0c0c5b47ca3a904219b5dc888f7f7c94580e4d6dc92081",
+          "official_tools": [
+            "GetAppYAML",
+            "GetAppYAML"
+          ]
+        },
+        {
+          "id": "confirm_incorrect_image_reference",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "371dee52bbcf7d2c3ad33931957614daad3d714b15ee7cf8cb6a358f6cbd3fdc",
+          "derived_sha256": "adbbad40be92ea4e10a065fbdd59dd8647632504f60d1e2f363bc5b475859d03",
+          "official_tools": [
+            "GetAppYAML"
+          ]
+        },
+        {
+          "id": "confirm_missing_image_pull_secret",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "17c53b111d8c005e21506b461f2dca2b0d21255fd6adc09f52776e5f9bcc429b",
+          "derived_sha256": "fefbc1e02b5963a1640ae696aa099416f9510bdc88cd5ac0c3f3e1669493fdbf",
+          "official_tools": [
+            "GetAppYAML"
+          ]
+        }
+      ],
+      "registry_projection": {
+        "objective": "A pod cannot start because its container image cannot be pulled, appearing as ErrImagePull or ImagePullBackOff.",
+        "allowed_tools": [
+          "get_resources",
+          "describe_resource",
+          "get_app_yaml"
+        ],
+        "expected_evidence": [
+          "active_alerts_status",
+          "pod_health_status",
+          "pod_status_summary",
+          "failing_pod_identified",
+          "image_pull_error_message",
+          "pull_failure_reason",
+          "failing_service_image_registry",
+          "healthy_service_image_registry",
+          "registry_isolation_confirmed",
+          "no_image_pull_secret_issue",
+          "deployment_image_tag",
+          "healthy_service_tag",
+          "image_pull_secrets_status",
+          "incorrect_image_reference_confirmed",
+          "deployment_yaml",
+          "image_pull_secrets_presence",
+          "image_reference",
+          "missing_image_pull_secret_indicator",
+          "image_registry_requirement"
+        ],
+        "completion_rule": {
+          "owner": "runtime",
+          "rule": "current incident EvidenceSet satisfies the active VerificationObligation",
+          "skill_text_can_close_obligation": false
+        }
+      }
+    },
+    {
+      "id": "kubernetes_object_creation_failure",
+      "path": "agents/cloudops_skill_agent/harness/skills/boutique/kubernetes_object_creation_failure.yaml",
+      "source_sha256": "3b8ec1d5863329c91c738601c6d9af93cfeebddb0923caaad50ba6097e20f9c8",
+      "derived_sha256": "0772990ab2833e4b0cee8250c9aa4322fd2b9aa80c15e18d6be3138df6209465",
+      "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+      "node_count": 6,
+      "nodes": [
+        {
+          "id": "locate_creation_failure_scope",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "a76b29dfcedf6225d527d834064bfb67e74177ff4e8d48a03adfcedce8f83920",
+          "derived_sha256": "0bcca8b7aca5bcffcc2f7237396e6935223d7c74855761bff2c98c0624bb8655",
+          "official_tools": [
+            "GetResources",
+            "GetResources",
+            "GetResources"
+          ]
+        },
+        {
+          "id": "classify_pod_creation_admission_failure",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "ff1d55f2555cf59f810221163fdba37cfd1ee4ec875cabb40f255be5e3e09abf",
+          "derived_sha256": "fd537e211fe09eedf61687464c77b39bde2a3e20affe89295879c2b1d04e1a76",
+          "official_tools": [
+            "DescribeResource"
+          ]
+        },
+        {
+          "id": "confirm_missing_service_account",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "d70820cb70ad56bda8484aa963a17d698e76c7c45c2685ae2f79bb68446fc116",
+          "derived_sha256": "5c335694f57121bfb9aa296adc3118b4f529fab6d0f697d658d4637f9641276e",
+          "official_tools": [
+            "GetResources"
+          ]
+        },
+        {
+          "id": "confirm_namespace_pod_resource_quota",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "b78f32d4dbf36a796025b936cf589d0aa74a45efdeb0ae101ae89b8a8b834904",
+          "derived_sha256": "a5fda770f925ab4de0ffe51532c9f0c20c6518d03f7714d49b260f244047e9ae",
+          "official_tools": [
+            "GetResources"
+          ]
+        },
+        {
+          "id": "locate_unreachable_downstream_service",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "1a9911bbe1da2cbc41704fd86093e5db0b1dd3af870c85b9538ac85d2244b366",
+          "derived_sha256": "866db650bea08d0f22b5f4ec7b00afb97229ed67ee95b72bed999043d2a82969",
+          "official_tools": [
+            "GetServiceDependencies",
+            "CheckServiceConnectivity",
+            "CheckServiceConnectivity",
+            "CheckServiceConnectivity"
+          ]
+        },
+        {
+          "id": "confirm_namespace_service_quota",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "a8db99d0a04fce0fa4ccaa9195f6f5fd4332cc9458f1729aaf7dfe59b9e4f950",
+          "derived_sha256": "3e2910bda1948efb7d49810812370dedcca97a2963dcf899b1c4a094295b6c71",
+          "official_tools": [
+            "DescribeResource",
+            "GetAppYAML",
+            "GetResources"
+          ]
+        }
+      ],
+      "registry_projection": {
+        "objective": "An expected Kubernetes Pod, workload instance, or Service object is not created or has no ready instance.",
+        "allowed_tools": [
+          "get_resources",
+          "describe_resource",
+          "get_service_dependencies",
+          "check_service_connectivity",
+          "get_app_yaml"
+        ],
+        "expected_evidence": [
+          "affected_workload",
+          "affected_deployment",
+          "pod_existence_status",
+          "deployment_readiness",
+          "pod_creation_failure_indicator",
+          "service_inventory",
+          "missing_service_name",
+          "missing_service_object_confirmed",
+          "empty_endpoints_due_to_absent_backends",
+          "admission_creation_suspected",
+          "deployment_conditions",
+          "deployment_condition_failure",
+          "deployment_replica_status",
+          "associated_replicaset_name",
+          "replicaset_reference",
+          "replicaset_creation_errors",
+          "admission_failure_reason",
+          "admission_error_message",
+          "service_account_name",
+          "suspected_missing_service_account",
+          "quota_exceeded_event",
+          "quota_type_exceeded",
+          "pod_quota_limit_reached",
+          "creation_failure_reason",
+          "service_account_reference",
+          "existing_service_accounts",
+          "missing_service_account_confirmed",
+          "competing_quota_evidence",
+          "root_cause_confirmation",
+          "namespace_quota_status",
+          "quota_resource_type",
+          "quota_used_value",
+          "quota_hard_limit",
+          "quota_exceeded_evidence",
+          "cpu_quota_exhausted",
+          "memory_request_quota_match",
+          "pod_quota_exhausted_confirmed",
+          "pod_memory_request",
+          "quota_limit_match",
+          "unreachable_service_name",
+          "connectivity_status",
+          "suspicious_admission_signal",
+          "namespace_service_quota_exceeded"
+        ],
+        "completion_rule": {
+          "owner": "runtime",
+          "rule": "current incident EvidenceSet satisfies the active VerificationObligation",
+          "skill_text_can_close_obligation": false
+        }
+      }
+    },
+    {
+      "id": "node_network_degradation",
+      "path": "agents/cloudops_skill_agent/harness/skills/boutique/node_network_degradation.yaml",
+      "source_sha256": "c3b9335297a93a144062e27b9827ed231e5f81cd2690eacfb4e10c771993c6f9",
+      "derived_sha256": "b40b99646f15c8d75c83af62be486606dbaa6fd4add05f93bc1ad933e5b780fc",
+      "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+      "node_count": 6,
+      "nodes": [
+        {
+          "id": "locate_node_network_scope",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "666cabab08901228b98eb0bddecc7d2b1ba62872336165eb1d04dd66fdee91e0",
+          "derived_sha256": "9344dab6654757f150745c6e4cca9f02d0708dd5ab2ee30a3641fb6b6f05e348",
+          "official_tools": [
+            "GetAlerts",
+            "GetResources",
+            "GetClusterConfiguration"
+          ]
+        },
+        {
+          "id": "localize_degraded_node",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "078daa5c368d1f72c5cbba81e4520db007ac134b7904500814cdcf72cdb44086",
+          "derived_sha256": "e62debec79846326dded826a7e4c48e4566b42ac0246c4c83d5f44161e889439",
+          "official_tools": [
+            "GetClusterConfiguration",
+            "GetResources",
+            "CheckServiceConnectivity"
+          ]
+        },
+        {
+          "id": "inspect_node_network_components",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "242aae9fb20383abc4f7e6acfdca6780ed3f4cffa6dc1502b1367555a3024057",
+          "derived_sha256": "024126c4938410df5e2d3b6d97e14d071875885bbce4d153a0082366e9cdeab6",
+          "official_tools": [
+            "CheckNodeServiceStatus",
+            "CheckNodeServiceStatus"
+          ]
+        },
+        {
+          "id": "confirm_kube_proxy_unavailable",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "dbb86edc98466c342823b3a5e64aefa60d7229867f2af4b57183b931b013c5c6",
+          "derived_sha256": "1792b9642c962a0933d44546d74b22b99d983f2d67a0dc5e6087f453bcf8a19f",
+          "official_tools": []
+        },
+        {
+          "id": "confirm_node_network_delay_from_node_status",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "3269cd10567b92b008a4cef512098a9c9027348baff23fdc8ae1063f6c9d16a3",
+          "derived_sha256": "bc04c1a5131d3a21730cf5c94550f8f8dfd57937a73554849be40c5a1ddcdb0d",
+          "official_tools": [
+            "GetAlerts",
+            "DescribeResource"
+          ]
+        },
+        {
+          "id": "inspect_service_logs_for_network_packet_loss",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "451aaab92eacfb1b7d2c51806c70dc1c8ced7b20c71c0e5722beb4591ce5e95f",
+          "derived_sha256": "7d6da7f973433274b305836a1982904ee3cc9f602705289f857a4e79e25fd603",
+          "official_tools": [
+            "GetAlerts",
+            "GetErrorLogs"
+          ]
+        }
+      ],
+      "registry_projection": {
+        "objective": "Network performance or reachability degrades in a node-correlated pattern, such as increased latency or differences between nodes.",
+        "allowed_tools": [
+          "get_alerts",
+          "get_resources",
+          "get_cluster_configuration",
+          "check_service_connectivity",
+          "check_node_service_status",
+          "describe_resource",
+          "get_error_logs"
+        ],
+        "expected_evidence": [
+          "performance_alert_summary",
+          "anomalous_node",
+          "affected_services",
+          "pod_node_mapping",
+          "node_health_status",
+          "node_network_evidence",
+          "node_taints",
+          "affected_services_on_node",
+          "node_connectivity_results",
+          "suspect_node",
+          "cross_node_difference",
+          "ordinary_node_failure",
+          "node_network_degradation_supported",
+          "kube_proxy_status",
+          "containerd_status",
+          "node_network_component_status",
+          "kube_proxy_unavailable_supported",
+          "components_healthy_for_network_attribution",
+          "failing_node",
+          "kube_proxy_unavailable_confirmed",
+          "node_correlated_latency_degradation",
+          "no_high_magnitude_tcp_retransmission_on_suspect_node",
+          "node_network_components_healthy",
+          "node_network_delay_supported",
+          "high_magnitude_tcp_retransmission",
+          "retransmission_node_matches_suspect_node",
+          "affected_services_on_suspect_node",
+          "packet_loss_supporting_timeouts",
+          "node_network_packet_loss_supported"
+        ],
+        "completion_rule": {
+          "owner": "runtime",
+          "rule": "current incident EvidenceSet satisfies the active VerificationObligation",
+          "skill_text_can_close_obligation": false
+        }
+      }
+    },
+    {
+      "id": "oom_or_memory_exhaustion",
+      "path": "agents/cloudops_skill_agent/harness/skills/boutique/oom_or_memory_exhaustion.yaml",
+      "source_sha256": "78ab9c39e2da7b209977f3426a1e7064b1da6bf4edcdccff458f339d1f5543ea",
+      "derived_sha256": "f3c0b4d4c782ba98da9e7e409b7a30ed7a2c36dda1e9d3f87d9d81ef90890c6b",
+      "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+      "node_count": 6,
+      "nodes": [
+        {
+          "id": "locate_oom_affected_workload",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "158a7c4befaf73c08eaaa8b9496f73ff2d556389ef144d681ce8df7b0cfe8198",
+          "derived_sha256": "5f77441474bf17f08ad4286c636e7629ccfe76d057294db3775570a4a0864f62",
+          "official_tools": [
+            "GetResources"
+          ]
+        },
+        {
+          "id": "inspect_memory_exhaustion_mechanism",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "da2906e994045f2d65e9eba6796dff10f4ea7df0e1174d3102f7ded279b74781",
+          "derived_sha256": "14bfecc44acaec6c8d31e2e832be6826404763b13b6ee34443fd9fd72df4b77b",
+          "official_tools": [
+            "DescribeResource"
+          ]
+        },
+        {
+          "id": "evaluate_oom_resource_configuration",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "7537c737ede41452ea9d0eb6a79fccbd7fe6bca41b446b75c71040611bbd6793",
+          "derived_sha256": "74ef4bfd374dd80f3a80a03c98e6d6487b3f6cf87b898dc974573dc6c045603c",
+          "official_tools": [
+            "GetAppYAML"
+          ]
+        },
+        {
+          "id": "confirm_oom_limit_misconfiguration",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "dd3c7b47b27567eec1254b1ab743fa435732ed6b6c36d90f2058cddb6ad0b6f1",
+          "derived_sha256": "f11a8703cd0052989ba99d542bba4457122691cef35fe4df402b26ff213f799c",
+          "official_tools": []
+        },
+        {
+          "id": "confirm_memory_leak_code",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "17e67abc84d14e24dec930bf848b0e8efa4d03e47999b387acb33c0ab9a104a7",
+          "derived_sha256": "79f0aa4775d6efc33b988ffcd3e41a288d23ec0f2682fef3e192f255a728b634",
+          "official_tools": [
+            "ListCodeFiles",
+            "GetSourceCode"
+          ]
+        },
+        {
+          "id": "confirm_excessive_file_reads_code",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "8e3241a179a3f0e3cca50ac48cbc5c115220fbf412e84d20ea423ed52e93460b",
+          "derived_sha256": "12c65f90288910c07dada0f25454c798dcb4e272f90f6ef1ed2a1a06e8ee8688",
+          "official_tools": [
+            "ListCodeFiles",
+            "GetSourceCode"
+          ]
+        }
+      ],
+      "registry_projection": {
+        "objective": "A container terminates or restarts with observable out-of-memory evidence such as OOMKilled or exit code 137.",
+        "allowed_tools": [
+          "get_resources",
+          "describe_resource",
+          "get_app_yaml",
+          "list_code_files",
+          "read_file_when_source_workspace_is_bound"
+        ],
+        "expected_evidence": [
+          "failing_pod_identified",
+          "failing_pod_name",
+          "affected_workload",
+          "failing_service",
+          "symptom_service",
+          "pod_status_summary",
+          "pod_restart_counts",
+          "container_termination_reason",
+          "container_exit_code",
+          "pod_events",
+          "container_state",
+          "container_memory_limit",
+          "oom_kill_event",
+          "memory_exhaustion_mechanism",
+          "resource_configuration_check_needed",
+          "deployment_resource_limits",
+          "deployment_memory_limit",
+          "memory_limit_value",
+          "configuration_validity",
+          "resource_limit_independently_anomalous",
+          "resource_configuration_not_explanatory",
+          "root_cause_confirmation",
+          "deployment_memory_limit_insufficient",
+          "source_file_content",
+          "memory_allocation_pattern",
+          "source_code_evidence",
+          "repeated_or_unbounded_file_read_path",
+          "memory_growth_from_file_reads",
+          "code_excessive_file_reads_confirmed"
+        ],
+        "completion_rule": {
+          "owner": "runtime",
+          "rule": "current incident EvidenceSet satisfies the active VerificationObligation",
+          "skill_text_can_close_obligation": false
+        }
+      }
+    },
+    {
+      "id": "pending_or_unschedulable_pod",
+      "path": "agents/cloudops_skill_agent/harness/skills/boutique/pending_or_unschedulable_pod.yaml",
+      "source_sha256": "18a5809994f6272d42d6f0f8fafd6696332ce9b91e85166a4dd3283b0cfe24be",
+      "derived_sha256": "0f62550328bf3d536e1e0b7334db190dfe00cc67deb7de994576be5deed85452",
+      "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+      "node_count": 14,
+      "nodes": [
+        {
+          "id": "locate_pending_workload_context",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "8e5da77945220c75b65f946a1b85764a80aba4d9ba5d1a656d579c87c717463d",
+          "derived_sha256": "08df6da25771b743a7e4d218a52d61707c5ecca8e0ece4b59810b9307ef90953",
+          "official_tools": [
+            "GetResources"
+          ]
+        },
+        {
+          "id": "classify_pending_blocker",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "2f5a7b265a3770adc986f2d28ef477f1b56ef5bc8232c8baf7a49e638a3d27e0",
+          "derived_sha256": "703a9cbbb3d56f24a3a92c31c213b5ecf588f2e5267d76e4823e11d3b10b3036",
+          "official_tools": [
+            "DescribeResource"
+          ]
+        },
+        {
+          "id": "confirm_pod_resource_capacity_mismatch",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "032559ed05b26ac4d639440c8c5766afbc63fb0b2fdee7078ef5d2792c1d9ab4",
+          "derived_sha256": "d159592a86e137c50ca489d0fd9f5b18a6b951b9b47e8d59e241928c2eca51eb",
+          "official_tools": [
+            "GetAppYAML",
+            "GetClusterConfiguration"
+          ]
+        },
+        {
+          "id": "inspect_node_placement_constraints",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "ece311b2f1cb3507881d1fcf937f30171bc316cf205def41eb06157f07a4f99a",
+          "derived_sha256": "e5814e15f3cb6f2a155fcae282fa66f84c7bf1756481fe8a2f7e5b7f53007971",
+          "official_tools": [
+            "GetAppYAML",
+            "GetClusterConfiguration"
+          ]
+        },
+        {
+          "id": "confirm_node_selector_mismatch",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "0a563fa64654f7bf7361e0d51792b317b5a6cb09c53976aba91ebae2391e3601",
+          "derived_sha256": "f149cfa225bf244eead267272dd9f7f12616a88622ba3fd410c712f523aaeb1a",
+          "official_tools": [
+            "GetAppYAML",
+            "GetClusterConfiguration"
+          ]
+        },
+        {
+          "id": "confirm_node_affinity_mismatch",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "b4c38603b7f4f3fb5942fcf4fe5aa27c12456899a116049aa9536c6bbadb2827",
+          "derived_sha256": "d762d517cf605faab7c3e00cff3a7a5c0d3b751edd939a83a7a0c8a86cf67406",
+          "official_tools": [
+            "GetAppYAML",
+            "GetClusterConfiguration"
+          ]
+        },
+        {
+          "id": "confirm_node_cordon_status",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "79293242f56df4baa38199001306a19f0e2ebd2bcdc50bd76d74796199b9c07c",
+          "derived_sha256": "9584999c63341e396c0ed9621ef6e607f9735c0d668a0848f1cf60a9f7f8b112",
+          "official_tools": [
+            "GetClusterConfiguration"
+          ]
+        },
+        {
+          "id": "inspect_pod_anti_affinity_rule",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "c7dd50aee0122af275413ca611d52608478c5dcac366fc9f1b9d0ae299a20d3e",
+          "derived_sha256": "8f7a14a05e6c0128909e12a1a9c7f77e60c9a06bc5f4e47e0f6403b38f28211f",
+          "official_tools": [
+            "GetAppYAML",
+            "GetResources",
+            "GetClusterConfiguration"
+          ]
+        },
+        {
+          "id": "confirm_pod_anti_affinity_capacity",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "f25bfcf1e9a8a658f59bb65b4fd75a04d3e4055ee90e8242ef56c4a79b1b2279",
+          "derived_sha256": "3e27be3074f3c57745643aa65ff412648ed8758f3beabc973e41ed42d575c33c",
+          "official_tools": [
+            "GetResources",
+            "GetClusterConfiguration"
+          ]
+        },
+        {
+          "id": "confirm_taint_toleration_mismatch",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "443591e53d66fa6da58c32d6d582c4fd12e750376842d5cd36479381078f8d0a",
+          "derived_sha256": "f6e7dfbc2f1734dbe74a0cb64daf89b163b90be66a593cc9889a10ac24a6a929",
+          "official_tools": [
+            "GetClusterConfiguration",
+            "GetAppYAML"
+          ]
+        },
+        {
+          "id": "inspect_node_component_health",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "565563b203d8c699ae1e4defbb25b9e99f801d53229a7eb33ce738ab877cf375",
+          "derived_sha256": "ec6276d2d5bc5b4bf527f9757316c8052a755523f1325cc3f24802f43024658b",
+          "official_tools": [
+            "CheckNodeServiceStatus",
+            "CheckNodeServiceStatus"
+          ]
+        },
+        {
+          "id": "confirm_container_runtime_unavailable",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "5c47f320e1453e7127b6d53a5e62ac6e9c5a3c1bb870f876f2552174c84dc170",
+          "derived_sha256": "ade581dae6455509371aaf8100fdc77534bb6228d18879da78c8186f8b1e495f",
+          "official_tools": []
+        },
+        {
+          "id": "confirm_scheduler_availability",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "27dc2cae650aa1a7cf2c08164c00575f9d41002bafad87e8b9050ba020b59d36",
+          "derived_sha256": "63fc4456402cccb81e10e376143515347b45fa25b16503ba8067e0084c006514",
+          "official_tools": [
+            "CheckNodeServiceStatus"
+          ]
+        },
+        {
+          "id": "confirm_kubelet_unavailable",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "dc8c78d7ab27b8983f75aa5afc897f4bcb298456fba06164381981170236abd6",
+          "derived_sha256": "68875c5979938c8836587c75c57cab3bf16afd0aa290af2363c822e30c3c6557",
+          "official_tools": []
+        }
+      ],
+      "registry_projection": {
+        "objective": "A pod remains Pending, Unschedulable, Init, ContainerCreating, or otherwise stalled before normal startup.",
+        "allowed_tools": [
+          "get_resources",
+          "describe_resource",
+          "get_app_yaml",
+          "get_cluster_configuration",
+          "check_node_service_status"
+        ],
+        "expected_evidence": [
+          "pending_pod_identified",
+          "pending_pod_name",
+          "affected_workload",
+          "failing_service",
+          "pod_status_summary",
+          "pod_node_assignment",
+          "node_status_summary",
+          "active_alerts_summary",
+          "pod_events",
+          "pod_event_error_message",
+          "scheduler_failure_reason",
+          "node_name",
+          "pod_resource_requests",
+          "pod_node_selector",
+          "pod_tolerations",
+          "insufficient_cpu_event",
+          "insufficient_memory_event",
+          "node_affinity_mismatch_indicated",
+          "pod_anti_affinity_conflict_suspected",
+          "untolerated_taint_event",
+          "unschedulable_nodes_event",
+          "unbound_pvc_identified",
+          "container_runtime_failure_suspected",
+          "scheduler_unavailability_suspected",
+          "node_level_failure_suspected",
+          "pod_cpu_request",
+          "pod_memory_request",
+          "otherwise_eligible_nodes",
+          "eligible_node_allocatable_resources",
+          "cpu_capacity_mismatch_confirmed",
+          "memory_capacity_mismatch_confirmed",
+          "workload_node_selector",
+          "workload_required_node_affinity",
+          "workload_tolerations",
+          "node_labels",
+          "node_taints",
+          "node_spec_unschedulable",
+          "selector_matching_nodes",
+          "affinity_matching_nodes",
+          "matching_node_blocker",
+          "node_selector_mismatch_confirmed",
+          "required_node_affinity",
+          "node_affinity_mismatch_confirmed",
+          "placement_matching_nodes",
+          "unschedulable_taint_present",
+          "node_cordon_confirmed",
+          "required_pod_anti_affinity",
+          "anti_affinity_label_selector",
+          "topology_key",
+          "desired_replicas",
+          "matching_pod_distribution",
+          "schedulable_topology_domains",
+          "occupied_topology_domains",
+          "pending_replica_without_valid_domain",
+          "pod_anti_affinity_conflict_confirmed",
+          "placement_matching_node",
+          "non_cordon_node_taint",
+          "taint_toleration_mismatch_confirmed",
+          "containerd_health_status",
+          "kubelet_health_status",
+          "node_readiness_status",
+          "runtime_log_errors",
+          "containerd_unavailable_supported",
+          "kubelet_unavailable_supported",
+          "root_cause_confirmation",
+          "container_runtime_status",
+          "scheduler_service_status",
+          "root_cause_confirmed",
+          "kubelet_service_status"
+        ],
+        "completion_rule": {
+          "owner": "runtime",
+          "rule": "current incident EvidenceSet satisfies the active VerificationObligation",
+          "skill_text_can_close_obligation": false
+        }
+      }
+    },
+    {
+      "id": "pending_pod_storage_dependency",
+      "path": "agents/cloudops_skill_agent/harness/skills/boutique/pending_pod_storage_dependency.yaml",
+      "source_sha256": "9128d829283e325edf0618bf12a2ce778bb19dbd4db11c0a9a1e2e328f4641f4",
+      "derived_sha256": "3e5fbeeb4d37802651cfd675c07e30420f73b291cc18b766311e4d38f134dc70",
+      "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+      "node_count": 9,
+      "nodes": [
+        {
+          "id": "locate_pending_storage_workload",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "d3f636004adfc479e8e3b46c8896bb8434b0514e494266d8359d3ef14f8fe2c3",
+          "derived_sha256": "697496058bf2ba1a80920ef2b9bedd02b029492ab2345234aba51dbf1a37c705",
+          "official_tools": [
+            "GetResources"
+          ]
+        },
+        {
+          "id": "classify_pod_pvc_dependency",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "3284c77143cab760b8cb1bf0268bf7aebefd124f2e856361f021fb8f9514c9ea",
+          "derived_sha256": "cc4d7d500b2685bb62cdd0fc81a36f8c46e670912944024ae2d592d7ed2d819f",
+          "official_tools": [
+            "DescribeResource",
+            "GetResources"
+          ]
+        },
+        {
+          "id": "classify_pvc_pv_compatibility",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "1b10d9485a44e4e904671ce2bcefbcdde38c47375070de882f0a357970f42a34",
+          "derived_sha256": "db0ca14002a6a874783f084054286fd877b5e4ab167db717ab355bf48aece634",
+          "official_tools": [
+            "DescribeResource",
+            "GetResources"
+          ]
+        },
+        {
+          "id": "confirm_pv_binding_occupied",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "106bc5ee62660d86936feb7bc019068895d25eca574129c8b05711bb7d2e9cce",
+          "derived_sha256": "7f0cda115c841b9357c9327d05d528d605b54368829e104163be8dc96bcf891c",
+          "official_tools": [
+            "GetResources",
+            "DescribeResource"
+          ]
+        },
+        {
+          "id": "confirm_pvc_access_mode_mismatch",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "833497741367e02bf6c9e8e5b077c2e1d60297c389725078bd6345d7b37a8ef1",
+          "derived_sha256": "672e9bd0fcdc87463ee76073ed0e0d05a79b2fbe4720602891a37be5c713f47f",
+          "official_tools": [
+            "GetResources",
+            "GetAppYAML",
+            "GetResources"
+          ]
+        },
+        {
+          "id": "confirm_pvc_capacity_mismatch",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "8d663bec861bad0095277ad0b84aba20ad7ddf964613f96df67fa641aeb06aa2",
+          "derived_sha256": "99e585a0357ed24219c8d123ce925557fb9608a074d01f6c939ecb65bb7ea957",
+          "official_tools": [
+            "GetAppYAML"
+          ]
+        },
+        {
+          "id": "confirm_pvc_selector_mismatch",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "f9612de59e7946411ee002cf2bb890a670a192f897bbf7251f907ff045d53ee4",
+          "derived_sha256": "18b81b74233686c4c2a77fced065ea4425b6bfd6a98243cf7828d70042d2b1a8",
+          "official_tools": [
+            "GetAppYAML"
+          ]
+        },
+        {
+          "id": "confirm_pvc_storage_class_mismatch",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "61bfabdaef821849cc3c1c5fba107f47a303c7ada3c1658631e94ef96e81bddc",
+          "derived_sha256": "8fc7f43aa498a51e6331767e26d6d3908b9982480387219eba30c607f0820f90",
+          "official_tools": [
+            "DescribeResource",
+            "GetResources",
+            "GetResources"
+          ]
+        },
+        {
+          "id": "confirm_namespace_storage_quota",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "aa0d8a60a4500e5791f7b8ba7b99f6c40f79ba78b37677bb6d4e5e10aee69dc7",
+          "derived_sha256": "d14d01516f6e769fc9cc12a249eb47ef11c504877cbe60b7105b0ae376dcf069",
+          "official_tools": [
+            "GetResources",
+            "DescribeResource"
+          ]
+        }
+      ],
+      "registry_projection": {
+        "objective": "A Pending pod reports that a PVC or another persistent-storage dependency is unresolved.",
+        "allowed_tools": [
+          "get_resources",
+          "describe_resource",
+          "get_app_yaml"
+        ],
+        "expected_evidence": [
+          "pending_pod_identified",
+          "pending_pod_name",
+          "affected_workload",
+          "failing_service",
+          "pod_status_summary",
+          "active_alerts_summary",
+          "node_status_summary",
+          "pod_events",
+          "pod_pending_cause",
+          "referenced_pvc_name",
+          "pvc_object_exists",
+          "pvc_object_missing",
+          "pvc_status",
+          "pending_pvc_identified",
+          "storage_request",
+          "missing_pvc_reason",
+          "storage_quota_verification_candidate",
+          "pvc_binding_failure_reason",
+          "pvc_storage_request",
+          "pvc_access_modes",
+          "pvc_selector",
+          "pvc_storage_class",
+          "candidate_pv_name",
+          "available_pv_count",
+          "pv_binding_status",
+          "pv_capacity",
+          "pv_access_modes",
+          "pv_labels",
+          "pv_storage_class",
+          "occupied_pv_suspected",
+          "access_mode_mismatch_suspected",
+          "capacity_mismatch_suspected",
+          "selector_mismatch_suspected",
+          "storage_class_mismatch_suspected",
+          "pending_pvc_requirements",
+          "compatible_pv_name",
+          "pv_phase_bound",
+          "pv_bound_claim",
+          "pv_binding_occupied_confirmed",
+          "pv_access_mode",
+          "pvc_access_mode",
+          "access_mode_mismatch_confirmed",
+          "capacity_mismatch_confirmed",
+          "dynamic_provisioning_available",
+          "pvc_pv_comparison",
+          "pvc_selector_labels",
+          "selector_mismatch_confirmation",
+          "available_storage_classes",
+          "candidate_pv_storage_classes",
+          "explicit_storage_class_incompatibility",
+          "pvc_storage_class_mismatch_confirmed",
+          "namespace_storage_quota_limit",
+          "pvc_storage_exceeds_quota"
+        ],
+        "completion_rule": {
+          "owner": "runtime",
+          "rule": "current incident EvidenceSet satisfies the active VerificationObligation",
+          "skill_text_can_close_obligation": false
+        }
+      }
+    },
+    {
+      "id": "pod_crash_or_restart",
+      "path": "agents/cloudops_skill_agent/harness/skills/boutique/pod_crash_or_restart.yaml",
+      "source_sha256": "5ba5a33f3dbd635ad85dfa680129f2dd989881fb24c5688a3b17e55985fb006e",
+      "derived_sha256": "bdb14314b1b0e015de331379b9d7a1f422f3379bf017ea48fe2d9fa3fd0682ac",
+      "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+      "node_count": 10,
+      "nodes": [
+        {
+          "id": "locate_crashing_workload",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "a6df8d38a301397e313ace0ee2f2b027a2a68a031e93a55175a13221bd372c0c",
+          "derived_sha256": "add8708ad9d1036ebcdb0f3d4ce265165dfe0b002516a317635b1678a3a818cd",
+          "official_tools": [
+            "GetResources"
+          ]
+        },
+        {
+          "id": "inspect_crash_evidence",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "dd2df45c269fe42fcc3803077dfbb76f4302d70a9df9844f19938ddc1e9f23c4",
+          "derived_sha256": "c43b91833e2f0f92b5b90a5896227ed4830709a19697fd0e966a011d3a1197ee",
+          "official_tools": [
+            "DescribeResource",
+            "GetRecentLogs"
+          ]
+        },
+        {
+          "id": "confirm_volume_mount_permission_denied",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "af67b148686171b5d0fb42134d8a98116b39677c83bf760e2cdff6ad88a626dc",
+          "derived_sha256": "167242ff6e0aedf4a03449aeaded5615201c3f69ee863004c09b0883da876eeb",
+          "official_tools": [
+            "GetRecentLogs"
+          ]
+        },
+        {
+          "id": "confirm_probe_port_mismatch",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "387961d7fb622e97d8ab43218d3640765b108a3dbb7c81cf1d232466c78f95e1",
+          "derived_sha256": "bd19b7d53b00e1af3eeb0c540f1716b086edb3103f00b463b79a76496932c1d7",
+          "official_tools": [
+            "GetAppYAML"
+          ]
+        },
+        {
+          "id": "confirm_probe_protocol_mismatch",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "9d7ce90de28689cd861fe5b30eefd0ee985d162b6a53c4bee5f361f15f0dcf3f",
+          "derived_sha256": "3d6efe338611c8cda77e467a53cd6cd92f92b5a15419540dcc50cc1c9bb24555",
+          "official_tools": [
+            "GetAppYAML"
+          ]
+        },
+        {
+          "id": "confirm_liveness_probe_timing",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "eeb49c4dae6d9c8244be5871e50d8676761d145d3478975351bb1ca14cf14432",
+          "derived_sha256": "a08e4f882e9d2b25280f517286af6d868e8adc2ce3060a8e7c50b5e5e6e73bda",
+          "official_tools": [
+            "DescribeResource"
+          ]
+        },
+        {
+          "id": "classify_missing_parameter_logs",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "4381ae47ac8f8e52dc41b6cdd93134f152962f00435df5b233f007d02461724b",
+          "derived_sha256": "9b0cd46a8aaf23d777b68d1a3883381ed9ee9f06516bdc25a1e320161b94b2c1",
+          "official_tools": [
+            "GetRecentLogs",
+            "GetErrorLogs"
+          ]
+        },
+        {
+          "id": "locate_relevant_source_files",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "53811acfe5873a23a83d99606ea0eed15edc5b9bb26388add2c1440af8f72637",
+          "derived_sha256": "ca93cc37d276ebf20f0575f5078522d6f3b836f2557c349c602eefc5b22c2b5b",
+          "official_tools": [
+            "ListCodeFiles"
+          ]
+        },
+        {
+          "id": "confirm_missing_parameter_code",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "8bbf4a78fa7790ec0ca23ed33067309f08340c1a563522f912ee085f6b75f02e",
+          "derived_sha256": "3ca673257746d6c2160b3a7ce823d98def2dc036fa1fa006335ab0d41af60c80",
+          "official_tools": [
+            "ListCodeFiles",
+            "GetSourceCode"
+          ]
+        },
+        {
+          "id": "confirm_wrong_argument_order_code",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "d59e56805d7bc6562ae643b77ac07b04296598821403517a039b2684049cc55d",
+          "derived_sha256": "68e819cb36ae0c68a34226acb35229a7e90d3cd1689ada421962bf3805f65164",
+          "official_tools": [
+            "GetSourceCode"
+          ]
+        }
+      ],
+      "registry_projection": {
+        "objective": "A pod enters CrashLoopBackOff, exits abnormally, or repeatedly restarts.",
+        "allowed_tools": [
+          "get_resources",
+          "describe_resource",
+          "get_error_logs",
+          "get_app_yaml",
+          "list_code_files",
+          "read_file_when_source_workspace_is_bound"
+        ],
+        "expected_evidence": [
+          "failing_pod_identified",
+          "failing_pod_name",
+          "affected_workload",
+          "failing_service",
+          "symptom_service",
+          "entrypoint_service",
+          "pod_status_summary",
+          "pod_readiness_status",
+          "pod_restart_counts",
+          "active_alerts_status",
+          "container_exit_code",
+          "container_termination_reason",
+          "pod_events",
+          "volume_mount_details",
+          "liveness_probe_config",
+          "container_port",
+          "probe_failure_events",
+          "crash_log_message",
+          "panic_message",
+          "stack_trace_present",
+          "permission_denied_indicator",
+          "probe_port_mismatch_suspected",
+          "probe_protocol_mismatch_suspected",
+          "repeated_probe_timeout",
+          "container_memory_limit_too_low",
+          "container_error_log",
+          "permission_denied_confirmed",
+          "volume_permission_denied_error",
+          "security_context_uid",
+          "deployment_probe_config",
+          "readiness_probe_config",
+          "probe_port_consistency",
+          "port_mismatch_confirmed",
+          "root_cause_confirmed",
+          "deployment_yaml",
+          "protocol_consistency",
+          "probe_protocol_mismatch_confirmed",
+          "effective_probe_configuration",
+          "liveness_probe_timing_configuration",
+          "liveness_probe_timing_config_from_yaml",
+          "root_cause_confirmation",
+          "error_log_pattern",
+          "error_type",
+          "service_logs_clean",
+          "missing_parameter_hint",
+          "source_file_list",
+          "candidate_source_file_identified",
+          "primary_source_file",
+          "candidate_handler_files",
+          "candidate_source_files",
+          "source_file_candidates",
+          "relevant_source_files_identified",
+          "source_code_evidence",
+          "required_parameter",
+          "parameter_cleared_or_omitted",
+          "code_missing_parameter_confirmed",
+          "request_or_call_site",
+          "swapped_arguments",
+          "code_wrong_argument_order_confirmed"
+        ],
+        "completion_rule": {
+          "owner": "runtime",
+          "rule": "current incident EvidenceSet satisfies the active VerificationObligation",
+          "skill_text_can_close_obligation": false
+        }
+      }
+    },
+    {
+      "id": "pod_running_but_not_ready",
+      "path": "agents/cloudops_skill_agent/harness/skills/boutique/pod_running_but_not_ready.yaml",
+      "source_sha256": "b86921b6b1ffaab3c612a9bdca6e149c13f65b6bbfb33e25dcef98df1fe325fe",
+      "derived_sha256": "dea8532eec441b823a1208940d14ece346e501f9002145bd5473e4d1f3dd199c",
+      "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+      "node_count": 4,
+      "nodes": [
+        {
+          "id": "locate_runtime_affected_pod",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "3397f8bb71e8dbb7af5b987e53d470f81c33311c78aeed399e1e5ad7c05e4ae5",
+          "derived_sha256": "982247530d1501b9844fe12cb46db1e49e8573deedbc669a0310e0717af46602",
+          "official_tools": [
+            "GetResources"
+          ]
+        },
+        {
+          "id": "classify_readiness_probe_failure",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "e86c179be03106d0225d244400369d81d1d3b797af8eb6e650713e6093bb0dc4",
+          "derived_sha256": "182fb564b6c2f8a37a2f831ddc5d3df02908817586f5566a1762df2c44137c17",
+          "official_tools": [
+            "DescribeResource"
+          ]
+        },
+        {
+          "id": "confirm_probe_port_mismatch",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "387961d7fb622e97d8ab43218d3640765b108a3dbb7c81cf1d232466c78f95e1",
+          "derived_sha256": "bd19b7d53b00e1af3eeb0c540f1716b086edb3103f00b463b79a76496932c1d7",
+          "official_tools": [
+            "GetAppYAML"
+          ]
+        },
+        {
+          "id": "confirm_probe_protocol_mismatch",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "9d7ce90de28689cd861fe5b30eefd0ee985d162b6a53c4bee5f361f15f0dcf3f",
+          "derived_sha256": "3d6efe338611c8cda77e467a53cd6cd92f92b5a15419540dcc50cc1c9bb24555",
+          "official_tools": [
+            "GetAppYAML"
+          ]
+        }
+      ],
+      "registry_projection": {
+        "objective": "A pod is Running but does not become Ready, such as showing READY 0/1.",
+        "allowed_tools": [
+          "get_resources",
+          "describe_resource",
+          "get_app_yaml"
+        ],
+        "expected_evidence": [
+          "pod_runtime_status",
+          "pod_readiness_status",
+          "pod_restart_counts",
+          "failing_pod_identified",
+          "abnormal_pod_identified",
+          "no_failing_pod_identified",
+          "alert_anomaly_status",
+          "readiness_probe_config",
+          "container_port",
+          "probe_failure_events",
+          "suspected_port_mismatch",
+          "readiness_probe_protocol_mismatch_suspected",
+          "probe_protocol_consistency",
+          "readiness_probe_incorrect_protocol",
+          "deployment_probe_config",
+          "probe_port_consistency",
+          "port_mismatch_confirmed",
+          "root_cause_confirmed",
+          "deployment_yaml",
+          "liveness_probe_config",
+          "protocol_consistency",
+          "probe_protocol_mismatch_confirmed"
+        ],
+        "completion_rule": {
+          "owner": "runtime",
+          "rule": "current incident EvidenceSet satisfies the active VerificationObligation",
+          "skill_text_can_close_obligation": false
+        }
+      }
+    },
+    {
+      "id": "service_connectivity_or_routing_failure",
+      "path": "agents/cloudops_skill_agent/harness/skills/boutique/service_connectivity_or_routing_failure.yaml",
+      "source_sha256": "d0d69988a9afcf5f2123f58d1f5eca74b1187060aae7e4ec8052e57374ba0a0f",
+      "derived_sha256": "5cb288b1b7e84e90d954e9fe3d5cba7469c1f1e134a36a3a3530ba04c5789ae0",
+      "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+      "node_count": 6,
+      "nodes": [
+        {
+          "id": "locate_service_connectivity_failure",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "efc4f58a132bec6cf4d81c33ffd46499dd1e9e5768cb6d680e7872df81028bef",
+          "derived_sha256": "44c1aeff9c1d7fa0ee7ef0bb36bf00d3e69c9825e29809e000657d9e84c9f833",
+          "official_tools": [
+            "GetServiceDependencies",
+            "GetErrorLogs"
+          ]
+        },
+        {
+          "id": "confirm_service_address_configuration",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "228e66efaf28396ee479b1b0bba605a62da772f19635add3af14544503ec539c",
+          "derived_sha256": "16a6f4a117e8fbe9af51ae0c38b755184bae620addcf359863e9ae80c34b42a9",
+          "official_tools": [
+            "GetAppYAML"
+          ]
+        },
+        {
+          "id": "inspect_service_routing_context",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "bdcabf64ccc693bd40d767cd750c0dd1cba3bb4c14e6cd35e7051843558a4160",
+          "derived_sha256": "dacfa207c9abc2c84a7f287a55ab5e858076b34040fb4134d1192887038d8d78",
+          "official_tools": [
+            "DescribeResource",
+            "GetResources",
+            "GetAppYAML"
+          ]
+        },
+        {
+          "id": "confirm_service_target_port_mapping",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "30fb922f4d0721d8e45063037af7dad055c848a421f7ed12e9ad299306adbf3e",
+          "derived_sha256": "f5f6192cc50021cd2d1dc39f92a87621ec424810184f1bdb15714dea6f250988",
+          "official_tools": [
+            "GetAppYAML"
+          ]
+        },
+        {
+          "id": "confirm_service_protocol_compatibility",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "9fc7b150e10a164cc7640b92936539c211c12bc52ec082e01b436ef6adb58b63",
+          "derived_sha256": "4299d895a27f574a44ba93a24c16424aa06ff8b3ebacf65fe05e2e517c11da5d",
+          "official_tools": [
+            "GetAppYAML"
+          ]
+        },
+        {
+          "id": "confirm_service_selector_mapping",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "29af34fa670b700678812bae3c07baea5720950767ef6cb615fbc1337b60a45b",
+          "derived_sha256": "c0739ff3ecfc639aff9e45a00cdb2725fb61cd1ec13d08b1d6e1274f5c06b15c",
+          "official_tools": [
+            "DescribeResource",
+            "GetResources",
+            "GetResources"
+          ]
+        }
+      ],
+      "registry_projection": {
+        "objective": "A caller cannot resolve or connect to a Kubernetes Service, or traffic fails to reach otherwise healthy backends.",
+        "allowed_tools": [
+          "get_service_dependencies",
+          "get_error_logs",
+          "get_app_yaml",
+          "describe_resource",
+          "get_resources"
+        ],
+        "expected_evidence": [
+          "pod_health_status",
+          "service_inventory",
+          "entrypoint_service",
+          "service_dependency_graph",
+          "calling_service",
+          "failed_dependency",
+          "failing_service",
+          "failing_service_port",
+          "connectivity_failure_pattern",
+          "dns_resolution_failure_pattern",
+          "configuration_owner_service",
+          "downstream_address_env_var",
+          "env_var_value",
+          "actual_service_name",
+          "address_mismatch_confirmed",
+          "service_selector",
+          "service_endpoints",
+          "service_port",
+          "service_targetPort",
+          "service_protocol",
+          "candidate_pod_labels",
+          "container_port",
+          "selector_mismatch_candidate",
+          "target_port_mismatch_candidate",
+          "protocol_mismatch_candidate",
+          "routing_configuration_consistent",
+          "container_port_name",
+          "port_mismatch_verdict",
+          "container_protocol",
+          "client_expected_protocol",
+          "connectivity_failure",
+          "protocol_mismatch_confirmed",
+          "selector_value",
+          "pod_label_value",
+          "selector_label_mismatch",
+          "empty_or_wrong_endpoints",
+          "root_cause_confirmed"
+        ],
+        "completion_rule": {
+          "owner": "runtime",
+          "rule": "current incident EvidenceSet satisfies the active VerificationObligation",
+          "skill_text_can_close_obligation": false
+        }
+      }
+    },
+    {
+      "id": "service_cpu_or_resource_saturation",
+      "path": "agents/cloudops_skill_agent/harness/skills/boutique/service_cpu_or_resource_saturation.yaml",
+      "source_sha256": "64bb5afd4265aad49af85833af5571151a6c4e1247157588a15bdcde50632cdf",
+      "derived_sha256": "0586b2a1969c65ea7eec6300783b966b3ee7f1fad02473fbc7e61d7f9aba8e41",
+      "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+      "node_count": 5,
+      "nodes": [
+        {
+          "id": "locate_service_cpu_scope",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "6227d732a3e8afc8bd221aae1ad1a84e2a2485387af7a29b2cc598d88cc29b0f",
+          "derived_sha256": "88cd7e3973c9180e6b564597fdbb034976100b8faf52fe6a2fc8a3a044d8c3c3",
+          "official_tools": [
+            "GetAlerts",
+            "GetResources"
+          ]
+        },
+        {
+          "id": "inspect_cpu_service_context",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "47ab6c9e942c53a74a8c3b04dc6503c86dde883b27814e7b7f609ab648d3c3f6",
+          "derived_sha256": "9b50649d6720ceff8444b6564d87bdbccd1cdee80e62e3e72147baf524bed379",
+          "official_tools": [
+            "GetResources",
+            "GetErrorLogs",
+            "GetAppYAML"
+          ]
+        },
+        {
+          "id": "triage_performance_source",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "ee63321349b822d3361a60ec5815a9b1f494a2f6d810f12496f2a167dea895c0",
+          "derived_sha256": "7efdf65d14ffc90138b8ce894ecfba43ffcb8b8f799a14f5baf3cf6227bf9003",
+          "official_tools": [
+            "ListCodeFiles",
+            "GetSourceCode"
+          ]
+        },
+        {
+          "id": "confirm_busy_loop_code",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "3aaccd6b10e2e280cfc22fc4d0c3c9cb63f266554740347f2915c6e5407c20fb",
+          "derived_sha256": "a36894c8c43b87b3d006410117cd2bda9ba369a4c6144abf18d92dc93044ca62",
+          "official_tools": [
+            "GetSourceCode"
+          ]
+        },
+        {
+          "id": "attribute_observed_cpu_overload",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "8de6a14dbf77df0f0c41ea70dcfea68518ddaeb04143f865a7787cce0ee698da",
+          "derived_sha256": "58555b472e4a6a244a94bfdc127104d3214aaff721784c1f920a1e379415800d",
+          "official_tools": []
+        }
+      ],
+      "registry_projection": {
+        "objective": "An application service shows sustained CPU saturation or throttling with associated performance degradation.",
+        "allowed_tools": [
+          "get_alerts",
+          "get_resources",
+          "get_error_logs",
+          "get_app_yaml",
+          "list_code_files",
+          "read_file_when_source_workspace_is_bound"
+        ],
+        "expected_evidence": [
+          "performance_alert_summary",
+          "affected_services",
+          "anomalous_service",
+          "pod_health_summary",
+          "pod_node_mapping",
+          "cpu_throttling_evidence",
+          "affected_service",
+          "pod_health_status",
+          "pod_restart_count",
+          "pod_node_placement",
+          "error_log_pattern",
+          "application_error_present",
+          "cpu_saturation",
+          "resource_limits",
+          "configuration_normal",
+          "code_level_performance_candidate",
+          "local_failure_excluded",
+          "source_file_list",
+          "candidate_source_files",
+          "primary_source_file",
+          "source_code_pattern",
+          "artificial_delay_candidate",
+          "busy_loop_candidate",
+          "excessive_file_read_candidate",
+          "excessive_file_write_candidate",
+          "no_obvious_code_defect",
+          "source_code_evidence",
+          "busy_loop_found",
+          "non_busy_loop_code_pattern",
+          "root_cause_confirmation",
+          "code_defect_pattern",
+          "observed_cpu_saturation",
+          "source_code_review_summary",
+          "no_supported_cpu_code_defect",
+          "cpu_limit_context",
+          "pod_cpu_overload_attributed"
+        ],
+        "completion_rule": {
+          "owner": "runtime",
+          "rule": "current incident EvidenceSet satisfies the active VerificationObligation",
+          "skill_text_can_close_obligation": false
+        }
+      }
+    },
+    {
+      "id": "service_latency_or_io_degradation",
+      "path": "agents/cloudops_skill_agent/harness/skills/boutique/service_latency_or_io_degradation.yaml",
+      "source_sha256": "da01a1d8620ab3ca43c743f0a9756a23f34446cbdc0b0fe2215dec59c57cae34",
+      "derived_sha256": "086355eddb826440761ab80ed621b66414f30dea6723221f084f17fa0f591928",
+      "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+      "node_count": 7,
+      "nodes": [
+        {
+          "id": "locate_service_latency_io_scope",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "e91059134429ce04cd3ff5d56aa1b981635ae8c0ac8f8faacf6af32340f50e3a",
+          "derived_sha256": "f2e46b45c1fd950c0d18d04b8e5a0230c6cf8b51d697dd7df4ad4ba41c30619a",
+          "official_tools": [
+            "GetAlerts",
+            "GetResources"
+          ]
+        },
+        {
+          "id": "inspect_latency_io_service_context",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "0dfe82a3ec81f875ee41c97e4687e62c5e0363df7de62e0232b7cde27f69dbbf",
+          "derived_sha256": "9b0b3553d159bbf2f81180287440483ddb7772cd7f54a163fc4e9417658348be",
+          "official_tools": [
+            "GetResources",
+            "GetErrorLogs",
+            "GetRecentLogs"
+          ]
+        },
+        {
+          "id": "triage_performance_source",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "fa56f2736b72f0cd9430ed5be73ff752d49024c6dd4c178501dbbd47be7b7a96",
+          "derived_sha256": "9eba838269f3095eb5999a592daf72bbfcb967c677de7b933345e6e64b71a350",
+          "official_tools": [
+            "ListCodeFiles",
+            "GetSourceCode"
+          ]
+        },
+        {
+          "id": "confirm_artificial_delay_code",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "1322cefa158a0f0b1d297c29b2e3fdc95648536d720c2696e99597e71f3677a8",
+          "derived_sha256": "faa66e41ad3498aa4a92d41cdb23edaeb7e99b95fdf4600dc071b09a719fadbd",
+          "official_tools": [
+            "ListCodeFiles",
+            "GetSourceCode"
+          ]
+        },
+        {
+          "id": "confirm_busy_loop_code",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "3aaccd6b10e2e280cfc22fc4d0c3c9cb63f266554740347f2915c6e5407c20fb",
+          "derived_sha256": "a36894c8c43b87b3d006410117cd2bda9ba369a4c6144abf18d92dc93044ca62",
+          "official_tools": [
+            "GetSourceCode"
+          ]
+        },
+        {
+          "id": "confirm_excessive_file_writes_code",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "d7213519dd370d054b97017be9a85d496bcd5c582cd0cbf0b9b8f02d29e6e0e2",
+          "derived_sha256": "0280b57ca8bfefe63ee48ed4925c5c32cf82b12fd1036941a270870a231f06e8",
+          "official_tools": [
+            "ListCodeFiles",
+            "GetSourceCode"
+          ]
+        },
+        {
+          "id": "attribute_pod_network_delay_after_code_exclusion",
+          "disposition": "DIRECT_REUSE_PUBLIC_PRIOR",
+          "source_sha256": "9cdc8710e1c32028d6ad64bb3086354597de93faadbf4272b58bf27ec690f57b",
+          "derived_sha256": "9fadbf682601446618b9e2ee5c8a575aa4772f87cb794cc85c3bf813c9b779ed",
+          "official_tools": [
+            "GetServiceDependencies"
+          ]
+        }
+      ],
+      "registry_projection": {
+        "objective": "An application service shows sustained response latency, throughput degradation, or abnormal filesystem-I/O activity.",
+        "allowed_tools": [
+          "get_alerts",
+          "get_resources",
+          "get_error_logs",
+          "list_code_files",
+          "read_file_when_source_workspace_is_bound",
+          "get_service_dependencies"
+        ],
+        "expected_evidence": [
+          "performance_alert_summary",
+          "affected_services",
+          "anomalous_service",
+          "pod_health_summary",
+          "pod_node_mapping",
+          "latency_degradation_evidence",
+          "filesystem_io_evidence",
+          "affected_service",
+          "pod_health_status",
+          "pod_restart_count",
+          "pod_node_placement",
+          "error_log_pattern",
+          "recent_log_pattern",
+          "application_error_present",
+          "downstream_timeout_found",
+          "fixed_latency_pattern",
+          "filesystem_write_surge",
+          "connectivity_failure_pattern",
+          "code_level_performance_candidate",
+          "local_failure_excluded",
+          "source_file_list",
+          "candidate_source_files",
+          "primary_source_file",
+          "source_code_pattern",
+          "artificial_delay_candidate",
+          "busy_loop_candidate",
+          "excessive_file_read_candidate",
+          "excessive_file_write_candidate",
+          "no_obvious_code_defect",
+          "target_source_file",
+          "artificial_delay_present",
+          "non_delay_code_pattern",
+          "root_cause_confirmed",
+          "source_code_evidence",
+          "busy_loop_found",
+          "non_busy_loop_code_pattern",
+          "root_cause_confirmation",
+          "code_defect_pattern",
+          "repeated_or_unbounded_file_write_path",
+          "code_excessive_file_writes_confirmed",
+          "observed_latency_degradation",
+          "source_code_review_summary",
+          "no_supported_latency_code_defect",
+          "service_dependency_topology",
+          "no_visible_downstream_bottleneck",
+          "pod_network_delay_attributed"
+        ],
+        "completion_rule": {
+          "owner": "runtime",
+          "rule": "current incident EvidenceSet satisfies the active VerificationObligation",
+          "skill_text_can_close_obligation": false
+        }
+      }
+    }
+  ],
+  "audit_summary": {
+    "official_tool_count": 12,
+    "skill_count": 12,
+    "node_count": 83,
+    "direct_public_prior_node_count": 83,
+    "excluded_skill_node_count": 0,
+    "thin_adapter_tool_count": 12,
+    "direct_reuse_tool_count": 0
+  },
+  "excluded_control_surfaces": [
+    {
+      "surface": "case_fault_category_metadata",
+      "path": "agents/cloudops_skill_agent/run.py",
+      "source_sha256": "8d8a5168baad075bc9b4305d9dbddbbd1dc1e98b83b59c68cfc5a85dabd57e27",
+      "disposition": "EXCLUDED_BENCHMARK_CONTROL",
+      "reason": "fault_category is evaluator/dataset metadata and must not enter Planner, Router, Context or Runtime control"
+    },
+    {
+      "surface": "fault_category_tool_contract_selector",
+      "path": "agents/cloudops_skill_agent/tools/cloudops.py",
+      "source_sha256": "96f0c6bc5c47a52b3d6c270d017d49acd6da33e603712739c7ed96bf9409bffa",
+      "disposition": "EXCLUDED_BENCHMARK_CONTROL",
+      "reason": "the V1/V2 GetResources choice is category-driven; the local adapter uses snapshot capability instead"
+    },
+    {
+      "surface": "select_symptom_and_submit_control_loop",
+      "path": "agents/cloudops_skill_agent/harness/harness.py",
+      "source_sha256": "4571cf4f39cc3bbd0220a06e63ae9198c0199f6c32ac347c11d5967fca8ac22f",
+      "disposition": "EXCLUDED_BENCHMARK_CONTROL",
+      "reason": "upstream ReAct control and Submit are not reused as Evidence lifecycle or obligation transitions"
+    },
+    {
+      "surface": "diagnostic_graph_prompt_injection_control",
+      "path": "agents/cloudops_skill_agent/runtime/skills.py",
+      "source_sha256": "31ca162ad8a2afa4a433aa427099ce66e34cf35e9ebcdc93e46079b1d5fff56b",
+      "disposition": "EXCLUDED_BENCHMARK_CONTROL",
+      "reason": "graph validation is a reference; full-graph prompt control is replaced by a bounded Registry adapter"
+    }
+  ],
+  "control_policy": {
+    "router_inputs": [
+      "active_hypothesis",
+      "ready_obligation",
+      "relevant_evidence",
+      "contradictions",
+      "available_capabilities"
+    ],
+    "router_forbidden_inputs": [
+      "case_id",
+      "case_path",
+      "fault_label",
+      "fault_category",
+      "gold",
+      "milestone_label"
+    ],
+    "skill_confirmation_text_is_prior_not_state": true,
+    "un_audited_assets_allowed": false
+  },
+  "shared_arm_assets": {
+    "domain_content_bundle_sha256": "62d22285669b81a261b23fda13a1873722d5203127a5362f7c64d35e148937a2",
+    "common_domain_prompt": {
+      "path": "experiments/refactor/common_domain_prompt.txt",
+      "sha256": "89275c963e85cf4b5fa66cc688a21faa9f69dbae1e8cad194772e73e263d3b82"
+    },
+    "arms": {
+      "A0": {
+        "domain_content_bundle": "shared",
+        "control_policy_path": "experiments/refactor/control_A0.txt",
+        "control_policy_sha256": "90d38166ea393dd59aded4eeea279bb19f428d6e65f8a350a4bbdd4244a9bfe7"
+      },
+      "A1": {
+        "domain_content_bundle": "shared",
+        "control_policy_path": "experiments/refactor/control_A1.txt",
+        "control_policy_sha256": "40a56adee020b9f64ce8e29973d05c267122354e6225219b9fb3a86c349f1195"
+      },
+      "A2": {
+        "domain_content_bundle": "shared",
+        "control_policy_path": "experiments/refactor/control_A2.txt",
+        "control_policy_sha256": "d01df4a2c197e47a314edb49a02a033024d10e6428da413515bc9d5d9d8d35cf"
+      }
+    },
+    "control_bundle_sha256": "c84ca3bf07fd70eb44598eb54222f28ec6d5e0bc3526ea73810a5c34010dc3aa"
+  }
+}

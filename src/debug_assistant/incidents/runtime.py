@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, replace
+from copy import deepcopy
 import json
 import math
-import multiprocessing
-import inspect
-from hashlib import sha1
 from pathlib import Path
 import time
 from typing import Any, Literal
@@ -14,57 +12,97 @@ from debug_assistant.agent.final_review import (
     FinalReviewAgent, ReviewSchemaError, enforce_review_consistency,
 )
 from debug_assistant.agent.reflection import IncidentReflectionAgent, ReflectionContractExhausted
+from debug_assistant.skills.projection import load_skill_views
 from debug_assistant.agent.planner import (
-    NativePlannerResult, NativeToolPlanner, PlannerContractError,
+    NativeToolPlanner, PlannerContractError,
     PlannerContractExhausted,
 )
-from debug_assistant.config import ContextConfig
+from debug_assistant.config import RuntimeConfig
+from debug_assistant.context.models import ContextView
 from debug_assistant.context.manager import ContextManager
 from debug_assistant.context.projection import IncidentProjectionPolicy
-from debug_assistant.context.task_projection import project_verification_tasks
 from debug_assistant.harness.trace import TraceRecorder
 from debug_assistant.harness.budget import BudgetController
 from debug_assistant.harness.dynamic_budget import (
-    BudgetAllocation, BudgetState, DynamicBudgetController, ProgressMarker, PromptBudgetExceeded,
+    BudgetState, DynamicBudgetController, ProgressMarker, PromptBudgetExceeded,
     RunBudgetAdmissionExceeded,
     progress_made, resolve_model_capability,
 )
 from debug_assistant.harness.deadline import RunDeadline
 from debug_assistant.harness.retry import RetryPolicy
-from debug_assistant.harness.tool_executor import execute_with_retry
-from debug_assistant.harness.guards import LoopGuard
 from debug_assistant.harness.provider_health import ToolCircuitBreaker
-from debug_assistant.harness.feature_flags import FeatureFlags
 from debug_assistant.incidents.contracts import (
+    CompletionContract, FactRequirement, EvidenceConstraint,
     Contradiction, IncidentCase, IncidentEvidence, IncidentHypothesis, IncidentMetrics,
-    IncidentRunResult, ReflectionFeedback, ReflectionContradictionUpdate,
-    ReviewDecision, RootCauseCandidate,
-    SourceClaim, VerificationObligation, is_canonical_fault_code,
+    IncidentRunResult, ReflectionFeedback,
+    ReviewDecision, RootCauseCandidate, SemanticDecisionRecord, SemanticEvidenceRecord,
+    DiagnosticReportReview,
+    SourceClaim, TerminalOutcome, VerificationObligation, build_verification_key,
 )
-from debug_assistant.incidents.dag_convergence import evaluate_dag_finalization
 from debug_assistant.incidents.verification_dag import (
-    LangGraphVerificationAdapter,
     VerificationDAGHarnessAdapter,
     VerificationDAGState,
     VerificationTask,
     VerificationTaskExecution,
 )
+from debug_assistant.incidents.rca_state import RCAState, RCAStateError
+from debug_assistant.incidents.semantic_transition import (
+    SemanticTransitionError, SemanticTraceBuffer, resolve_hypothesis,
+    validate_disposition_conflicts,
+)
+from debug_assistant.incidents.evidence_pipeline import (
+    EvidencePipeline, EvidencePipelineError, EvidenceSet,
+)
+from debug_assistant.incidents.finalization import (
+    FinalizationDecision, FinalizationFacts, FinalizationPolicy,
+)
+from debug_assistant.incidents.report import build_diagnostic_report
+from debug_assistant.context.requests import ContextResolutionError
+from debug_assistant.agent.requirement_targeting import targeting_feedback, requirement_table
+from debug_assistant.incidents.planning_session import PlanningSession, LogicalTurnRetryBudget
+from debug_assistant.incidents.continuation import ContinuationPolicy
+from debug_assistant.incidents.provider_gateway import (
+    ProviderOperationalGateway, ProviderCallLimitExceeded, aggregate_provider_usage,
+)
+from debug_assistant.incidents.action_runtime import (
+    ActionRuntime, ActionExecutionContext, InvestigationUse, DuplicateAcquisition,
+)
+from debug_assistant.incidents.verification_plan import (
+    PlanAdmissionDecision, VerificationPlanError, compile_planned_action,
+    registry_schema_sha256, EnrichedVerificationPlan,
+)
+from debug_assistant.incidents.obligation_admission import (
+    CanonicalObligationProposal,
+    ObligationAdmissionDecision,
+    ObligationAdmissionPolicy,
+    ObligationProposalError,
+    obligation_id_for_key,
+)
+from debug_assistant.incidents.progress_policy import ProgressDecision, ProgressFacts, ProgressPolicy
 from debug_assistant.models import ActionKind, ActionProposal, AgentState, TaskSpec, ToolObservation
 from debug_assistant.memory.evidence_boundary import is_canonical_source_evidence
 from debug_assistant.memory.evidence_memory import EvidenceMemory
+from debug_assistant.memory.evidence_projector import (
+    EvidenceProjector, EvidenceProposal, EvidenceProposalError,
+    evidence_relationship_key,
+)
 from debug_assistant.memory.observation_store import ObservationStore
 from debug_assistant.knowledge import (
     CapabilitySnapshot, HybridRouter, IncidentEntityExtractor,
     KnowledgeCoordinator, KnowledgeQueryBuilder, KnowledgeRetrievalTool,
 )
-from debug_assistant.llm.base import LLMDeadlineExceeded, LLMError, complete_json_compat
-from debug_assistant.llm.base import ModelCapability
-from debug_assistant.skills.catalog import INCIDENT_SKILLS
+from debug_assistant.llm.base import (
+    LLMDeadlineExceeded, LLMError, LLMOutputError,
+)
+from debug_assistant.skills.investigation import (
+    DomainAssetCatalog,
+    DomainSkillRegistry,
+)
 from debug_assistant.tools.cloudops_snapshot import CloudOpsSnapshotToolRegistry
 
 
 # Runtime-owned convergence controls. The provider adapter carries the
-# reasoning limit as a bounded completion envelope for tool-call JSON.
+# reasoning limit as a bounded structured completion envelope.
 CONVERGE_MAX_REASONING_TOKENS = 2_000
 CONVERGE_MAX_OUTPUT_TOKENS = 3_000
 CONVERGE_MAX_READ_FILE_CALLS = 3
@@ -79,6 +117,89 @@ CONVERGE_START_STEP = 7
 CONVERGE_DISABLE_REFLECTIONS = True
 
 
+def _prompt_accounting_residual(
+    *,
+    actual_prompt_tokens: int | None,
+    components: dict[str, int | None],
+    provider_overhead_tokens: int | None,
+) -> tuple[int | None, bool]:
+    """Return actual prompt residual and whether the attributed total is too high."""
+    if actual_prompt_tokens is None:
+        return None, False
+    attributed = sum(
+        int(value) for value in components.values() if value is not None
+    )
+    overhead = max(0, int(provider_overhead_tokens or 0))
+    residual = int(actual_prompt_tokens) - attributed - overhead
+    return residual, residual < 0
+
+
+def _provider_failure_category(exc: BaseException) -> str:
+    """Classify transport, provider-contract, and semantic failures separately."""
+    if isinstance(exc, LLMOutputError):
+        return "provider_contract_failure"
+    if isinstance(exc, LLMError):
+        return "provider_transport_failure"
+    return "semantic_adjudication_failure"
+
+
+def _usage_token_value(usage: dict[str, Any], *keys: str) -> int | None:
+    """Read a token field from top-level or common nested Provider usage."""
+    for key in keys:
+        value = usage.get(key)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict):
+        for key in keys:
+            value = details.get(key)
+            if value is not None:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return None
+    return None
+
+
+def _grounded_contradiction_ids(
+    proposed_ids: Any,
+    projected_facts: Any,
+    hypothesis_scopes: set[str] | frozenset[str] = frozenset(),
+) -> tuple[str, ...]:
+    """Keep only contradiction claims grounded in canonical Evidence relations.
+
+    Planner contradiction fields are semantic proposals.  They cannot turn a
+    neutral or partial observation into a Runtime-owned blocking contradiction.
+    When one Evidence ID has multiple relationship projections, prefer the
+    projection for the current hypothesis scope; stale branch projections must
+    not block the revised RCA.
+    """
+    from .semantic_transition import grounded_contradiction_ids
+    return grounded_contradiction_ids(proposed_ids or (), projected_facts or (), hypothesis_scopes)
+
+
+def _source_investigation_declared(
+    *,
+    source_obligation: Any | None,
+    source_claims: Any,
+    cited_source_ids: Any,
+    proposed_status: str,
+) -> bool:
+    """Return whether the Planner explicitly entered a source branch."""
+    return bool(
+        source_obligation is not None
+        or tuple(source_claims or ())
+        or tuple(cited_source_ids or ())
+        or str(proposed_status or "unknown") != "unknown"
+    )
+
+# The CloudOps project has one active asset source.  Keeping the manifest
+# default here makes every harness construction use the same canonical
+# registry; callers may only replace it with another explicitly versioned
+# manifest for a separate experiment.
 def _safe_planner_metadata_for_trace(exc: Exception) -> dict[str, Any] | None:
     """Keep planner diagnostics useful without copying model output to Trace."""
     metadata = getattr(exc, "metadata", None)
@@ -86,10 +207,10 @@ def _safe_planner_metadata_for_trace(exc: Exception) -> dict[str, Any] | None:
         return None
     safe: dict[str, Any] = {}
     for key in (
-        "error_type", "index", "tool", "arguments_type", "actions_type",
+        "error_type", "error_layer", "index", "tool", "arguments_type", "actions_type",
         "actions_count", "child_types", "output_shape", "repair_rejection_reason",
         "raw_output", "parsed_output", "normalized_output", "validation_error",
-        "repair_prompt", "repair_output", "repair_result",
+        "repair_prompt", "repair_output", "repair_result", "requirement_feedback", "capability_feedback",
     ):
         if key in metadata:
             safe[key] = metadata[key]
@@ -111,196 +232,16 @@ def _safe_planner_metadata_for_trace(exc: Exception) -> dict[str, Any] | None:
     return safe or None
 
 
-@dataclass(frozen=True, slots=True)
-class DiagnosisHarnessConfig:
-    execution_mode: Literal["legacy", "dag"] = "legacy"
-    context_projection_mode: Literal["existing", "task_aware"] = "task_aware"
-    max_steps: int = 10
-    max_tool_calls: int = 10
-    max_review_rounds: int = 2
-    max_post_reject_tool_calls: int = 3
-    max_post_reject_steps: int = 4
-    # Once the current hypothesis has passed the deterministic completion
-    # predicate, bounded extra exploration is useful only for a small amount
-    # of verification.  This prevents a model from consuming the whole run
-    # budget after the answer is already reviewable.
-    max_post_sufficiency_tool_calls: int = 4
-    max_tool_contract_repairs: int = 1
-    planner_llm_timeout_seconds: float = 60.0
-    review_llm_timeout_seconds: float = 45.0
-    max_llm_calls: int = 40
-    max_total_tokens: int = 120_000
-    terminal_reserve_tokens: int = 0
-    terminal_reserve_llm_calls: int = 3
-    context_pressure_ratio: float = 0.75
-    hard_pressure_ratio: float = 0.95
-    max_cost_per_incident: float | None = None
-    max_wall_time_seconds: float = 900.0
-    finalization_reserve_seconds: float = 0.0
-    tool_retry_attempts: int = 1
-    retry_base_delay_seconds: float = 0.0
-    retry_max_delay_seconds: float = 0.0
-    max_duplicate_actions: int = 2
-    max_no_progress: int = 4
-    enable_reflection: bool = True
-    max_reflection_calls: int = 2
-    max_consecutive_reflection_calls: int = 1
-    converge_disable_reflections: bool = False
-    # Stage-owned output and Review reserve controls.  These are Runtime
-    # policy, not values proposed by the Planner.
-    planner_max_completion_tokens: int = 8_000
-    converge_max_reasoning_tokens: int = CONVERGE_MAX_REASONING_TOKENS
-    converge_max_output_tokens: int = CONVERGE_MAX_OUTPUT_TOKENS
-    converge_max_read_file_calls: int = CONVERGE_MAX_READ_FILE_CALLS
-    source_verify_max_output_tokens: int = 6_000
-    source_verify_max_read_file_calls: int = 6
-    review_max_completion_tokens: int = 8_000
-    review_repair_max_completion_tokens: int = 4_000
-    review_reserve_tokens: int = 24_000
-    review_reserve_calls: int = 2
-    enable_review: bool = True
-    max_review_recovery_cycles: int = 1
-    tool_circuit_failure_threshold: int = 2
-    max_context_chars: int = 24_000
-    context: ContextConfig = field(default_factory=ContextConfig)
-    features: FeatureFlags = field(default_factory=FeatureFlags)
-    trace_dir: str = ".debug_assistant/incident_traces"
-
-    @classmethod
-    def from_app_harness(cls, source, *, trace_dir: str | None = None,
-                         planner_llm_timeout_seconds: float | None = None,
-                         review_llm_timeout_seconds: float | None = None) -> "DiagnosisHarnessConfig":
-        """Explicitly adapt the generic AppConfig harness to incident semantics.
-
-        The two runtimes intentionally keep separate config types.  This adapter
-        maps only fields with the same operational meaning and makes the few
-        renamed controls explicit instead of relying on ``**vars(...)``.
-        """
-        return cls(
-            execution_mode=getattr(source, "execution_mode", "legacy"),
-            context_projection_mode=getattr(source, "context_projection_mode", "task_aware"),
-            max_steps=source.max_steps,
-            max_tool_calls=source.max_tool_calls,
-            max_llm_calls=source.max_llm_calls,
-            max_total_tokens=source.max_total_tokens,
-            max_cost_per_incident=getattr(source, "max_cost_per_incident", None),
-            terminal_reserve_tokens=getattr(source, "terminal_reserve_tokens", 0),
-            terminal_reserve_llm_calls=getattr(source, "terminal_reserve_llm_calls", 3),
-            max_review_recovery_cycles=getattr(source, "max_review_recovery_cycles", 1),
-            max_consecutive_reflection_calls=getattr(source, "max_consecutive_reflection_calls", 1),
-            context_pressure_ratio=getattr(source, "context_pressure_ratio", 0.75),
-            hard_pressure_ratio=getattr(source, "hard_pressure_ratio", 0.95),
-            max_wall_time_seconds=source.max_wall_time_seconds,
-            finalization_reserve_seconds=source.finalization_reserve_seconds,
-            planner_llm_timeout_seconds=(
-                source.planner_llm_timeout_seconds
-                if planner_llm_timeout_seconds is None else planner_llm_timeout_seconds
-            ),
-            review_llm_timeout_seconds=(
-                source.reporter_llm_timeout_seconds
-                if review_llm_timeout_seconds is None else review_llm_timeout_seconds
-            ),
-            planner_max_completion_tokens=getattr(source, "planner_max_completion_tokens", 8_000),
-            converge_max_reasoning_tokens=getattr(source, "converge_max_reasoning_tokens", CONVERGE_MAX_REASONING_TOKENS),
-            converge_max_output_tokens=getattr(source, "converge_max_output_tokens", CONVERGE_MAX_OUTPUT_TOKENS),
-            converge_max_read_file_calls=getattr(source, "converge_max_read_file_calls", CONVERGE_MAX_READ_FILE_CALLS),
-            converge_disable_reflections=getattr(source, "converge_disable_reflections", False),
-            source_verify_max_output_tokens=getattr(source, "source_verify_max_output_tokens", 6_000),
-            source_verify_max_read_file_calls=getattr(source, "source_verify_max_read_file_calls", 6),
-            review_max_completion_tokens=getattr(source, "review_max_completion_tokens", 8_000),
-            review_repair_max_completion_tokens=getattr(source, "review_repair_max_completion_tokens", 4_000),
-            review_reserve_tokens=getattr(source, "review_reserve_tokens", 24_000),
-            review_reserve_calls=getattr(source, "review_reserve_calls", 2),
-            tool_retry_attempts=source.tool_retry_attempts,
-            retry_base_delay_seconds=source.retry_base_delay_seconds,
-            retry_max_delay_seconds=source.retry_max_delay_seconds,
-            max_duplicate_actions=source.max_repeat_action,
-            max_no_progress=source.max_no_progress_steps,
-            max_context_chars=source.max_context_chars,
-            context=source.context,
-            features=source.features,
-            trace_dir=trace_dir or source.trace_dir,
-        )
-
-    def __post_init__(self):
-        if self.execution_mode not in {"legacy", "dag"}:
-            raise ValueError("execution_mode must be legacy or dag")
-        if self.context_projection_mode not in {"existing", "task_aware"}:
-            raise ValueError("context_projection_mode must be existing or task_aware")
-        if self.max_steps <= 0 or self.max_tool_calls <= 0:
-            raise ValueError("step and tool budgets must be positive")
-        if self.max_review_rounds != 2:
-            raise ValueError("max_review_rounds is fixed at 2")
-        if not 1 <= self.max_post_reject_tool_calls <= 3:
-            raise ValueError("post-review tool calls must be between 1 and 3")
-        if not 1 <= self.max_post_reject_steps <= 4:
-            raise ValueError("post-review steps must be between 1 and 4")
-        if not 1 <= self.max_post_sufficiency_tool_calls <= 8:
-            raise ValueError("post-sufficiency tool calls must be between 1 and 8")
-        if not 1 <= self.max_tool_contract_repairs <= 3:
-            raise ValueError("tool contract repairs must be between 1 and 3")
-        if self.planner_llm_timeout_seconds <= 0 or self.review_llm_timeout_seconds <= 0:
-            raise ValueError("LLM timeouts must be positive")
-        if self.max_context_chars <= 0:
-            raise ValueError("max_context_chars must be positive")
-        if any(value <= 0 for value in (
-            self.planner_max_completion_tokens,
-            self.converge_max_reasoning_tokens,
-            self.converge_max_output_tokens,
-            self.converge_max_read_file_calls,
-            self.source_verify_max_output_tokens,
-            self.source_verify_max_read_file_calls,
-            self.review_max_completion_tokens,
-            self.review_repair_max_completion_tokens,
-            self.review_reserve_tokens,
-            self.review_reserve_calls,
-        )):
-            raise ValueError("stage budget controls must be positive")
-        if self.max_llm_calls <= 0 or self.max_total_tokens <= 0 or self.max_wall_time_seconds <= 0:
-            raise ValueError("LLM, token, and wall-clock budgets must be positive")
-        if self.terminal_reserve_tokens < 0 or self.terminal_reserve_llm_calls <= 0:
-            raise ValueError("terminal reserves must be non-negative tokens and positive calls")
-        if not 0.5 <= self.context_pressure_ratio < 1.0:
-            raise ValueError("context pressure ratio must be in [0.5, 1.0)")
-        if not self.context_pressure_ratio <= self.hard_pressure_ratio <= 1.0:
-            raise ValueError("hard pressure ratio must be >= pressure ratio and <= 1")
-        if self.max_cost_per_incident is not None and self.max_cost_per_incident <= 0:
-            raise ValueError("max_cost_per_incident must be positive when configured")
-        if self.finalization_reserve_seconds < 0 or self.finalization_reserve_seconds >= self.max_wall_time_seconds:
-            raise ValueError("finalization reserve must be smaller than the run deadline")
-        if self.tool_retry_attempts <= 0 or self.max_duplicate_actions <= 0 or self.max_no_progress <= 0:
-            raise ValueError("retry and progress limits must be positive")
-        if self.max_reflection_calls < 0:
-            raise ValueError("max_reflection_calls must be non-negative")
-        if self.max_consecutive_reflection_calls <= 0:
-            raise ValueError("max_consecutive_reflection_calls must be positive")
-        if self.max_review_recovery_cycles < 0:
-            raise ValueError("max_review_recovery_cycles must be non-negative")
-        if self.tool_circuit_failure_threshold <= 0:
-            raise ValueError("tool_circuit_failure_threshold must be positive")
-
-    @property
-    def budget_allocation(self) -> BudgetAllocation:
-        """Return immutable token/call ownership resolved for this run."""
-        return BudgetAllocation.resolve(
-            total_tokens=self.max_total_tokens,
-            total_llm_calls=self.max_llm_calls,
-            review_tokens=self.review_reserve_tokens if self.enable_review else 0,
-            review_llm_calls=self.review_reserve_calls if self.enable_review else 0,
-            terminal_tokens=self.terminal_reserve_tokens,
-            terminal_llm_calls=self.terminal_reserve_llm_calls,
-            terminal_seconds=self.finalization_reserve_seconds,
-        )
+DiagnosisHarnessConfig = RuntimeConfig
 
 
 # Kept for callers and tests written against the first Incident vertical slice.
-IncidentHarnessConfig = DiagnosisHarnessConfig
 
 
 _OBLIGATION_TRANSITIONS = {
     "OPEN": {
         "OPEN", "SATISFIED", "BLOCKED_BY_CAPABILITY",
-        "NOT_APPLICABLE_BY_CAPABILITY",
+        "NOT_APPLICABLE_BY_CAPABILITY", "SUPERSEDED_BY_REPLAN",
     },
     "SATISFIED": {"SATISFIED"},
     "BLOCKED_BY_CAPABILITY": {
@@ -308,6 +249,7 @@ _OBLIGATION_TRANSITIONS = {
         "NOT_APPLICABLE_BY_CAPABILITY",
     },
     "NOT_APPLICABLE_BY_CAPABILITY": {"NOT_APPLICABLE_BY_CAPABILITY"},
+    "SUPERSEDED_BY_REPLAN": {"SUPERSEDED_BY_REPLAN"},
 }
 _CONTRADICTION_TRANSITIONS = {
     "OPEN": {"OPEN", "RESOLVED", "EXPLAINED"},
@@ -328,6 +270,117 @@ def _is_source_mechanism_obligation(obligation: VerificationObligation) -> bool:
     return obligation.claim.strip().casefold() == _SOURCE_MECHANISM_OBLIGATION_CLAIM.casefold()
 
 
+def _is_source_action_obligation(obligation: VerificationObligation) -> bool:
+    """Identify any open Obligation whose answer must come from application code.
+
+    This is intentionally broader than the Runtime-owned source-coverage
+    Obligation above.  Planner-proposed intermediate questions such as source
+    file discovery must receive the same source Tool route, while their
+    lifecycle remains ordinary EvidenceSet/RCAState lifecycle.
+    """
+    text = " ".join(
+        str(getattr(obligation, field, "") or "")
+        for field in (
+            "claim", "evidence_requirement", "verification_question", "evidence_type",
+        )
+    ).casefold()
+    return any(marker in text for marker in (
+        "source evidence", "source code", "application source", "source file",
+        "source contains", "source inspection", "source pattern", "read_file",
+        "code behavior", "code-level", "code defect",
+    ))
+
+
+def _obligation_capability_gaps(proposal: dict[str, Any], capabilities: Any) -> tuple[str, ...]:
+    """Return capability boundaries for an otherwise valid obligation proposal.
+
+    This is a Runtime capability check, not a diagnosis rule.  The Planner may
+    describe an evidence question in natural language, but it cannot keep an
+    OPEN lifecycle for a structured evidence type whose only provider source is
+    already EMPTY/UNAVAILABLE/FAILED.
+    """
+    evidence_type = str(proposal.get("evidence_type", "") or "").casefold()
+    text = " ".join(
+        str(proposal.get(name, "") or "")
+        for name in ("evidence_type", "evidence_requirement", "verification_question")
+    ).casefold()
+    required: list[str] = []
+    if (
+        "log" in evidence_type
+        or "log" in text
+        or "runtime behavior" in text
+        or "runtime evidence" in text
+    ):
+        required.append("logs")
+    source_markers = (
+        "source evidence", "source code", "source_code", "application source",
+        "application_code", "source file", "source inspection", "source pattern",
+        "read_file", "code behavior", "code_behavior", "code defect",
+    )
+    # A log question may mention a "code-level" delay as a pattern to rule
+    # out. That still needs only the captured log capability; the phrase is
+    # not evidence that an application source workspace is required. Keep
+    # application_code fail-closed for explicit source/code evidence types or
+    # source markers, while allowing a non-log code-level question to retain
+    # the historical capability boundary.
+    source_required = any(
+        marker in evidence_type or marker in text for marker in source_markers
+    ) or (
+        "code-level" in text
+        and not any(
+            marker in evidence_type or marker in text
+            for marker in ("log", "runtime behavior", "runtime evidence")
+        )
+    )
+    if source_required:
+        # ``read_file`` is an executable Tool, not a CapabilitySnapshot key.
+        # Tool visibility is checked separately against the bound source
+        # registry; treating it as a capability here incorrectly converted a
+        # valid source obligation into NOT_APPLICABLE_BY_CAPABILITY.
+        required.append("application_code")
+    gaps = []
+    for capability in dict.fromkeys(required):
+        state = str(capabilities.capability_state(capability))
+        if state != "AVAILABLE":
+            gaps.append(capability)
+    return tuple(gaps)
+
+
+def _normalize_obligation_capability_status(
+    obligation: VerificationObligation,
+    capabilities: Any,
+) -> tuple[VerificationObligation, tuple[str, ...]]:
+    """Reconcile an existing open Obligation with newly observed capabilities.
+
+    Capability state can become EMPTY/FAILED after an Obligation was created
+    (for example, a captured log query may return no records).  Rehydrating
+    that stale OPEN item would make the Planner pursue an impossible fact until
+    no-progress or budget termination.  This changes only lifecycle
+    applicability; it does not assert a diagnosis or satisfy Evidence.
+    """
+    if obligation.status not in {"OPEN", "BLOCKED_BY_CAPABILITY"}:
+        return obligation, ()
+    gaps = _obligation_capability_gaps(
+        {
+            "evidence_type": obligation.evidence_type,
+            "evidence_requirement": obligation.evidence_requirement,
+            "verification_question": obligation.verification_question,
+        },
+        capabilities,
+    )
+    if not gaps:
+        return obligation, ()
+    return obligation.model_copy(update={
+        "status": "NOT_APPLICABLE_BY_CAPABILITY",
+        "supporting_evidence_ids": (),
+        "blocked_capabilities": tuple(dict.fromkeys(
+            (*obligation.blocked_capabilities, *gaps)
+        )),
+    }), gaps
+
+
+
+
 class ReviewProgressRequired(RuntimeError):
     """The bounded post-review loop tried to submit an unchanged candidate."""
 
@@ -336,18 +389,23 @@ class ConvergenceBudgetExhausted(RuntimeError):
     """A convergence response exhausted its bounded output envelope."""
 
 
-class DAGFinalizationBlocked(RuntimeError):
-    """The integrated DAG convergence predicate rejected finalization."""
+class FinalizationBlocked(RuntimeError):
+    """The canonical FinalizationPolicy rejected Candidate publication."""
+
+    def __init__(self, decision: FinalizationDecision):
+        self.decision = decision
+        super().__init__(", ".join(reason.code for reason in decision.reasons))
 
 
 class DiagnosisHarness:
     """Bounded CloudOps diagnosis runtime with a separate final-review boundary.
 
-    This is deliberately the lightweight diagnosis core. The older generic
-    AgentHarness remains the SWE compatibility path until Task B.
+    This is the sole CloudOps diagnosis runtime. SWE execution is isolated in
+    the sibling project and is not part of this import graph.
     """
 
-    def __init__(self, llm, review_llm=None, *, model: str = "", review_model: str = "",
+    def __init__(self, llm, review_llm=None, *, model: str = "", reflection_model: str = "",
+                 review_model: str = "", transport_profile: str = "semantic_plan",
                  config: DiagnosisHarnessConfig | None = None,
                  topology_path: str | Path | None = None, search_engine=None,
                  knowledge_store=None, domain_rag=None, static_graph=None,
@@ -355,8 +413,12 @@ class DiagnosisHarness:
         self.llm = llm
         self.review_llm = review_llm or llm
         self.model = model
+        self.reflection_model = reflection_model or model
         self.review_model = review_model
         self.config = config or DiagnosisHarnessConfig()
+        if transport_profile != "semantic_plan":
+            raise ValueError("incident Runtime requires structured interpretation/planning transport")
+        self.transport_profile = transport_profile
         # Optional semantic retrieval is an environment capability.  The
         # default CloudOps path still creates a task-scoped lexical index and
         # degrades explicitly when no semantic engine is injected.
@@ -373,17 +435,16 @@ class DiagnosisHarness:
         self,
         case: IncidentCase,
         *,
-        mode: Literal["legacy", "dag"] | None = None,
+        mode: Literal["baseline", "dag"] | None = None,
     ) -> IncidentRunResult:
         execution_mode = mode or self.config.execution_mode
-        if execution_mode not in {"legacy", "dag"}:
-            raise ValueError("mode must be legacy or dag")
+        if execution_mode not in {"baseline", "dag"}:
+            raise ValueError("mode must be baseline or dag")
         tools = CloudOpsSnapshotToolRegistry(
             case.runtime_data_dir, self.topology_path, search_engine=self.search_engine,
         )
-        # Keep this state aligned with the provider-facing registry projection;
-        # hidden repository primitives remain executable but are not advertised
-        # as Planner capabilities.
+        # Keep this state aligned with the provider-facing CloudOps registry;
+        # source-discovery tools are advertised only when the case binds code.
         source_workspace_available = bool(
             getattr(getattr(tools, "source_binding", None), "available", False)
         )
@@ -410,18 +471,55 @@ class DiagnosisHarness:
             tools.register(knowledge_tool)
         planner = NativeToolPlanner(
             self.llm, tools, self.model,
-            planner_state_envelope=self.config.features.planner_state_envelope,
+            public_fault_taxonomy=self.config.features.public_fault_taxonomy,
+            planner_contract_version=self.config.features.planner_contract_version,
+            transport_profile=self.transport_profile,
         )
-        reviewer = FinalReviewAgent(self.review_llm, self.review_model)
-        reflection_agent = IncidentReflectionAgent(self.llm, self.model)
+        provider_gateway = ProviderOperationalGateway(self.llm, transport_profile=self.transport_profile,
+            max_context_chars=self.config.max_context_chars,
+            max_request_input_tokens=self.config.max_request_input_tokens,
+            max_llm_calls=self.config.max_llm_calls)
+        planning_session = PlanningSession(planner, provider_gateway)
+
+        reviewer = FinalReviewAgent(
+            self.review_llm, self.review_model,
+            provider_gateway=provider_gateway.bind(self.review_llm, "review"),
+        )
+        reflection_agent = IncidentReflectionAgent(
+            self.llm, self.reflection_model,
+            provider_gateway=provider_gateway.bind(self.llm, "reflection"),
+        )
         trace = TraceRecorder(self.config.trace_dir, case.case_id)
+        asset_manifest_path = self.config.domain_asset_manifest_path
+        try:
+            domain_assets = DomainAssetCatalog.from_manifest(asset_manifest_path)
+            domain_registry = DomainSkillRegistry.from_manifest(asset_manifest_path)
+            trace.record("DOMAIN_ASSET_PARITY", {
+                "manifest_path": domain_assets.manifest_path,
+                "manifest_sha256": domain_assets.manifest_sha256,
+                "tool_count": len(domain_assets.tool_ids),
+                "skill_count": len(domain_assets.skill_ids),
+                "excluded_node_count": domain_assets.excluded_node_count,
+                "registry_skill_count": len(domain_registry.skills),
+            })
+        except (OSError, ValueError) as exc:
+            trace.record("DOMAIN_ASSET_PARITY_UNAVAILABLE", {
+                "manifest_path": asset_manifest_path,
+                "error_type": type(exc).__name__,
+                "reason": str(exc),
+            })
+            raise RuntimeError(
+                "the active CloudOps runtime requires the packaged DomainAssetManifest"
+            ) from exc
         deadline = RunDeadline(self.config.max_wall_time_seconds)
         state = AgentState(TaskSpec(
             task_id=case.case_id, issue=case.summary, repo_path=case.runtime_data_dir,
             repo_name=case.system, metadata={"task_kind": "incident", "namespace": case.namespace},
         ))
         observation_store = ObservationStore()
+        pending_capability_blocks: set[str] = set()
         evidence_memory = EvidenceMemory()
+        evidence_projector = EvidenceProjector()
         state.evidence = evidence_memory.pinned
         incident_projection = IncidentProjectionPolicy()
         context_manager = ContextManager(
@@ -430,22 +528,25 @@ class DiagnosisHarness:
             enable_model_selection=True,
             enable_budget_packing=self.config.features.context_manager,
             enable_lifecycle=self.config.features.context_manager,
-            enable_projection=self.config.features.context_manager,
+            enable_projection=self.config.features.context_projection_v2,
             projection_policy=incident_projection,
         )
-        hypotheses: list[IncidentHypothesis] = []
+        interpretation_view = ContextView("interpretation")
+        bootstrap_pending_observation_ids: tuple[str, ...] = ()
         actions: list[dict[str, Any]] = []
         rejected_actions: list[dict[str, Any]] = []
-        fingerprints: set[str] = set()
-        loop_guard = LoopGuard(
-            max_repeat=self.config.max_duplicate_actions,
-            max_no_progress=(
-                self.config.max_no_progress
-                if self.config.features.no_progress_detection else 1_000_000
-            ),
-        )
+
         tool_circuit = ToolCircuitBreaker(
             failure_threshold=self.config.tool_circuit_failure_threshold,
+        )
+        action_runtime = ActionRuntime(
+            tools, action_ledger=actions, circuit=tool_circuit,
+            snapshot_identity=f"frozen:{Path(case.runtime_data_dir).resolve()}",
+            retry_policy=RetryPolicy(
+                max_attempts=self.config.tool_retry_attempts,
+                base_delay_seconds=self.config.retry_base_delay_seconds,
+                max_delay_seconds=self.config.retry_max_delay_seconds,
+            ),
         )
         active_skill = ""
         prompt_tokens = completion_tokens = 0
@@ -459,11 +560,25 @@ class DiagnosisHarness:
         consecutive_reflection_no_delta = 0
         reflection_feedback = ""
         reflection_constraint = ""
+        runtime_action_constraint = ""
+        runtime_tool_visibility_override: tuple[str, ...] | None = None
         reflection_signatures: set[str] = set()
         reflection_trigger = ""
         duplicate_calls = 0
         blocked_tool_call_count = 0
         schema_repair_count = 0
+        provider_calls = 0
+        budget_rejected_attempts = 0
+        budget_rejection_keys: set[tuple[str, int, str]] = set()
+        schema_repair_calls = 0
+        provider_failures = 0
+        provider_contract_failures = 0
+        semantic_adjudication_failures = 0
+        token_accounting_error_count = 0
+        unattributed_prompt_total = 0
+        token_telemetry: list[dict[str, Any]] = []
+        provider_event_cursors: dict[str, int] = {}
+        provider_calls_by_stage: dict[str, int] = {}
         obligation_created_count = 0
         obligation_blocked_count = 0
         blocking_contradiction_count = 0
@@ -475,28 +590,80 @@ class DiagnosisHarness:
         llm_calls = 0
         planner_calls = 0
         planner_contract_retry_used = False
-        tool_contract_repairs = 0
+
         contract_repair_calls = 0
         review_calls = 0
+        # The cursor is initialized before the terminal-report review helper;
+        # candidate Review assigns the same cursor for each normal round.
+        review_record_cursor = 0
         termination_reason = ""
         run_started = time.monotonic()
         runtime_phase = "INIT"
         state_transition_count = 0
         converge_read_file_calls = 0
-        dag_harness = VerificationDAGHarnessAdapter() if execution_mode == "dag" else None
+        dag_harness = VerificationDAGHarnessAdapter()
         dag_state: VerificationDAGState | None = None
-        dag_graph: LangGraphVerificationAdapter | None = None
-        dag_action_registry: dict[str, tuple[Any, dict[str, Any], str]] = {}
-        dag_observations: dict[str, ToolObservation] = {}
-        dag_replan_pending = False
-        dag_task_sequence = 0
+        canonical_rca_state = RCAState(incident_id=case.case_id)
+
+        def active_hypothesis() -> IncidentHypothesis | None:
+            return canonical_rca_state.active_hypothesis_projection()
+
+        def hypothesis_history() -> tuple[IncidentHypothesis, ...]:
+            return canonical_rca_state.hypothesis_projections()
+
+        def obligation_projection() -> dict[str, VerificationObligation]:
+            return {
+                item.id: item.model_copy(deep=True)
+                for item in canonical_rca_state.obligations
+            }
+        # FinalizationPolicy is the canonical semantic publication boundary.
+        # Convergence remains operational telemetry and cannot authorize a
+        # Candidate independently.
+        last_convergence_decision = None
+        terminal_convergence_decision = None
+        evidence_pipeline = EvidencePipeline(
+            observation_store=observation_store,
+            evidence_memory=evidence_memory,
+            projector=evidence_projector,
+            deterministic_fact_adapters=("source_range_capture",),
+        )
+
+        # One admitted Evidence may answer more than one canonical
+        # Obligation.  Keep one relation record per (Evidence, Obligation)
+        # instead of overwriting the first relation by evidence_id alone.
+        projected_facts: dict[tuple[Any, ...], Any] = {}
+        evidence_admission_rejections = 0
+        evidence_sets: dict[tuple[str, str], EvidenceSet] = {}
+
         dag_task_metrics = {
             "planned": 0,
-            "satisfied": 0,
+            "completed": 0,
             "blocked": 0,
-            "contradicted": 0,
+            "failed": 0,
             "local_replans": 0,
         }
+
+        def project_obligation_ids_to_dag(reason: str) -> None:
+            """Project canonical Obligation IDs into execution state."""
+            nonlocal dag_state
+            if dag_state is None:
+                return
+            before = set(dag_state.obligation_ids)
+            dag_state = dag_harness.register_obligation_ids(
+                dag_state,
+                (item.id for item in canonical_rca_state.obligations),
+            )
+            trace.record("DAG_OBLIGATION_IDS_PROJECTED", {
+                "source": "rca_state_authority",
+                "reason": reason,
+                "registered_obligation_ids": sorted(
+                    set(dag_state.obligation_ids) - before
+                ),
+                "obligation_count": len(canonical_rca_state.obligations),
+                "open_critical_obligation_ids": list(
+                    canonical_rca_state.open_critical_obligation_ids
+                ),
+            })
 
         def transition_phase(target: str, reason: str, **metadata: Any) -> None:
             """Record the only Runtime-owned PLAN/REFLECT/FINALIZE/REVIEW edges."""
@@ -527,6 +694,7 @@ class DiagnosisHarness:
         dynamic_budget = DynamicBudgetController(
             model_capability,
             max_context_chars=self.config.max_context_chars,
+            max_request_input_tokens=self.config.max_request_input_tokens,
             max_total_tokens=self.config.max_total_tokens,
             max_llm_calls=self.config.max_llm_calls,
             max_wall_time_seconds=self.config.max_wall_time_seconds,
@@ -539,11 +707,13 @@ class DiagnosisHarness:
             hard_pressure_ratio=self.config.hard_pressure_ratio,
             started_at=state.started_at,
         )
+        provider_gateway.attempt_admission = dynamic_budget.api_attempt_rejection
         trace.record("INCIDENT_STARTED", {
             "case_id": case.case_id, "summary": case.summary, "system": case.system,
             "namespace": case.namespace, "evidence_sources": case.evidence_sources,
             "execution_mode": execution_mode,
             "context_projection_mode": self.config.context_projection_mode,
+            "tool_exposure_policy_version": self.config.tool_exposure_policy_version,
             "model_capability": model_capability.as_dict(),
             "terminal_reserve": dynamic_budget.terminal_reserve_payload(),
             "budget_lifecycle": budget_allocation.as_dict(),
@@ -601,23 +771,118 @@ class DiagnosisHarness:
                 "packed_tokens": prior_context.packed_tokens,
             })
 
-        def add_usage(usage_source, *, stage: str = "unknown", prompt_breakdown: dict[str, Any] | None = None) -> None:
+        def _optional_int(mapping: dict[str, Any], *keys: str) -> int | None:
+            for key in keys:
+                if key in mapping and mapping[key] is not None:
+                    try:
+                        return int(mapping[key])
+                    except (TypeError, ValueError):
+                        return None
+            return None
+
+        def _prompt_components(breakdown: dict[str, Any]) -> dict[str, int | None]:
+            explicit = breakdown.get("prompt_components") or {}
+            token_breakdown = dict(
+                breakdown.get("token_breakdown")
+                or breakdown.get("last_token_breakdown")
+                or {}
+            )
+            def first(*keys: str) -> int | None:
+                for key in keys:
+                    value = explicit.get(key, breakdown.get(key, token_breakdown.get(key)))
+                    if value is not None:
+                        try:
+                            return int(value)
+                        except (TypeError, ValueError):
+                            return None
+                return None
+            return {
+                "system_tokens": first("system_tokens", "system"),
+                "tool_schema_tokens": first("tool_schema_tokens", "tools", "tool_schema"),
+                "control_state_tokens": first("control_state_tokens", "control_state"),
+                "diagnostic_context_tokens": first("diagnostic_context_tokens", "diagnostic_context", "user"),
+            }
+
+        def record_provider_events(stage: str) -> None:
+            """Consume canonical gateway records once for every production role."""
+            nonlocal provider_calls, provider_failures, provider_contract_failures
+            records = [item for item in provider_gateway.records if item.role == stage]
+            cursor = provider_event_cursors.get(stage, 0)
+            fresh = records[cursor:]
+            provider_event_cursors[stage] = len(records)
+            for item in fresh:
+                provider_calls += item.attempt_count
+                provider_calls_by_stage[stage] = provider_calls_by_stage.get(stage, 0) + item.attempt_count
+                if item.status == "failed":
+                    if item.failure_layer == "transport_provider":
+                        provider_failures += 1
+                    elif item.failure_layer in {"parse", "contract_schema"}:
+                        provider_contract_failures += 1
+                trace.record("PROVIDER_CALL", {
+                    "role": item.role, "request_kind": item.request_kind,
+                    "turn_id": item.turn_id, "state_snapshot_hash": item.state_snapshot_hash,
+                    "request_sha256": item.request_sha256,
+                    "status": item.status, "failure_layer": item.failure_layer,
+                    "error_type": item.error_type, "attempt_count": item.attempt_count,
+                    "elapsed_seconds": item.elapsed_seconds, "usage": item.usage_dict,
+                    "attempt_details": item.attempt_details,
+                    "redacted": True,
+                })
+
+        def record_provider_failure(
+            stage: str,
+            *,
+            exc: BaseException | None = None,
+        ) -> str:
+            nonlocal provider_calls, provider_failures
+            nonlocal provider_contract_failures, semantic_adjudication_failures
+            failures_before = provider_failures
+            contract_before = provider_contract_failures
+            semantic_before = semantic_adjudication_failures
+            add_usage(self.llm, stage=stage, call_status="failed")
+            category = _provider_failure_category(exc) if exc is not None else "provider_transport_failure"
+            if (
+                category == "provider_transport_failure"
+                and provider_failures == failures_before
+            ):
+                provider_failures += 1
+            elif (
+                category == "provider_contract_failure"
+                and provider_contract_failures == contract_before
+            ):
+                provider_contract_failures += 1
+            elif (
+                category == "semantic_adjudication_failure"
+                and semantic_adjudication_failures == semantic_before
+            ):
+                semantic_adjudication_failures += 1
+            return category
+
+        def add_usage(usage_source, *, stage: str = "unknown", prompt_breakdown: dict[str, Any] | None = None,
+                      call_status: str = "completed") -> None:
             nonlocal prompt_tokens, completion_tokens, run_cost, cost_measured
+            nonlocal token_accounting_error_count, unattributed_prompt_total
             run_tokens_before = prompt_tokens + completion_tokens
-            usage = dict(getattr(usage_source, "usage", None) or {})
-            if not usage and hasattr(usage_source, "response"):
-                usage = dict(getattr(usage_source.response, "usage", None) or {})
-            if not usage and hasattr(usage_source, "last_usage"):
-                usage = dict(getattr(usage_source, "last_usage", None) or {})
-            actual_prompt_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
-            actual_completion_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+            role_records = [item for item in provider_gateway.records if item.role == stage]
+            fresh_records = role_records[provider_event_cursors.get(stage, 0):]
+            if not fresh_records:
+                return
+            usage = aggregate_provider_usage(fresh_records)
+            actual_prompt_tokens = _optional_int(usage, "prompt_tokens", "input_tokens")
+            actual_completion_tokens = _optional_int(usage, "completion_tokens", "output_tokens")
+            cached_tokens = _usage_token_value(
+                usage, "cached_tokens", "cache_read_input_tokens"
+            )
+            provider_overhead_tokens = _usage_token_value(
+                usage, "provider_overhead_tokens"
+            )
             raw_cost = usage.get("cost", usage.get("total_cost", usage.get("estimated_cost")))
             try:
                 actual_cost = None if raw_cost is None else float(raw_cost)
             except (TypeError, ValueError):
                 actual_cost = None
-            prompt_tokens += actual_prompt_tokens
-            completion_tokens += actual_completion_tokens
+            prompt_tokens += actual_prompt_tokens or 0
+            completion_tokens += actual_completion_tokens or 0
             if actual_cost is not None:
                 run_cost += max(0.0, actual_cost)
                 cost_measured = True
@@ -627,14 +892,40 @@ class DiagnosisHarness:
                 cost_used=run_cost,
             )
             breakdown = dict(prompt_breakdown or getattr(usage_source, "last_prompt_breakdown", {}) or {})
-            estimated_prompt_tokens = int(
-                breakdown.get("estimated_prompt_tokens", breakdown.get("last_estimated_prompt_tokens", 0)) or 0
+            components = _prompt_components(breakdown)
+            estimated_prompt_tokens = breakdown.get("estimated_prompt_tokens")
+            if estimated_prompt_tokens is None:
+                estimated_prompt_tokens = sum(value or 0 for value in components.values())
+            estimated_prompt_tokens = int(estimated_prompt_tokens or 0)
+            accounting_delta, accounting_error = _prompt_accounting_residual(
+                actual_prompt_tokens=actual_prompt_tokens,
+                components=components,
+                provider_overhead_tokens=provider_overhead_tokens,
             )
+            if accounting_delta is not None:
+                unattributed_prompt_total += accounting_delta
+            if accounting_error:
+                token_accounting_error_count += 1
+            telemetry = {
+                "stage": stage,
+                **components,
+                "provider_overhead_tokens": provider_overhead_tokens,
+                "unattributed_prompt_tokens": accounting_delta,
+                "token_accounting_error": accounting_error,
+                "accounting_delta": accounting_delta,
+                "estimated_prompt_tokens": estimated_prompt_tokens,
+                "actual_prompt_tokens": actual_prompt_tokens,
+                "actual_completion_tokens": actual_completion_tokens,
+                "cached_tokens": cached_tokens,
+                "call_status": call_status,
+            }
+            token_telemetry.append(telemetry)
+            record_provider_events(stage)
             dynamic_budget.record_actual_usage(
                 stage=stage,
                 estimated_prompt_tokens=estimated_prompt_tokens,
-                actual_prompt_tokens=actual_prompt_tokens if usage else None,
-                actual_completion_tokens=actual_completion_tokens if usage else None,
+                actual_prompt_tokens=actual_prompt_tokens,
+                actual_completion_tokens=actual_completion_tokens,
                 actual_cost=actual_cost,
             )
             after_state = dynamic_budget.decision(
@@ -649,8 +940,18 @@ class DiagnosisHarness:
                 "provider": model_capability.provider or type(self.llm).__name__,
                 "model": model_capability.model or self.model,
                 "estimated_prompt_tokens": estimated_prompt_tokens,
-                "actual_prompt_tokens": actual_prompt_tokens if usage else None,
-                "actual_completion_tokens": actual_completion_tokens if usage else None,
+                "actual_prompt_tokens": actual_prompt_tokens,
+                "actual_completion_tokens": actual_completion_tokens,
+                "cached_tokens": cached_tokens,
+                "system_tokens": components["system_tokens"],
+                "tool_schema_tokens": components["tool_schema_tokens"],
+                "control_state_tokens": components["control_state_tokens"],
+                "diagnostic_context_tokens": components["diagnostic_context_tokens"],
+                "provider_overhead_tokens": provider_overhead_tokens,
+                "unattributed_prompt_tokens": accounting_delta,
+                "token_accounting_error": accounting_error,
+                "accounting_delta": accounting_delta,
+                "call_status": call_status,
                 "actual_cost": actual_cost,
                 "run_tokens_before": run_tokens_before,
                 "run_tokens_after": prompt_tokens + completion_tokens,
@@ -660,16 +961,30 @@ class DiagnosisHarness:
                 "compaction_applied": after_state.state is not BudgetState.NORMAL,
                 "prior_pruned": False,
                 "rehydrated_evidence_count": 0,
-                "cache_hit": False,
+                "cache_hit": bool(cached_tokens and cached_tokens > 0),
                 "duplicate_blocked": False,
             })
-            if prompt_tokens + completion_tokens > self.config.max_total_tokens:
-                raise RuntimeError("max_total_tokens exceeded after LLM response")
-            if (
-                dynamic_budget.max_cost_per_incident is not None
-                and run_cost > dynamic_budget.max_cost_per_incident
-            ):
-                raise RuntimeError("max_cost_per_incident exceeded after LLM response")
+            capacity = ProgressPolicy.evaluate(operational_facts("post_usage"))
+            if capacity.action == "stop":
+                raise RuntimeError(capacity.reasons[0] + " exceeded after LLM response")
+
+        def operational_facts(boundary: str, **overrides) -> ProgressFacts:
+            """Project operational counters; policy owns continuation decisions."""
+            values = dict(
+                boundary=boundary, tokens=prompt_tokens + completion_tokens,
+                token_limit=self.config.max_total_tokens, llm_calls=llm_calls,
+                llm_limit=self.config.max_llm_calls, tool_calls=state.tool_calls,
+                tool_limit=self.config.max_tool_calls, steps=state.step,
+                step_limit=self.config.max_steps, cost=run_cost,
+                cost_limit=dynamic_budget.max_cost_per_incident,
+                review_calls=review_calls, review_limit=self.config.review_reserve_calls,
+                deadline_available=not deadline.expired(), no_progress_count=state.no_progress_count,
+                no_progress_limit=self.config.max_no_progress if self.config.features.no_progress_detection else 0,
+                repeated_count=state.repeated_actions,
+                repeat_limit=self.config.max_duplicate_actions,
+            )
+            values.update(overrides)
+            return ProgressFacts(**values)
 
         def budget_snapshot(boundary: str) -> Any:
             snapshot = budget.snapshot(
@@ -681,7 +996,7 @@ class DiagnosisHarness:
             # before the provider reaches its ratio threshold.  L5 applies a
             # Runtime-owned step boundary so the next planner call is bounded
             # convergence regardless of provider-side token accounting.
-            current = hypotheses[-1] if hypotheses else None
+            current = active_hypothesis()
             source_ready = bool(current is not None and (
                 current.source_mechanism_status in {"sufficient", "not_applicable"}
                 and not any(
@@ -690,10 +1005,12 @@ class DiagnosisHarness:
                     for item in current.verification_obligations
                 )
             ))
-            if snapshot.phase == "explore" and state.step + 1 >= CONVERGE_START_STEP:
-                if source_ready or not source_workspace_available:
-                    return replace(snapshot, phase="converge")
-                if boundary != "source_verify_hold":
+            phase = ProgressPolicy.evaluate(operational_facts(
+                "phase", phase=snapshot.phase, phase_start_step=CONVERGE_START_STEP,
+                verification_ready=source_ready or not source_workspace_available,
+            )).phase
+            if phase != snapshot.phase:
+                if phase == "source_verify" and boundary != "source_verify_hold":
                     trace.record("INVESTIGATION_PHASE_HELD", {
                         "boundary": boundary,
                         "requested_phase": "converge",
@@ -701,7 +1018,7 @@ class DiagnosisHarness:
                         "reason": "source_relevance_gate_open",
                         "source_mechanism_status": current.source_mechanism_status if current else "unknown",
                     })
-                return replace(snapshot, phase="source_verify")
+                return replace(snapshot, phase=phase)
             return snapshot
 
         def budget_payload(snapshot) -> dict[str, Any]:
@@ -710,6 +1027,8 @@ class DiagnosisHarness:
                 cost_used=run_cost,
             )
             return {
+                "remaining_steps": max(0, self.config.max_steps - snapshot.steps_used),
+                **dynamic_budget.model_status(llm_calls_used=llm_calls),
                 "steps_used": snapshot.steps_used,
                 "tool_calls_used": snapshot.tool_calls_used,
                 "llm_calls_used": snapshot.llm_calls_used,
@@ -726,15 +1045,62 @@ class DiagnosisHarness:
                 "terminal_reserve_tokens": dynamic_state.terminal_reserve_tokens,
                 "terminal_reserve_llm_calls": dynamic_state.terminal_reserve_llm_calls,
                 "budget_lifecycle": dynamic_budget.lifecycle_payload(
-                    tokens_used=prompt_tokens,
+                    tokens_used=prompt_tokens + completion_tokens,
                     llm_calls_used=llm_calls,
                 ),
             }
 
+        def request_budget_status() -> dict[str, Any]:
+            # Local ContextRequests/corrections are billed before the enclosing
+            # semantic turn publishes usage. Read the one physical Gateway ledger
+            # so the next request cannot reuse stale counters from that turn.
+            usage = aggregate_provider_usage(provider_gateway.records)
+            dynamic_budget.set_run_usage(
+                tokens_used=int(usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)),
+                llm_calls_used=sum(record.attempt_count for record in provider_gateway.records),
+                cost_used=float(usage.get("cost", 0.0)),
+            )
+            return {**dynamic_budget.model_status(),
+                    "remaining_steps": max(0, self.config.max_steps - state.step)}
+
+        def record_budget_rejection(stage: str, reason: str = "") -> None:
+            nonlocal budget_rejected_attempts
+            if stage in {"planner", "reflection", "review", "contract_repair"}:
+                rejection_key = (str(stage), int(state.step), str(reason or "local_budget_admission"))
+                if rejection_key in budget_rejection_keys:
+                    return
+                budget_rejection_keys.add(rejection_key)
+                budget_rejected_attempts += 1
+                token_telemetry.append({
+                    "stage": stage,
+                    "system_tokens": None,
+                    "tool_schema_tokens": None,
+                    "control_state_tokens": None,
+                    "diagnostic_context_tokens": None,
+                    "provider_overhead_tokens": None,
+                    "unattributed_prompt_tokens": None,
+                    "token_accounting_error": False,
+                    "accounting_delta": None,
+                    "estimated_prompt_tokens": None,
+                    "actual_prompt_tokens": None,
+                    "actual_completion_tokens": None,
+                    "cached_tokens": None,
+                    "call_status": "rejected",
+                })
+                trace.record("LLM_ATTEMPT_REJECTED", {
+                    "stage": stage,
+                    "reason": reason or "local_budget_admission",
+                    "failure_category": "run_budget_admission_exceeded",
+                    "provider_calls": 0,
+                    "call_status": "rejected",
+                })
+
         def admit(stage: str, *, count_llm: bool = False,
                   allow_targeted_recovery: bool = False) -> None:
             nonlocal llm_calls, planner_calls, review_calls
-            deadline.check()
+            capacity = ProgressPolicy.evaluate(operational_facts("admission", stage=stage))
+            if "global_deadline" in capacity.reasons:
+                raise TimeoutError("global run deadline exceeded")
             if stage == "review":
                 try:
                     dynamic_budget.begin_review(
@@ -751,6 +1117,7 @@ class DiagnosisHarness:
                         "message": str(exc),
                         "budget_lifecycle": lifecycle,
                     })
+                    record_budget_rejection(stage, str(exc))
                     raise RunBudgetAdmissionExceeded(replace(
                         dynamic_budget.decision(
                             stage,
@@ -794,33 +1161,27 @@ class DiagnosisHarness:
                     # therefore deliberately not admitted through this gate;
                     # callers either finalize an already-valid hypothesis or
                     # terminate INCONCLUSIVE.
-                    if (
-                        stage in {"planner", "tool", "reflection", "contract_repair"}
-                        and not allow_targeted_recovery
-                    ):
-                        raise RunBudgetAdmissionExceeded(dynamic_state)
-            if snapshot.tokens_used >= self.config.max_total_tokens:
-                raise RuntimeError("max_total_tokens exceeded")
-            if (
-                dynamic_budget.max_cost_per_incident is not None
-                and run_cost >= dynamic_budget.max_cost_per_incident
-            ):
-                raise RuntimeError("max_cost_per_incident exceeded")
-            if count_llm:
-                if stage == "review" and review_calls >= self.config.review_reserve_calls:
+            capacity = ProgressPolicy.evaluate(operational_facts(
+                "admission", stage=stage, count_llm=count_llm,
+                terminal_reserve_available="terminal reserve" not in dynamic_state.reason,
+                targeted_recovery_allowed=(allow_targeted_recovery or (stage == "planner"
+                    and dynamic_budget.lifecycle_phase == "consolidation")),
+            ))
+            if capacity.action == "stop":
+                reason = capacity.reasons[0]
+                if count_llm:
+                    record_budget_rejection(stage, reason)
+                if reason in {"terminal_reserve_protected", "review_call_reserve_exhausted"}:
                     raise RunBudgetAdmissionExceeded(dynamic_state)
-                if llm_calls >= self.config.max_llm_calls:
-                    raise RuntimeError("max_llm_calls exceeded")
+                raise RuntimeError(reason + " exceeded")
+            if count_llm:
                 llm_calls += 1
                 if stage == "planner":
                     planner_calls += 1
                 elif stage == "review":
                     review_calls += 1
                     dynamic_budget.set_review_calls_used(review_calls)
-            elif stage == "planner" and state.step >= self.config.max_steps:
-                raise RuntimeError("max_steps exceeded")
-            elif stage == "tool" and state.tool_calls >= self.config.max_tool_calls:
-                raise RuntimeError("max_tool_calls exceeded")
+
 
         def provider_timeout(configured: float) -> float:
             remaining = deadline.remaining()
@@ -830,18 +1191,12 @@ class DiagnosisHarness:
             return timeout
 
         def account_review_attempts(reviewer: FinalReviewAgent) -> None:
-            """Account every logical Review call, including a failed repair.
-
-            The first Review call is admitted before entering FinalReviewAgent;
-            subsequent calls are reported by the agent.  Counting from the
-            agent's pre-call counter also works when a repair raises before it
-            can return a ReviewDecision.
-            """
+            """Keep logical admission separate from ledger-derived physical usage."""
             nonlocal llm_calls, review_calls, schema_repair_count
+            nonlocal schema_repair_calls
             call_count = max(1, int(getattr(reviewer, "last_call_count", 1) or 1))
             extra_calls = call_count - 1
             llm_calls += extra_calls
-            review_calls += extra_calls
             attempts = tuple(getattr(reviewer, "last_attempts", ()) or ())
             repaired_calls = sum(1 for item in attempts if bool(item.get("schema_repair")))
             # If a hard process boundary kills the child before its state can
@@ -850,7 +1205,21 @@ class DiagnosisHarness:
             if repaired_calls == 0 and bool(getattr(reviewer, "last_repair_attempted", False)):
                 repaired_calls = 1
             schema_repair_count += repaired_calls
+            schema_repair_calls += repaired_calls
             dynamic_budget.set_review_calls_used(review_calls)
+            accounting = provider_gateway.accounting(
+                item for item in provider_gateway.records[review_record_cursor:]
+                if item.role == "review"
+            )
+            trace.record("REVIEW_ATTEMPTS_ACCOUNTED", {
+                "logical_review_calls": review_calls,
+                "round": review_rounds,
+                "role_invocations": call_count,
+                "physical_review_attempts": accounting["provider_attempts"],
+                "provider_accounting": accounting,
+                "schema_repair_calls": repaired_calls,
+                "schema_repairs_consume_logical_round": False,
+            })
 
         def materialize_review_attempts(reviewer: FinalReviewAgent, attempt_count: int,
                                         *, effective_timeout: float,
@@ -915,6 +1284,10 @@ class DiagnosisHarness:
                     "round": round_number,
                     "actions": list(reviewer.last_normalization_actions),
                 })
+            if getattr(reviewer, "last_symbol_normalizations", None):
+                trace.record("MODEL_OUTPUT_CANONICALIZED", {
+                    "role": "review", "events": reviewer.last_symbol_normalizations,
+                })
             if (
                 getattr(reviewer, "last_metadata_drops", None)
                 or getattr(reviewer, "last_metadata_warnings", None)
@@ -975,6 +1348,13 @@ class DiagnosisHarness:
             nonlocal capabilities
             previous_states = dict(capabilities.states)
             capabilities = capabilities.observe_tool(tool_name, observation)
+            if getattr(observation, "error_type", None) == "snapshot_unavailable":
+                trace.record("CAPABILITY_QUERY_BOUNDARY", {
+                    "tool": tool_name,
+                    "observation_id": observation.observation_id,
+                    "reason": "snapshot_query_missing; source_capability_preserved",
+                    "states": dict(capabilities.states),
+                })
             changed = {
                 key: value for key, value in capabilities.states.items()
                 if previous_states.get(key) != value
@@ -986,147 +1366,169 @@ class DiagnosisHarness:
                     "observation_id": observation.observation_id,
                 })
 
-        def execute_tool(tool, arguments: dict[str, Any], tool_name: str) -> ToolObservation:
+        def execute_tool(arguments: dict[str, Any], tool_name: str, *,
+                         permitted_tools: tuple[str, ...] | None = None,
+                         visible_tools: tuple[str, ...] | None = None,
+                         requested_for: InvestigationUse = InvestigationUse(),
+                         action_record: dict[str, Any] | None = None) -> ToolObservation | DuplicateAcquisition:
             nonlocal blocked_tool_call_count
-            if not tool_circuit.before_call(tool_name):
-                blocked_tool_call_count += 1
-                trace.record("TOOL_CALL_BLOCKED_BY_CIRCUIT", {
-                    "tool": tool_name,
-                    "health": tool_circuit.summary().get(tool_name, {}),
-                })
-                observation = tool_circuit.blocked_observation(tool_name)
-                update_capability_state(tool_name, observation)
-                return observation
-            admit("tool")
-            policy = RetryPolicy(
-                max_attempts=self.config.tool_retry_attempts,
-                base_delay_seconds=self.config.retry_base_delay_seconds,
-                max_delay_seconds=self.config.retry_max_delay_seconds,
-            )
-            try:
-                observation = execute_with_retry(
-                    tool, arguments, policy=policy,
+            available = tuple(capabilities.planner_tool_names(tools))
+            observation = action_runtime.execute(
+                ActionExecutionContext(
+                    action=ActionProposal(
+                        kind=ActionKind.TOOL, skill=active_skill, reason="runtime_execution",
+                        tool=tool_name, arguments=arguments,
+                    ),
+                    permitted_tool_names=available if permitted_tools is None else permitted_tools,
+                    visible_tool_names=available if visible_tools is None else visible_tools,
+                    capability_tool_names=available,
                     absolute_deadline=deadline.absolute_deadline,
-                    on_retry=lambda attempt, failed: trace.record("TOOL_RETRY", {
-                        "tool": tool_name, "attempt": attempt,
-                        "error_type": failed.error_type,
-                    }),
-                )
-            except Exception as exc:
-                trace.record("TOOL_EXECUTION_FAILED", {
-                    "tool": tool_name, "error_type": type(exc).__name__,
-                    "failure_category": self._failure_category(exc),
-                    "message": str(exc),
-                })
-                observation = ToolObservation(
-                    tool_name, False, str(exc),
-                    {
-                        "retryable": False,
-                        "failure_category": "execution_failure",
-                        "execution_failure": True,
-                    },
-                    type(exc).__name__, 0.0,
-                )
-                transition = tool_circuit.observe(tool_name, observation)
-                if transition == "opened":
-                    trace.record("TOOL_CIRCUIT_OPEN", {
-                        "tool": tool_name,
-                        "health": tool_circuit.summary().get(tool_name, {}),
-                    })
-                update_capability_state(tool_name, observation)
+                    requested_for=requested_for,
+                ),
+                before_execution=lambda: admit("tool"),
+                record=trace.record, action_record=action_record,
+            )
+            if isinstance(observation, DuplicateAcquisition):
                 return observation
-            normalization_action = (observation.metadata or {}).get("normalization_action")
-            if isinstance(normalization_action, dict):
-                trace.record("PATH_NORMALIZED", {
-                    "tool": tool_name,
-                    "normalization_action": dict(normalization_action),
-                    "observation_id": observation.observation_id,
-                })
-            transition = tool_circuit.observe(tool_name, observation)
-            if transition == "opened":
-                trace.record("TOOL_CIRCUIT_OPEN", {
-                    "tool": tool_name,
-                    "health": tool_circuit.summary().get(tool_name, {}),
-                })
+            if observation.error_type == "tool_circuit_open":
+                blocked_tool_call_count += 1
             update_capability_state(tool_name, observation)
             return observation
 
         def admit_tool_observation(
-            observation: ToolObservation,
-            *,
-            tool_name: str,
-            arguments: dict[str, Any],
+            observation: ToolObservation, *, tool_name: str,
+            arguments: dict[str, Any], obligation: Any | None = None,
+            hypothesis: Any | None = None,
         ) -> tuple[str, ...]:
-            """Commit one existing Harness observation to the shared ledger.
-
-            This helper is deliberately shared by legacy and DAG execution.
-            The DAG executor calls it from the LangGraph node, while the
-            legacy path calls it immediately after the direct Tool call.
-            Neither path gets a second Tool or Evidence implementation.
-            """
+            """Capture execution facts only; the next Planner proposes meaning."""
+            if isinstance(observation, DuplicateAcquisition):
+                return observation
             if observation.error_type == "tool_circuit_open":
-                mark_blocked_capability(tool_name)
+                pending_capability_blocks.add(tool_name)
+            observation = replace(observation, metadata={
+                **dict(observation.metadata or {}),
+                "acquisition_hypothesis_scopes": (
+                    evidence_projector.hypothesis_scope_fingerprints(hypothesis)
+                    if hypothesis is not None else ()
+                ),
+            })
             state.observations.append(observation)
             observation_store.add(observation)
             trace.record("TOOL_OBSERVATION", observation)
+            return ()
+
+        def admit_planner_evidence(proposal: EvidenceProposal, *, turn_input, proposal_index, hypothesis=None) -> tuple[str, ...]:
+            """Submit new admission or explicit reuse to the same EvidencePipeline."""
+            visible = set(turn_input.context_view.visible_observation_ids)
+            reusable = set(turn_input.context_view.visible_evidence_refs)
             admitted_ids: list[str] = []
-            if observation.ok:
-                target = self._target(arguments)
-                projected = incident_projection.compact_content(observation)
-                shared_evidence = evidence_memory.add_observation(
-                    observation,
-                    evidence_id=f"ev-{len(evidence_memory.pinned) + 1:03d}",
-                    kind=str(observation.metadata.get("context_kind") or "OBSERVATION"),
-                    source=tool_name,
-                    summary=projected,
-                    excerpt=projected,
-                    target=target,
-                    tags=["task_kind:incident"],
-                    enforce_admission=self.config.features.evidence_lifecycle,
-                    deduplicate=self.config.features.evidence_lifecycle,
+            hypothesis = hypothesis or active_hypothesis()
+            proposal = proposal.model_copy(update={"hypothesis_id": evidence_projector.hypothesis_id(hypothesis)})
+            try:
+                if proposal.evidence_ref is not None:
+                    evidence = evidence_memory.get(proposal.evidence_ref)
+                    if evidence is None or evidence.evidence_id not in reusable:
+                        raise EvidenceProposalError("proposal requires visible canonical Evidence")
+                    observation_id = evidence.raw_observation_id
+                else:
+                    if len(proposal.observation_refs) != 1 or proposal.observation_refs[0] not in visible:
+                        raise EvidenceProposalError("proposal requires one visible Observation")
+                    observation_id = proposal.observation_refs[0]
+                observation = observation_store.get(observation_id)
+                if observation is None or not observation.ok:
+                    raise EvidenceProposalError("proposal requires a successful stored Observation")
+                obligation = canonical_rca_state.obligation(proposal.obligation_id)
+            except (EvidenceProposalError, RCAStateError, ValueError) as exc:
+                trace.record("EVIDENCE_PROPOSAL_REJECTED", {
+                    "proposal_index": proposal_index, "obligation_id": proposal.obligation_id,
+                    "observation_refs": list(proposal.observation_refs), "reason": str(exc),
+                    "reason_code": "planner_evidence_binding_invalid",
+                })
+                return ()
+            tool_name = observation.tool
+            target = self._target(dict(observation.metadata.get("arguments") or {}))
+            projected = incident_projection.compact_content(observation)
+            evidence_id = f"ev-{len(evidence_memory.pinned) + 1:03d}"
+            trace.record("EVIDENCE_PROPOSAL", {
+                "observation_id": observation.observation_id,
+                "obligation_id": str(getattr(obligation, "id", None) or getattr(obligation, "obligation_id", "") or ""),
+                **proposal.model_dump(mode="json"),
+            })
+            try:
+                relation_input = dict(
+                    proposal=proposal, obligation=obligation, hypothesis=hypothesis,
+                    incident_id=case.case_id, existing_facts=tuple(projected_facts.values()),
+                    rca_state=canonical_rca_state, hypothesis_scopes=(
+                        evidence_projector.hypothesis_scope_fingerprints(hypothesis)
+                        if hypothesis is not None else None
+                    ),
                 )
-                if shared_evidence is not None:
-                    admitted_ids.append(shared_evidence.evidence_id)
-                    state.no_progress_count = 0
-                    consecutive_reflection_no_delta = 0
-                    item = IncidentEvidence(
-                        evidence_id=shared_evidence.evidence_id,
-                        source=shared_evidence.source,
-                        target=shared_evidence.target or target,
-                        summary=shared_evidence.summary,
-                        observation_id=(
-                            shared_evidence.raw_observation_id
-                            or observation.observation_id
-                        ),
+                if proposal.evidence_ref is not None:
+                    pipeline_result = evidence_pipeline.reuse(
+                        **relation_input, reusable_evidence_ids=reusable,
                     )
-                    trace.record("EVIDENCE_ADDED", item)
+                else:
+                    pipeline_result = evidence_pipeline.admit(
+                        observation, **relation_input, evidence_id=evidence_id,
+                        visible_observation_ids=visible, evidence_kwargs={
+                            "kind": str(observation.metadata.get("context_kind") or "OBSERVATION"),
+                            "source": tool_name,
+                            "summary": projected,
+                            "excerpt": projected,
+                            "target": target,
+                            "tags": ["task_kind:incident"],
+                            "enforce_admission": self.config.features.evidence_lifecycle,
+                            "deduplicate": self.config.features.evidence_lifecycle,
+                        },
+                    )
+            except (EvidencePipelineError, ValueError) as exc:
+                trace.record("EVIDENCE_PROPOSAL_REJECTED", {
+                    "proposal_index": proposal_index, "obligation_id": proposal.obligation_id,
+                    "observation_id": observation.observation_id,
+                    "tool": tool_name,
+                    "reason_code": getattr(exc, "code", "proposal_validation_failed"),
+                    "reason": str(exc),
+                })
+                return ()
+            if pipeline_result.duplicate:
+                trace.record("EVIDENCE_PROPOSAL_DUPLICATE", {
+                    "observation_id": observation.observation_id,
+                    "obligation_id": obligation.id,
+                    "evidence_id": pipeline_result.evidence_id,
+                })
+                return (pipeline_result.evidence_id,)
+            shared_evidence = evidence_memory.evidence_for_observation(
+                observation.observation_id
+            )
+            projected_fact = pipeline_result.projected_fact
+            if shared_evidence is not None and projected_fact is not None:
+                admitted_ids.append(shared_evidence.evidence_id)
+                relationship_key = evidence_relationship_key(projected_fact)
+                projected_facts[relationship_key] = projected_fact
+                trace.record("EVIDENCE_PROJECTED", {
+                    **projected_fact.model_dump(mode="json"),
+                    "relationship_key": list(relationship_key),
+                })
+                item = IncidentEvidence(
+                    evidence_id=shared_evidence.evidence_id,
+                    source=shared_evidence.source,
+                    target=shared_evidence.target or target,
+                    summary=shared_evidence.summary,
+                    observation_id=(
+                        shared_evidence.raw_observation_id
+                        or observation.observation_id
+                    ),
+                )
+                trace.record("EVIDENCE_REUSED" if proposal.evidence_ref else "EVIDENCE_ADDED", item)
+                qualify_current_evidence_set(
+                    obligation,
+                    hypothesis,
+                    reason="planner_evidence_admitted",
+                )
+
             return tuple(admitted_ids)
 
-        def execute_dag_task(task: VerificationTask) -> VerificationTaskExecution:
-            """LangGraph callback that crosses back into the existing Harness."""
-            entry = dag_action_registry.get(task.task_id)
-            if entry is None:
-                raise RuntimeError(f"DAG task has no registered Harness action: {task.task_id}")
-            _, arguments, tool_name = entry
-            observation = execute_tool(tools.get(tool_name), arguments, tool_name)
-            state.tool_calls += 1
-            admitted_ids = admit_tool_observation(
-                observation, tool_name=tool_name, arguments=arguments,
-            )
-            dag_observations[task.task_id] = observation
-            if admitted_ids:
-                return VerificationTaskExecution(
-                    task_id=task.task_id,
-                    status="SATISFIED",
-                    evidence_ids=admitted_ids,
-                )
-            return VerificationTaskExecution(task_id=task.task_id, status="BLOCKED")
 
-        if execution_mode == "dag":
-            dag_graph = LangGraphVerificationAdapter(
-                dag_harness,
-                execute_dag_task,
-            )
 
         def incident_evidence() -> tuple[IncidentEvidence, ...]:
             """Project the shared ledger only at Review/serialization boundaries."""
@@ -1148,6 +1550,80 @@ class DiagnosisHarness:
                 )
                 for item in evidence_memory.pinned
             )
+
+        def record_semantic_decision(selection, prior_hypothesis, committed_hypothesis) -> None:
+            """Persist model meaning after the whole semantic transaction validates.
+
+            Evidence bodies and provenance stay in their existing stores.  This
+            journal only records the model's relationship-scoped interpretation
+            plus canonical refs, so a later turn can recover meaning without a
+            second summarizer call or a second semantic owner.
+            """
+            nonlocal canonical_rca_state
+            facts = tuple(projected_facts.values())
+            interpretations: list[SemanticEvidenceRecord] = []
+            for proposal in tuple(getattr(selection, "evidence_proposals", ()) or ()):
+                if proposal.evidence_ref:
+                    evidence = evidence_memory.get(proposal.evidence_ref)
+                else:
+                    ref = proposal.observation_refs[0] if proposal.observation_refs else ""
+                    evidence = evidence_memory.evidence_for_observation(ref)
+                if evidence is None:
+                    # Invalid/unadmitted proposals never become canonical
+                    # semantic history; the admission path already recorded
+                    # their rejection.
+                    continue
+                candidates = [
+                    fact for fact in facts
+                    if fact.evidence_id == evidence.evidence_id
+                    and fact.obligation_id == proposal.obligation_id
+                    and fact.hypothesis_id == evidence_projector.hypothesis_id(committed_hypothesis)
+                ]
+                fact = candidates[-1] if candidates else None
+                if fact is None:
+                    # A duplicate/no-op proposal has no newly admitted
+                    # relationship to journal; the prior canonical record is
+                    # already recoverable by its Evidence ref.
+                    continue
+                interpretations.append(SemanticEvidenceRecord(
+                    evidence_id=evidence.evidence_id,
+                    observation_id=evidence.raw_observation_id or evidence.evidence_id,
+                    semantic_claim=proposal.semantic_claim,
+                    hypothesis_relation=proposal.hypothesis_relation,
+                    obligation_relation=proposal.relation,
+                    covered_fact_slots=tuple(getattr(fact, "covered_fact_slots", ()) or proposal.covered_fact_slots),
+                    reason=proposal.reason,
+                    rationale=proposal.rationale,
+                    source_spans=tuple(proposal.source_spans),
+                ))
+            transition = getattr(selection, "hypothesis_transition", None)
+            kind = transition.kind if transition is not None else "KEEP_CURRENT"
+            reason = " ".join(str(getattr(selection, "reason", "") or "").split()).strip()
+            if not reason:
+                reason = "semantic decision retained without additional hypothesis rationale"
+            changed_ids = tuple(
+                dict.fromkeys(
+                    str(item.obligation_id)
+                    for item in (getattr(transition, "obligation_dispositions", ()) or ())
+                    if str(item.obligation_id)
+                )
+            )
+            record = SemanticDecisionRecord(
+                record_id=f"sem-{len(canonical_rca_state.semantic_records) + 1:04d}",
+                state_version=canonical_rca_state.event_count,
+                transition_kind=kind,
+                hypothesis_id=evidence_projector.hypothesis_id(committed_hypothesis),
+                hypothesis_revision=int(getattr(committed_hypothesis, "revision", 0) or 0),
+                hypothesis_claim=str(getattr(committed_hypothesis, "claim", "") or ""),
+                change_reason=reason,
+                evidence=tuple(interpretations),
+                changed_obligation_ids=changed_ids,
+            )
+            canonical_rca_state = canonical_rca_state.reduce({
+                "kind": "ADD_SEMANTIC_RECORD",
+                "payload": {"record": record.model_dump(mode="json")},
+            })
+            trace.record("SEMANTIC_DECISION_RECORDED", record.model_dump(mode="json"))
 
         def source_evidence_ids() -> tuple[str, ...]:
             """Return canonical CODE Evidence from verified source-reading tools."""
@@ -1224,18 +1700,221 @@ class DiagnosisHarness:
                 "source_evidence_ids": sorted(canonical_by_id),
             }
 
-        obligation_state: dict[str, VerificationObligation] = {}
+        # Provider payloads may contain broad prose gaps. They are retained for
+        # audit and convergence diagnostics
+        # but are never admitted as canonical obligations or closure signals.
+        unstructured_obligation_gaps: tuple[str, ...] = ()
 
-        def _obligation_id(claim: str) -> str:
-            return "obl-" + sha1(" ".join(str(claim).split()).encode("utf-8")).hexdigest()[:10]
+        def reduce_runtime_hypothesis(
+            proposed: IncidentHypothesis, *, reason: str,
+        ) -> IncidentHypothesis:
+            """Commit a Runtime-normalized semantic snapshot through RCAState.
+
+            Provider objects are proposals. Every accepted semantic change is
+            reduced here before consumers receive a detached projection.
+            """
+            nonlocal canonical_rca_state
+            try:
+                for evidence in evidence_memory.pinned:
+                    if evidence.evidence_id not in canonical_rca_state.evidence_ids:
+                        canonical_rca_state = canonical_rca_state.reduce({
+                            "kind": "LINK_EVIDENCE",
+                            "payload": {"evidence_id": evidence.evidence_id},
+                        })
+                canonical_by_id = {
+                    item.id: item for item in canonical_rca_state.obligations
+                }
+                normalized_obligations = []
+                for item in proposed.verification_obligations:
+                    current = canonical_by_id.get(item.id)
+                    if current is None:
+                        raise RCAStateError(
+                            f"hypothesis references an unadmitted Obligation: {item.id}"
+                        )
+                    elif current != item:
+                        # Terminal/capability decisions are Runtime-owned. A
+                        # stale Planner projection cannot reopen them.
+                        if current.status in {
+                            "SATISFIED", "SUPERSEDED_BY_REPLAN",
+                        } and item.status != current.status:
+                            item = current
+                        elif current.status == "BLOCKED_BY_CAPABILITY" and item.status == "OPEN":
+                            item = current
+                        else:
+                            canonical_rca_state = canonical_rca_state.reduce({
+                                "kind": "UPDATE_OBLIGATION",
+                                "payload": {
+                                    "obligation_id": item.id,
+                                    "status": item.status,
+                                    "supporting_evidence_ids": list(item.supporting_evidence_ids),
+                                    "blocked_capabilities": list(item.blocked_capabilities),
+                                },
+                            })
+                            current = canonical_rca_state.obligation(item.id)
+                    normalized_obligations.append(current)
+                normalized = proposed.model_copy(update={
+                    "verification_obligations": tuple(normalized_obligations),
+                })
+                canonical_rca_state = canonical_rca_state.reduce({
+                    "kind": "SET_CONTRADICTIONS",
+                    "payload": {
+                        "contradictions": [
+                            item.model_dump() for item in normalized.contradictions
+                        ],
+                    },
+                })
+                canonical_rca_state = canonical_rca_state.reduce({
+                    "kind": "SET_HYPOTHESIS",
+                    "payload": {"hypothesis": normalized.model_dump()},
+                })
+            except RCAStateError as exc:
+                trace.record("RCA_STATE_REJECTED", {
+                    "reason": reason,
+                    "error": str(exc),
+                })
+                raise RuntimeError(f"RCAState rejected semantic update: {exc}") from exc
+            project_obligation_ids_to_dag(reason)
+            committed = canonical_rca_state.active_hypothesis_projection()
+            if committed is None:
+                raise RuntimeError("RCAState did not commit an active hypothesis")
+            trace.record("RCA_STATE_UPDATED", {
+                "source": "rca_state_reducer",
+                "reason": reason,
+                "incident_id": case.case_id,
+                "event_count": canonical_rca_state.event_count,
+                "obligation_count": len(canonical_rca_state.obligations),
+                "task_count": len(dag_state.tasks) if dag_state is not None else 0,
+                "hypothesis_count": len(canonical_rca_state.hypotheses),
+                "open_critical_obligation_ids": list(
+                    canonical_rca_state.open_critical_obligation_ids
+                ),
+            })
+            return committed
+
+        def qualify_current_evidence_set(
+            obligation: Any,
+            hypothesis: Any | None = None,
+            *,
+            reason: str,
+        ) -> EvidenceSet:
+            """Aggregate admitted projected facts and apply the Runtime rule."""
+            nonlocal canonical_rca_state
+            obligation_id = str(
+                getattr(obligation, "id", None)
+                or getattr(obligation, "obligation_id", "")
+                or ""
+            )
+            hypothesis_id = str(
+                getattr(hypothesis, "hypothesis_id", None)
+                or getattr(hypothesis, "id", None)
+                or ""
+            )
+            allowed_scopes = set(
+                evidence_projector.hypothesis_scope_fingerprints(hypothesis)
+            )
+            facts = tuple(
+                item for item in projected_facts.values()
+                if item.obligation_id == obligation_id
+                and (not allowed_scopes or item.hypothesis_fingerprint in allowed_scopes)
+            )
+            completion_prerequisites_met = True
+            completion_blocker = ""
+            # Source line coverage is a deterministic prerequisite. It can
+            # veto coverage completion but cannot create semantic coverage.
+            if _is_source_mechanism_obligation(obligation):
+                source_capability_gaps = []
+                if not source_workspace_available:
+                    source_capability_gaps.append("source_workspace")
+                if "application_code" not in case.evidence_sources:
+                    source_capability_gaps.append("application_code")
+                if "read_file" not in available_code_tools:
+                    source_capability_gaps.append("read_file")
+                source_claims = tuple(getattr(hypothesis, "source_claims", ()) or ())
+                source_coverage = evaluate_source_claims(source_claims)
+                if (
+                    not source_capability_gaps
+                    and source_claims
+                    and not source_coverage["all_claims_covered"]
+                ):
+                    completion_prerequisites_met = False
+                    completion_blocker = (
+                        "declared source claim lacks complete deterministic line coverage"
+                    )
+            try:
+                evidence_set = evidence_pipeline.qualify(
+                    obligation=obligation,
+                    evidence=facts,
+                    hypothesis_id=hypothesis_id,
+                    hypothesis_scopes=(
+                        allowed_scopes if hypothesis is not None else None
+                    ),
+                    completion_prerequisites_met=completion_prerequisites_met,
+                    completion_blocker=completion_blocker,
+                    resolved_contradiction_ids=(
+                        item.evidence_id
+                        for item in canonical_rca_state.contradictions
+                        if item.status != "OPEN"
+                    ),
+                )
+            except EvidencePipelineError as exc:
+                trace.record("EVIDENCE_PIPELINE_REJECTED", {
+                    "obligation_id": obligation_id,
+                    "reason_code": exc.code,
+                    "reason": str(exc),
+                })
+                evidence_set = evidence_pipeline.qualify(
+                    obligation=obligation,
+                    evidence=(),
+                    hypothesis_id=hypothesis_id,
+                    hypothesis_scopes=(
+                        allowed_scopes if hypothesis is not None else None
+                    ),
+                )
+            evidence_sets[(obligation_id, hypothesis_id)] = evidence_set
+            trace.record("EVIDENCE_SET_QUALIFIED", {
+                "obligation_id": obligation_id,
+                "hypothesis_id": hypothesis_id,
+                "reason": reason,
+                **evidence_set.model_dump(mode="json"),
+            })
+            try:
+                rca_events = evidence_pipeline.propose_rca_events(
+                    evidence_set,
+                    facts=facts,
+                    state=canonical_rca_state,
+                )
+                for event in rca_events:
+                    canonical_rca_state = canonical_rca_state.reduce(event)
+                    if event.kind == "UPDATE_OBLIGATION":
+                        trace.record("OBLIGATION_SATISFIED", {
+                            "source": "evidence_pipeline_coverage",
+                            "obligation_id": obligation_id,
+                            "evidence_ids": list(evidence_set.supporting_evidence_ids),
+                        })
+                # Refresh only the DAG's canonical Obligation-ID references.
+                # Task serialization cannot write semantic lifecycle state.
+                project_obligation_ids_to_dag("evidence_set_qualification")
+            except RCAStateError as exc:
+                trace.record("EVIDENCE_SET_STATE_REJECTED", {
+                    "obligation_id": obligation_id,
+                    "reason": str(exc),
+                })
+            return evidence_set
+
+        def completion_provenance_profiles():
+            from debug_assistant.tools.provenance import registry_provenance_profiles, observation_provenance_profiles
+            return registry_provenance_profiles(tools, capabilities.planner_tool_names(tools)) + observation_provenance_profiles(
+                [{'tool': obs.tool, 'ok': obs.ok, 'metadata': obs.metadata} for obs in observation_store.all()])
 
         def build_hypothesis(selection) -> IncidentHypothesis:
-            """Normalize legacy planner fields into one reasoning state."""
+            """Normalize one canonical Planner proposal into RCAState input."""
+            nonlocal canonical_rca_state
             nonlocal previous_hypothesis, obligation_created_count
             nonlocal obligation_blocked_count, blocking_contradiction_count
-            known_ids = {item.evidence_id for item in evidence_memory.pinned}
-            old = hypotheses[-1] if hypotheses else None
+            nonlocal unstructured_obligation_gaps
 
+            known_ids = {item.evidence_id for item in evidence_memory.pinned}
+            old = active_hypothesis()
             # Source-obligation lifecycle is Runtime-owned.  The provider may
             # propose a status for audit purposes, but it cannot close or waive
             # this obligation.  Keep the capability decision deterministic and
@@ -1256,37 +1935,196 @@ class DiagnosisHarness:
             source_capability_available = not source_capability_gaps
 
             supplied = list(selection.verification_obligations or ())
+            current_obligations = obligation_projection()
             next_obligations: dict[str, VerificationObligation] = {}
-            for obligation in supplied:
-                if _is_source_mechanism_obligation(obligation):
-                    # Providers may regenerate the source row with a fresh ID.
-                    # The claim, not the model-chosen ID, is the canonical key.
-                    canonical_source = next(
-                        (
-                            item for item in (*next_obligations.values(), *obligation_state.values())
-                            if _is_source_mechanism_obligation(item)
-                        ),
-                        None,
+            rejected_gaps: list[str] = []
+
+            selection_hypothesis_fingerprints = set(
+                evidence_projector.hypothesis_scope_fingerprints(selection)
+            )
+            for proposal in supplied:
+                try:
+                    canonical_proposal = ObligationAdmissionPolicy.canonicalize(
+                        proposal,
+                        related_hypothesis=selection.current_hypothesis,
                     )
-                    if canonical_source is not None and obligation.id != canonical_source.id:
-                        trace.record("SOURCE_OBLIGATION_ID_NORMALIZED", {
-                            "proposed_id": obligation.id,
-                            "canonical_id": canonical_source.id,
-                            "reason": "runtime_owned_source_obligation_identity",
+                except ObligationProposalError as exc:
+                    claim = " ".join(str(getattr(proposal, "claim", "") or "").split()).strip()
+                    if claim:
+                        rejected_gaps.append(claim)
+                    trace.record("OBLIGATION_PROPOSAL_REJECTED", {
+                        "claim": claim,
+                        "reason": "non_atomic_obligation",
+                        "missing_fields": list(exc.missing_fields),
+                    })
+                    continue
+                claim = canonical_proposal.claim
+                target_component = canonical_proposal.target_component
+                verification_question = canonical_proposal.verification_question
+                evidence_type = canonical_proposal.evidence_type
+                trace.record("OBLIGATION_PROPOSAL_CANONICALIZED", {
+                    "claim": claim,
+                    "target_component": target_component,
+                    "related_hypothesis": canonical_proposal.related_hypothesis,
+                    "active_hypothesis_component": selection.candidate_component,
+                    "lifecycle_fields_runtime_owned": True,
+                    "reason": "planner_proposal_to_runtime_identity_inputs",
+                })
+                verification_key = build_verification_key(
+                    target_component=target_component,
+                    verification_question=verification_question,
+                    evidence_type=evidence_type,
+                    related_hypothesis=selection.current_hypothesis,
+                )
+                matching_priors = tuple(
+                    item for item in (*next_obligations.values(), *current_obligations.values())
+                    if item.canonical_verification_key
+                    and item.canonical_verification_key == verification_key
+                )
+
+                # Prefer the live instance when an older superseded branch
+                # and a reactivated instance share the same structured key.
+                prior = next(
+                    (
+                        item for item in matching_priors
+                        if item.status != "SUPERSEDED_BY_REPLAN"
+                    ),
+                        matching_priors[0] if matching_priors else None,
+                )
+
+                if prior is not None:
+                    duplicate_admission = ObligationAdmissionPolicy.admit(
+                        proposal,
+                        provenance_profiles=completion_provenance_profiles(), related_hypothesis=selection.current_hypothesis,
+                        existing_obligations=matching_priors,
+                    )
+                    if duplicate_admission.status == "REJECTED":
+                        trace.record("OBLIGATION_PROPOSAL_REJECTED", {
+                            "claim": claim, "reason": "common_admission_rejected",
+                            "admission_reasons": list(duplicate_admission.reasons),
                         })
-                        obligation = obligation.model_copy(update={"id": canonical_source.id})
-                prior = obligation_state.get(obligation.id)
+                        continue
+
+                if prior is not None and prior.status == "SUPERSEDED_BY_REPLAN":
+                    # A superseded branch is historical state, not a live
+                    # answer to the same structured question. Reusing its
+                    # terminal ID would silently project a non-open
+                    # obligation and make the Planner repeat the same Action
+                    # forever. Reactivate the structured question as a new
+                    # Runtime instance while keeping natural-language
+                    # hypothesis prose out of the identity key.
+                    trace.record("OBLIGATION_REACTIVATION", {
+                        "previous_obligation_id": prior.id,
+                        "verification_key": verification_key,
+                        "reason": "superseded_branch_reintroduced_same_structured_question",
+                    })
+                    prior = None
+                existing_ids = {
+                    item.id for item in (
+                        *canonical_rca_state.obligations,
+                        *next_obligations.values(),
+                        *current_obligations.values(),
+                    )
+                }
+                obligation_identity = verification_key
+                if (
+                    prior is None
+                    and obligation_id_for_key(obligation_identity) in existing_ids
+                ):
+                    identity_disambiguator = (
+                        f"runtime_instance:{obligation_created_count + 1}"
+                    )
+                else:
+                    identity_disambiguator = ""
+                if prior is None:
+                    source_requirement = _is_source_mechanism_obligation(canonical_proposal)
+                    admission_capability_gaps = (
+                        tuple(source_capability_gaps) if source_requirement
+                        else _obligation_capability_gaps(canonical_proposal.model_dump(), capabilities)
+                    )
+                    admission = ObligationAdmissionPolicy.admit(
+                        proposal,
+                        provenance_profiles=completion_provenance_profiles(),
+                        related_hypothesis=selection.current_hypothesis,
+                        existing_obligations=tuple(
+                            item for item in (
+                                *next_obligations.values(), *current_obligations.values()
+                            )
+                            if item.status != "SUPERSEDED_BY_REPLAN"
+                        ),
+                        critical=True,
+                        required_tools=("read_file",) if source_requirement else (),
+                        available_tools=capabilities.planner_tool_names(tools),
+                        capability_gaps=admission_capability_gaps,
+                        identity_disambiguator=identity_disambiguator,
+                    )
+                    if not admission.admitted:
+                        trace.record("OBLIGATION_PROPOSAL_REJECTED", {
+                            "claim": claim,
+                            "reason": "common_admission_rejected",
+                            "admission_reasons": list(admission.reasons),
+                            "capability_gaps": list(admission_capability_gaps),
+                            "capability_states": {name: capabilities.capability_state(name)
+                                                  for name in admission_capability_gaps},
+                        })
+                        continue
+                    canonical_rca_state = canonical_rca_state.reduce(admission.accepted_event())
+                    obligation = canonical_rca_state.obligation(admission.obligation_id)
+                else:
+                    # A follow-up binds to an existing canonical question; it
+                    # does not replace its identity with Provider metadata.
+                    obligation = canonical_rca_state.obligation(prior.id)
+                proposed_status = next(
+                    (
+                        value for path, value in getattr(
+                            selection, "planner_control_rejections", ()
+                        )
+                        if path.endswith(".status")
+                    ),
+                    "OPEN",
+                )
+                # Planner status/evidence projections are never lifecycle
+                # writes. SATISFIED can only be produced by the EvidenceSet
+                # completion reducer below.
+                if prior is not None and prior.status != "OPEN":
+                    # Planner proposals can restate a semantic question but
+                    # cannot reopen or supersede a Runtime-owned lifecycle.
+                    if prior.status == "SATISFIED":
+                        if proposed_status == "OPEN":
+                            trace.record("OBLIGATION_REOPEN_REJECTED", {
+                                "obligation_id": prior.id,
+                                "from": prior.status,
+                                "to": "OPEN",
+                                "reason": "terminal_runtime_state_preserved",
+                            })
+                        else:
+                            trace.record("OBLIGATION_TERMINAL_REPLAY_REJECTED", {
+                                "obligation_id": prior.id,
+                                "status": proposed_status,
+                                "reason": "terminal_runtime_state_preserved",
+                            })
+                    obligation = prior
                 if _is_source_mechanism_obligation(obligation):
-                    proposed_status = obligation.status
                     if source_capability_available:
+                        # Strict source verification may only preserve a
+                        # SATISFIED status that was already produced by the
+                        # shared EvidenceSet completion path.  Merely having
+                        # a read_file Evidence or complete source coverage is
+                        # a deterministic prerequisite; it is not semantic
+                        # RCA closure.
                         prior_source_ids = tuple(
                             evidence_id for evidence_id in (prior.supporting_evidence_ids if prior else ())
                             if evidence_id in set(source_ids)
                         )
-                        runtime_status = "SATISFIED" if (cited_source_ids or prior_source_ids) else "OPEN"
-                        runtime_support = tuple(dict.fromkeys(
-                            cited_source_ids or prior_source_ids
-                        ))
+                        runtime_status = (
+                            "SATISFIED"
+                            if obligation.status == "SATISFIED"
+                            else "OPEN"
+                        )
+                        runtime_support = (
+                            tuple(dict.fromkeys(prior_source_ids))
+                            if runtime_status == "SATISFIED" else ()
+                        )
                         runtime_blocked = ()
                     else:
                         runtime_status = "NOT_APPLICABLE_BY_CAPABILITY"
@@ -1295,6 +2133,7 @@ class DiagnosisHarness:
                     obligation = obligation.model_copy(update={
                         "claim": _SOURCE_MECHANISM_OBLIGATION_CLAIM,
                         "critical": True,
+                        "verification_role": "NECESSARY",
                         "status": runtime_status,
                         "supporting_evidence_ids": runtime_support,
                         "blocked_capabilities": runtime_blocked,
@@ -1315,8 +2154,10 @@ class DiagnosisHarness:
                         })
                     # Do not apply generic transition/terminal checks to a
                     # source obligation. A stale provider projection is
-                    # normalized to the Runtime-owned OPEN/SATISFIED/N/A state.
-                    if obligation.id not in obligation_state:
+                    # normalized to the Runtime-owned OPEN/SATISFIED/N/A state;
+                    # strict SATISFIED can only be replayed after EvidenceSet
+                    # completion, never synthesized from source coverage.
+                    if obligation.id not in current_obligations:
                         obligation_created_count += 1
                         trace.record("OBLIGATION_CREATED", obligation.model_dump())
                     elif prior != obligation:
@@ -1328,120 +2169,70 @@ class DiagnosisHarness:
                         })
                     next_obligations[obligation.id] = obligation
                     continue
-                if (
-                    prior is not None
-                    and prior.status == "SATISFIED"
-                    and obligation.status == prior.status
-                    and (
-                        not obligation.supporting_evidence_ids
-                        or any(
-                            evidence_id not in known_ids
-                            or not evidence_id.startswith("ev-")
-                            for evidence_id in obligation.supporting_evidence_ids
-                        )
-                    )
-                ):
-                    # Terminal state and its Evidence are Runtime-owned. A
-                    # later provider turn may repeat a stale, incomplete
-                    # compatibility projection while requesting a new tool.
-                    trace.record("OBLIGATION_TERMINAL_REPLAY_REJECTED", {
-                        "obligation_id": obligation.id,
-                        "status": obligation.status,
-                        "reason": "terminal_runtime_state_preserved",
-                        "invalid_supporting_evidence_ids": list(
-                            obligation.supporting_evidence_ids
-                        ),
+                capability_gaps = _obligation_capability_gaps(
+                    canonical_proposal.model_dump(), capabilities,
+                )
+                if capability_gaps and obligation.status != "SATISFIED":
+                    runtime_status = "NOT_APPLICABLE_BY_CAPABILITY"
+                    obligation = obligation.model_copy(update={
+                        "status": runtime_status,
+                        "supporting_evidence_ids": (),
+                        "blocked_capabilities": capability_gaps,
                     })
-                    obligation = prior
-                if (
-                    prior is not None
-                    and prior.status == "SATISFIED"
-                    and obligation.status == "OPEN"
-                ):
-                    # Planner outputs are a semantic proposal, but terminal
-                    # obligation state is Runtime-owned. A stale or repeated
-                    # structured item must not reopen a resolved obligation
-                    # and crash the run on SATISFIED->OPEN.
-                    trace.record("OBLIGATION_REOPEN_REJECTED", {
+                    trace.record("OBLIGATION_STATUS_OVERRIDDEN", {
                         "obligation_id": obligation.id,
-                        "from": prior.status,
-                        "to": obligation.status,
-                        "reason": "terminal_runtime_state_preserved",
+                        "proposed_status": proposed_status,
+                        "runtime_status": runtime_status,
+                        "capability_gaps": list(capability_gaps),
+                        "evidence_type": evidence_type,
+                        "reason": "runtime_capability_boundary",
                     })
-                    obligation = prior
-                if prior is not None and obligation.status not in _OBLIGATION_TRANSITIONS[prior.status]:
-                    raise RuntimeError(
-                        f"invalid obligation status transition {prior.status}->{obligation.status}"
-                    )
-                if obligation.status == "SATISFIED":
-                    if not obligation.supporting_evidence_ids or any(
-                        evidence_id not in known_ids or not evidence_id.startswith("ev-")
-                        for evidence_id in obligation.supporting_evidence_ids
-                    ):
-                        raise RuntimeError(
-                            "terminal verification obligation requires existing ev-* evidence"
-                        )
-                if prior is not None and prior.status != obligation.status:
-                    trace.record("OBLIGATION_TRANSITION", {
-                        "obligation_id": obligation.id,
-                        "from": prior.status,
-                        "to": obligation.status,
-                        "reason": "planner_structured_state",
-                    })
-                if obligation.id not in obligation_state:
+                if obligation.id not in current_obligations:
                     obligation_created_count += 1
                     trace.record("OBLIGATION_CREATED", obligation.model_dump())
                 next_obligations[obligation.id] = obligation
 
-            # A required_evidence_gaps response is the compatibility input.  It
-            # is normalized into the obligation ledger instead of becoming a
-            # second mutable source of truth.
+            # Natural-language evidence gaps are diagnostics only. They never
+            # become semantic obligations; every active obligation must arrive
+            # through the structured proposal contract above.
             for gap in selection.required_evidence_gaps:
                 claim = " ".join(str(gap).split()).strip()
                 if not claim:
                     continue
-                # VerificationObligation is canonical when the Planner emits
-                # both representations. Never let the compatibility gap
-                # projection overwrite a structured SATISFIED state
-                # (or erase structured supporting Evidence) in this turn.
-                structured_match = next(
-                    (item for item in next_obligations.values()
-                     if " ".join(item.claim.split()).casefold() == claim.casefold()),
-                    None,
+                rejected_gaps.append(claim)
+                trace.record("OBLIGATION_PROPOSAL_REJECTED", {
+                    "claim": claim,
+                    "reason": "unstructured_evidence_gap",
+                })
+
+            # Rehydrate canonical critical obligations into the next
+            # provider projection.  The Planner may omit an existing
+            # obligation while proposing a follow-up action, but that cannot
+            # erase the Runtime/RCAState semantic requirement.  This is a
+            # state projection only: it creates no obligation and changes no
+            # lifecycle status.
+            for canonical in canonical_rca_state.obligations:
+                normalized_canonical, capability_gaps = (
+                    _normalize_obligation_capability_status(canonical, capabilities)
                 )
-                if structured_match is not None:
-                    continue
-                existing = next(
-                    (item for item in obligation_state.values()
-                     if " ".join(item.claim.split()).casefold() == claim.casefold()),
-                    None,
-                )
-                oid = existing.id if existing is not None else _obligation_id(claim)
-                prior = obligation_state.get(oid)
-                if prior is not None and prior.status != "OPEN":
-                    # Legacy required_gaps are an input projection, not a
-                    # command to reopen a terminal obligation. A capability
-                    # block must remain visible until the Planner explicitly
-                    # supplies a legal Runtime transition.
-                    next_obligations[oid] = prior
-                    continue
-                obligation = VerificationObligation(
-                    id=oid,
-                    claim=claim,
-                    critical=True,
-                    status="OPEN",
-                    supporting_evidence_ids=(),
-                    blocked_capabilities=prior.blocked_capabilities if prior else (),
-                )
-                if prior is None:
-                    obligation_created_count += 1
-                    trace.record("OBLIGATION_CREATED", obligation.model_dump())
-                elif prior.status != "OPEN":
-                    trace.record("OBLIGATION_TRANSITION", {
-                        "obligation_id": oid, "from": prior.status, "to": "OPEN",
-                        "reason": "planner_reopened_required_gap",
+                if capability_gaps:
+                    canonical = normalized_canonical
+                    trace.record("OBLIGATION_STATUS_OVERRIDDEN", {
+                        "obligation_id": canonical.id,
+                        "proposed_status": "OPEN",
+                        "runtime_status": canonical.status,
+                        "capability_gaps": list(capability_gaps),
+                        "reason": "runtime_capability_boundary_rehydration",
                     })
-                next_obligations[oid] = obligation
+                if canonical.blocks_finalization and canonical.id not in next_obligations:
+                    next_obligations[canonical.id] = canonical
+                    trace.record("OBLIGATION_REHYDRATED", {
+                        "obligation_id": canonical.id,
+                        "status": canonical.status,
+                        "reason": "preserve_open_critical_runtime_state",
+                    })
+
+            unstructured_obligation_gaps = tuple(dict.fromkeys(rejected_gaps))
 
             # Source coverage is a Runtime-owned capability/evidence decision.
             # The LLM field is retained for audit only and cannot close the
@@ -1453,6 +2244,9 @@ class DiagnosisHarness:
             if not active_source_claims and old is not None:
                 active_source_claims = tuple(old.source_claims or ())
             source_coverage = evaluate_source_claims(active_source_claims)
+            if active_source_claims and not source_coverage["all_claims_covered"]:
+                raise SemanticTransitionError("source_claim_provenance_invalid",
+                    json.dumps(source_coverage, ensure_ascii=False))
             trace.record("SOURCE_MECHANISM_RELEVANCE_EVALUATED", {
                 "capability_available": source_capability_available,
                 "capability_gaps": list(source_capability_gaps),
@@ -1466,9 +2260,27 @@ class DiagnosisHarness:
                 if evidence_id in set(source_ids)
             ))
             source_support_ids = tuple(dict.fromkeys((*cited_source_ids, *claim_source_ids)))
+            source_obligation = next(
+                (
+                    item for item in (*next_obligations.values(), *current_obligations.values())
+                    if _is_source_mechanism_obligation(item)
+                ),
+                None,
+            )
+            source_declared = _source_investigation_declared(
+                source_obligation=source_obligation,
+                source_claims=active_source_claims,
+                cited_source_ids=cited_source_ids,
+                proposed_status=proposed_source_status,
+            )
             source_status = (
                 "not_applicable" if not source_capability_available
-                else "sufficient" if source_coverage["all_claims_covered"] else "gap"
+                else "sufficient"
+                if source_coverage["all_claims_covered"]
+                or (not active_source_claims and bool(source_support_ids))
+                else "gap"
+                if source_declared
+                else "unknown"
             )
             if proposed_source_status != source_status:
                 trace.record("SOURCE_MECHANISM_STATUS_OVERRIDDEN", {
@@ -1478,42 +2290,96 @@ class DiagnosisHarness:
                     "capability_gaps": list(source_capability_gaps),
                     "cited_source_evidence_ids": list(source_support_ids),
                     "source_claim_count": len(active_source_claims),
-                    "reason": "runtime_owned_source_coverage",
+                    "reason": (
+                        "runtime_owned_source_coverage"
+                        if active_source_claims
+                        else "runtime_owned_canonical_source_evidence"
+                    ),
                 })
-            source_obligation = next(
-                (
-                    item for item in (*next_obligations.values(), *obligation_state.values())
-                    if _is_source_mechanism_obligation(item)
-                ),
-                None,
+            # A normal causal mechanism is not proof that the diagnosis is a
+            # source investigation.  Source routing is declared only by an
+            # explicit source status/claim, cited source Evidence, or an
+            # already Runtime-owned source Obligation.  Otherwise a generic
+            # mechanism such as "unverified" must not collapse the live Tool
+            # surface to read_file before an exact path exists.
+            # A source-specific Evidence Obligation may already have been
+            # admitted and closed by the normal EvidenceSet path. When the
+            # Planner merely confirms that canonical source Evidence supports
+            # the mechanism, but declares no SourceClaim and no Runtime-owned
+            # source coverage Obligation exists yet, do not append a second
+            # synthetic coverage branch with no EvidenceSet closure path.
+            # Explicit SourceClaims and an already-open source Obligation keep
+            # the strict range-coverage lifecycle.
+            source_coverage_already_grounded = bool(
+                source_status == "sufficient"
+                and source_support_ids
+                and not active_source_claims
+                and source_obligation is None
             )
-            source_should_track = bool(
-                source_obligation is not None
-                or selection.candidate_mechanism.strip()
-            )
+            if source_coverage_already_grounded:
+                trace.record("SOURCE_OBLIGATION_SUPPRESSED", {
+                    "source_evidence_ids": list(source_support_ids),
+                    "reason": (
+                        "canonical source Evidence already supports the mechanism; "
+                        "no SourceClaim or existing Runtime source Obligation requires "
+                        "a separate coverage branch"
+                    ),
+                    "lifecycle_change": "none",
+                })
+            source_should_track = source_declared and not source_coverage_already_grounded
             if source_should_track:
-                desired_status = (
-                    "SATISFIED" if source_status == "sufficient"
-                    else "NOT_APPLICABLE_BY_CAPABILITY"
-                    if source_status == "not_applicable" else "OPEN"
-                )
-                desired_support = tuple(source_support_ids) if desired_status == "SATISFIED" else ()
+                if source_status == "not_applicable":
+                    desired_status = "NOT_APPLICABLE_BY_CAPABILITY"
+                    desired_support = ()
+                else:
+                    current_status = source_obligation.status if source_obligation else "OPEN"
+                    desired_status = (
+                        "SATISFIED" if current_status == "SATISFIED" else "OPEN"
+                    )
+                    desired_support = (
+                        tuple(source_obligation.supporting_evidence_ids)
+                        if desired_status == "SATISFIED" else ()
+                    )
                 desired_blocked = (
                     tuple(source_capability_gaps)
                     if desired_status == "NOT_APPLICABLE_BY_CAPABILITY" else ()
                 )
                 if source_obligation is None:
-                    source_obligation = VerificationObligation(
-                        id=_obligation_id(_SOURCE_MECHANISM_OBLIGATION_CLAIM),
+                    source_proposal = CanonicalObligationProposal(
                         claim=_SOURCE_MECHANISM_OBLIGATION_CLAIM,
-                        critical=True,
-                        status=desired_status,
-                        supporting_evidence_ids=desired_support,
-                        blocked_capabilities=desired_blocked,
+                        evidence_requirement="Canonical source Evidence covering every declared source claim range.",
+                        target_component="application source",
+                        verification_question=_SOURCE_MECHANISM_OBLIGATION_CLAIM,
+                        evidence_type="complete source claim coverage",
+                        completion_contract=CompletionContract(required_facts=(FactRequirement(
+                            slot="source_range_coverage", role="OBSERVATION",
+                            description="Canonical source Evidence covers all declared source ranges.",
+                            evidence_constraints=EvidenceConstraint(source_tools=("read_file",),
+                                context_kinds=("CODE",), information_sources=("source_read",)),
+                        ),)),
                     )
-                    obligation_created_count += 1
-                    trace.record("OBLIGATION_CREATED", source_obligation.model_dump())
-                elif (
+                    admission = ObligationAdmissionPolicy.admit(
+                        source_proposal,
+                        provenance_profiles=completion_provenance_profiles(),
+                        related_hypothesis=selection.current_hypothesis,
+                        existing_obligations=canonical_rca_state.obligations,
+                        required_tools=("read_file",),
+                        available_tools=available_code_tools,
+                        capability_gaps=tuple(source_capability_gaps),
+                    )
+                    trace.record("SOURCE_OBLIGATION_ADMISSION", {
+                        "status": admission.status, "reasons": list(admission.reasons),
+                        "obligation_id": admission.obligation_id,
+                        "capability_gaps": list(source_capability_gaps),
+                    })
+                    if admission.admitted:
+                        canonical_rca_state = canonical_rca_state.reduce(admission.accepted_event())
+                        source_obligation = canonical_rca_state.obligation(admission.obligation_id)
+                        obligation_created_count += 1
+                        trace.record("OBLIGATION_CREATED", source_obligation.model_dump())
+                    elif admission.status == "DUPLICATE":
+                        source_obligation = canonical_rca_state.obligation(admission.obligation_id)
+                if source_obligation is not None and (
                     source_obligation.status != desired_status
                     or source_obligation.supporting_evidence_ids != desired_support
                     or source_obligation.blocked_capabilities != desired_blocked
@@ -1532,58 +2398,122 @@ class DiagnosisHarness:
                         "reason": "source_capability_and_evidence_check",
                     })
                     source_obligation = updated
-                next_obligations[source_obligation.id] = source_obligation
+                if source_obligation is not None:
+                    next_obligations[source_obligation.id] = source_obligation
 
-            # When the Planner explicitly closes all required gaps and has
-            # evidence, close prior obligations deterministically. The Harness
-            # does not decide whether one evidence source is semantically
-            # equivalent to another; it only applies the Planner's completion
-            # proposal to the known Evidence IDs.
-            if not selection.required_evidence_gaps and selection.evidence_sufficiency == "sufficient":
-                for oid, prior in obligation_state.items():
-                    if oid in next_obligations or prior.status not in {"OPEN", "BLOCKED_BY_CAPABILITY"}:
-                        continue
-                    if _is_source_mechanism_obligation(prior):
-                        # Source status is decided only by the deterministic
-                        # capability/evidence branch above; generic completion
-                        # must never close or waive it.
-                        continue
-                    if prior.status == "BLOCKED_BY_CAPABILITY":
-                        continue
-                    status = "SATISFIED"
-                    updated = prior.model_copy(update={
-                        "status": status,
-                        "supporting_evidence_ids": tuple(selection.supporting_evidence_ids),
-                    })
-                    next_obligations[oid] = updated
-                    trace.record("OBLIGATION_TRANSITION", {
-                        "obligation_id": oid, "from": prior.status, "to": status,
-                        "reason": "planner_declared_sufficient_with_known_evidence",
-                    })
-            obligation_state.clear()
-            obligation_state.update(next_obligations)
-            for obligation in obligation_state.values():
+            # Planner support/evidence fields are proposals only.  They must
+            # never close an Obligation or make the Hypothesis sufficient.
+            # The only active closure path is
+            # EvidenceProposal -> admission -> EvidenceSet -> RCAState reducer.
+            planner_support_ids = tuple(
+                evidence_id for evidence_id in selection.supporting_evidence_ids
+                if evidence_id in known_ids and evidence_id.startswith("ev-")
+            )
+            if planner_support_ids:
+                trace.record("PLANNER_SUPPORT_PROPOSAL", {
+                    "evidence_ids": list(planner_support_ids),
+                    "accepted_for": (
+                        "provider_projection"
+                        if not self.config.features.evidence_qualification
+                        else "audit_only"
+                    ),
+                    "reason": "planner evidence links cannot mutate canonical lifecycle",
+                })
+
+            # A Planner citation is not allowed to create or close an
+            # EvidenceSet.  Once a canonical EvidenceSet is already
+            # SATISFIES, however, its admitted Evidence members are the
+            # Runtime-known context for the completed verification question.
+            # Project only the intersection explicitly cited by the Planner;
+            # this lets a candidate cite the complete closed fact set while
+            # keeping the EvidenceSet reducer as the sole closure authority.
+            closed_evidence_ids = {
+                evidence_id
+                for item in canonical_rca_state.obligations
+                if item.status == "SATISFIED"
+                for (obligation_id, _), evidence_set in evidence_sets.items()
+                if obligation_id == item.id and evidence_set.status == "SATISFIES"
+                for evidence_id in evidence_set.evidence_ids
+                if evidence_id in known_ids
+            }
+            closed_planner_support_ids = tuple(
+                evidence_id for evidence_id in planner_support_ids
+                if evidence_id in closed_evidence_ids
+            )
+            if closed_planner_support_ids:
+                trace.record("PLANNER_SUPPORT_PROJECTED_FROM_CLOSED_EVIDENCE", {
+                    "evidence_ids": list(closed_planner_support_ids),
+                    "closed_evidence_ids": sorted(closed_evidence_ids),
+                    "reason": "explicit Planner citations intersect a Runtime-closed EvidenceSet",
+                    "lifecycle_mutation": False,
+                })
+
+            for obligation in next_obligations.values():
                 if obligation.status == "BLOCKED_BY_CAPABILITY":
                     obligation_blocked_count += 1
 
-            structured_contradictions = tuple(selection.contradictions or ())
-            if structured_contradictions:
+            proposed_structured_contradictions = tuple(selection.contradictions or ())
+            proposed_contradiction_ids = tuple(dict.fromkeys((
+                *(item.evidence_id for item in proposed_structured_contradictions),
+                *selection.contradicting_evidence_ids,
+            )))
+            grounded_contradiction_ids = _grounded_contradiction_ids(
+                proposed_contradiction_ids,
+                projected_facts.values(),
+                set(evidence_projector.hypothesis_scope_fingerprints(selection)),
+            )
+            rejected_contradiction_ids = tuple(
+                evidence_id for evidence_id in proposed_contradiction_ids
+                if evidence_id not in set(grounded_contradiction_ids)
+            )
+            if rejected_contradiction_ids:
+                trace.record("CONTRADICTION_PROPOSAL_REJECTED", {
+                    "evidence_ids": list(rejected_contradiction_ids),
+                    "grounded_evidence_ids": list(grounded_contradiction_ids),
+                    "reason": (
+                        "Planner contradiction must be backed by a canonical "
+                        "Evidence relation marked CONTRADICTS for the current "
+                        "hypothesis scope"
+                    ),
+                    "accepted_for": "audit_only",
+                    "lifecycle_mutation": False,
+                })
+            structured_contradictions = tuple(
+                item for item in proposed_structured_contradictions
+                if item.evidence_id in set(grounded_contradiction_ids)
+            )
+            structured_ids = {
+                item.evidence_id for item in structured_contradictions
+            }
+            structured_contradictions += tuple(
+                Contradiction(
+                    evidence_id=evidence_id,
+                    claim="Evidence directly contradicts the current diagnosis.",
+                    severity="BLOCKING",
+                    status="OPEN",
+                )
+                for evidence_id in grounded_contradiction_ids
+                if evidence_id not in structured_ids
+            )
+            flat_contradictions = tuple(grounded_contradiction_ids)
+            if (
+                not structured_contradictions
+                and old is not None
+                and old.contradictions
+            ):
+                # A same-hypothesis Planner projection cannot silently clear a
+                # still-open contradiction.  A changed hypothesis gets a new
+                # contradiction projection, while the prior snapshot remains
+                # auditable in RCAState.hypotheses.
+                structured_contradictions = tuple(old.contradictions)
                 flat_contradictions = tuple(
                     item.evidence_id for item in structured_contradictions
                     if item.blocks_finalization
                 )
-            else:
-                # Legacy flat IDs retain their historical blocking semantics.
-                flat_contradictions = tuple(selection.contradicting_evidence_ids)
-                structured_contradictions = tuple(
-                    Contradiction(
-                        evidence_id=evidence_id,
-                        claim="Evidence directly contradicts the current diagnosis.",
-                        severity="BLOCKING",
-                        status="OPEN",
-                    )
-                    for evidence_id in flat_contradictions
-                )
+                trace.record("CONTRADICTION_PROJECTION_PRESERVED", {
+                    "evidence_ids": list(flat_contradictions),
+                    "reason": "same_hypothesis_projection_cannot_clear_open_contradiction",
+                })
             for contradiction in structured_contradictions:
                 if (
                     not contradiction.evidence_id.startswith("ev-")
@@ -1592,19 +2522,25 @@ class DiagnosisHarness:
                     raise RuntimeError(
                         "contradiction must cite an existing ev-* Evidence ID"
                     )
-            blocking = {
-                item.evidence_id for item in structured_contradictions
-                if item.blocks_finalization
-            }
             prior_contradictions = {
                 item.evidence_id: item for item in (old.contradictions if old else ())
             }
+            canonical_contradictions: list[Contradiction] = []
             for contradiction in structured_contradictions:
                 prior = prior_contradictions.get(contradiction.evidence_id)
                 if prior is not None and contradiction.status not in _CONTRADICTION_TRANSITIONS[prior.status]:
-                    raise RuntimeError(
-                        f"invalid contradiction status transition {prior.status}->{contradiction.status}"
-                    )
+                    # Provider projections cannot reopen a Runtime-owned
+                    # terminal contradiction. Preserve the canonical terminal
+                    # record and continue with the current hypothesis; this is
+                    # lifecycle normalization, not semantic resolution.
+                    trace.record("CONTRADICTION_PROJECTION_REUSED", {
+                        "evidence_id": contradiction.evidence_id,
+                        "from": prior.status,
+                        "proposed": contradiction.status,
+                        "reason": "terminal_contradiction_cannot_reopen",
+                    })
+                    contradiction = prior
+                canonical_contradictions.append(contradiction)
                 if prior is None:
                     trace.record("CONTRADICTION_CREATED", contradiction.model_dump())
                 elif prior != contradiction:
@@ -1613,14 +2549,56 @@ class DiagnosisHarness:
                         "from": prior.model_dump(),
                         "to": contradiction.model_dump(),
                     })
+            structured_contradictions = tuple(canonical_contradictions)
+            flat_contradictions = tuple(
+                item.evidence_id for item in structured_contradictions
+                if item.blocks_finalization
+            )
+            blocking = {
+                item.evidence_id for item in structured_contradictions
+                if item.blocks_finalization
+            }
             blocking_contradiction_count = len(blocking)
 
-            required_projection = tuple(
-                item.claim for item in obligation_state.values() if item.blocks_finalization
-            )
+            # Only canonical Obligations are blockers. Typed rejected proposals
+            # abort the complete staged transaction before publication.
+            required_projection = tuple(dict.fromkeys(
+                item.claim for item in next_obligations.values()
+                if item.blocks_finalization
+            ))
+            if unstructured_obligation_gaps:
+                trace.record("UNSTRUCTURED_OBLIGATION_GAPS", {
+                    "gaps": list(dict.fromkeys(unstructured_obligation_gaps)),
+                    "accepted_for": "planner_hint_and_telemetry_only",
+                    "blocks_finalization": False,
+                })
+            active_obligation_ids = {
+                item.id for item in canonical_rca_state.obligations
+                if item.status != "SUPERSEDED_BY_REPLAN"
+            }
+            admitted_support_ids = tuple(dict.fromkeys(
+                fact.evidence_id
+                for fact in projected_facts.values()
+                if fact.obligation_id in active_obligation_ids
+                and fact.hypothesis_fingerprint in selection_hypothesis_fingerprints
+                and str(getattr(fact, "relation", "")).upper() == "SUPPORTS"
+                and str(getattr(fact, "hypothesis_relation", "")).upper() == "SUPPORTS"
+                and str(getattr(fact, "fulfillment", "")).upper()
+                in {"PARTIAL", "SATISFIES"}
+            ))
+            runtime_supporting_ids = admitted_support_ids
+            if selection.evidence_sufficiency == "sufficient":
+                trace.record("PLANNER_CONTROL_FIELD_REJECTED", {
+                    "field": "evidence_sufficiency",
+                    "value": "sufficient",
+                    "reason": "Runtime derives hypothesis sufficiency from canonical state",
+                })
             hypothesis = IncidentHypothesis(
+                hypothesis_id=selection.hypothesis_id, revision=selection.revision,
                 claim=selection.current_hypothesis,
-                evidence_gap=selection.evidence_gap,
+                # Provider-facing display projection only: the semantic gap is
+                # owned by canonical OPEN obligations, not by Planner prose.
+                evidence_gap=(required_projection[0] if required_projection else ""),
                 component=selection.candidate_component,
                 fault=(selection.candidate_fault
                        or selection.candidate_fault_code
@@ -1628,20 +2606,35 @@ class DiagnosisHarness:
                 fault_code=selection.candidate_fault_code,
                 fault_explanation=selection.candidate_fault_explanation,
                 mechanism=selection.candidate_mechanism,
-                supporting_evidence_ids=tuple(dict.fromkeys(
-                    (*selection.supporting_evidence_ids, *source_support_ids)
-                )),
+                supporting_evidence_ids=runtime_supporting_ids,
                 contradicting_evidence_ids=flat_contradictions,
                 required_gaps=required_projection,
-                evidence_sufficient=selection.evidence_sufficiency == "sufficient",
+                evidence_sufficient=False,
                 mechanism_category=selection.mechanism_category,
                 source_mechanism_status=source_status,
                 source_claims=active_source_claims,
-                verification_obligations=tuple(obligation_state.values()),
+                verification_obligations=tuple(next_obligations.values()),
                 contradictions=structured_contradictions,
             )
+            runtime_evidence_sufficient = bool(
+                runtime_supporting_ids
+                and not required_projection
+                and not blocking
+                and all(
+                    bool(str(value).strip())
+                    for value in (
+                        selection.candidate_component,
+                        selection.candidate_fault or selection.candidate_fault_code,
+                        selection.candidate_mechanism,
+                    )
+                )
+            )
+            hypothesis = hypothesis.model_copy(update={
+                "evidence_sufficient": runtime_evidence_sufficient,
+                "status": "supported" if runtime_evidence_sufficient else hypothesis.status,
+            })
             if old is not None:
-                same_identity = self._material_hypothesis_fingerprint(old) == self._material_hypothesis_fingerprint(hypothesis)
+                same_identity = selection.hypothesis_transition.kind in {"KEEP_CURRENT", "REFINE"}
                 old_blocking = {
                     item.evidence_id for item in old.contradictions if item.blocks_finalization
                 }
@@ -1651,7 +2644,109 @@ class DiagnosisHarness:
                 stable_rounds = 0
             hypothesis = hypothesis.model_copy(update={"stable_rounds": stable_rounds})
             previous_hypothesis = old
-            return hypothesis
+            updated = reduce_runtime_hypothesis(
+                hypothesis,
+                reason="planner_" + selection.hypothesis_transition.kind.lower(),
+            )
+
+            return updated
+
+        def canonical_rca_state_reset(obligation_id):
+            nonlocal canonical_rca_state
+            canonical_rca_state = canonical_rca_state.reduce({
+                "kind": "REOPEN_OBLIGATION",
+                "payload": {"obligation_id": obligation_id, "reason": "hypothesis_revision_requires_requalification"},
+            })
+
+        def semantic_transition(transition, proposed, operation):
+            """Evaluate against detached stores; publish only a validated complete result."""
+            nonlocal canonical_rca_state, evidence_memory, evidence_pipeline, projected_facts, evidence_sets
+            nonlocal trace, dag_state, previous_hypothesis, obligation_created_count, obligation_blocked_count
+            nonlocal blocking_contradiction_count, unstructured_obligation_gaps, reflection_constraint, reflection_delta_accepts
+            before_state = canonical_rca_state
+            resolved = resolve_hypothesis(before_state, transition, proposed)
+            live = (
+                canonical_rca_state, evidence_memory, evidence_pipeline,
+                projected_facts, evidence_sets, trace,
+                dag_state, previous_hypothesis, obligation_created_count,
+                obligation_blocked_count, blocking_contradiction_count, unstructured_obligation_gaps,
+                reflection_constraint, reflection_delta_accepts,
+            )
+            evidence_memory = deepcopy(evidence_memory)
+            evidence_pipeline = EvidencePipeline(
+                observation_store=observation_store, evidence_memory=evidence_memory,
+                projector=evidence_projector, deterministic_fact_adapters=("source_range_capture",),
+            )
+            projected_facts = dict(projected_facts)
+            evidence_sets = dict(evidence_sets)
+            trace = SemanticTraceBuffer()
+            dag_state = None  # DAG and committed trace are post-publication projections.
+            try:
+                if transition.kind != 'KEEP_CURRENT' and before_state.contradictions:
+                    # Contradiction status belongs to admitted relationships in
+                    # one hypothesis scope, not to an Evidence body forever.
+                    canonical_rca_state = canonical_rca_state.reduce({
+                        'kind': 'SET_CONTRADICTIONS', 'payload': {'contradictions': []}})
+                    trace.record('CONTRADICTION_SCOPE_INVALIDATED', {
+                        'evidence_ids': [item.evidence_id for item in before_state.contradictions],
+                        'previous_scopes': list(evidence_projector.hypothesis_scope_fingerprints(
+                            before_state.active_hypothesis_projection())),
+                        'next_scopes': list(evidence_projector.hypothesis_scope_fingerprints(resolved)),
+                        'reason': 'hypothesis_revision_requires_requalification'})
+                # A new revision carries no automatic satisfaction/coverage inheritance.
+                for item in before_state.obligations:
+                    if transition.kind != "KEEP_CURRENT" and item.status == "SATISFIED":
+                        canonical_rca_state = canonical_rca_state.reduce({
+                            "kind": "REOPEN_OBLIGATION",
+                            "payload": {"obligation_id": item.id, "reason": "hypothesis_revision_requires_requalification"},
+                        })
+                result = operation(resolved)
+                trace.validate()
+                validate_disposition_conflicts(transition, before_state, canonical_rca_state)
+                superseded = {item.obligation_id for item in transition.obligation_dispositions if item.action == "SUPERSEDE"}
+                if any(kind == "OBLIGATION_SATISFIED" and payload.get("obligation_id") in superseded
+                       for kind, payload in trace.records):
+                    raise SemanticTransitionError("semantic_transition_conflict", "SUPERSEDE + SATISFIED")
+                for disposition in transition.obligation_dispositions:
+                    if disposition.action == "SUPERSEDE":
+                        canonical_rca_state = canonical_rca_state.reduce({
+                            "kind": "SUPERSEDE_OBLIGATION",
+                            "payload": {"obligation_id": disposition.obligation_id},
+                        })
+                        trace.record("OBLIGATION_TRANSITION", {
+                            "obligation_id": disposition.obligation_id, "to": "SUPERSEDED_BY_REPLAN",
+                            "reason": disposition.reason, "source": "validated_disposition",
+                        })
+                staged = (
+                canonical_rca_state, evidence_memory, evidence_pipeline,
+                projected_facts, evidence_sets, trace,
+                dag_state, previous_hypothesis, obligation_created_count,
+                obligation_blocked_count, blocking_contradiction_count, unstructured_obligation_gaps,
+                reflection_constraint, reflection_delta_accepts,
+            )
+            finally:
+                (
+                canonical_rca_state, evidence_memory, evidence_pipeline,
+                projected_facts, evidence_sets, trace,
+                dag_state, previous_hypothesis, obligation_created_count,
+                obligation_blocked_count, blocking_contradiction_count, unstructured_obligation_gaps,
+                reflection_constraint, reflection_delta_accepts,
+            ) = live
+            # No fallible semantic validation follows publication. Stores remain sole owners.
+            staged_memory, staged_trace = staged[1], staged[5]
+            evidence_memory.publish_staged(staged_memory)
+            canonical_rca_state = staged[0]
+            projected_facts, evidence_sets = staged[3], staged[4]
+            (previous_hypothesis, obligation_created_count, obligation_blocked_count,
+             blocking_contradiction_count, unstructured_obligation_gaps,
+             reflection_constraint, reflection_delta_accepts) = staged[7:]
+            project_obligation_ids_to_dag("semantic_transition_published")
+            staged_trace.publish(trace)
+            trace.record("SEMANTIC_TRANSITION_COMMITTED", {
+                "kind": transition.kind, "hypothesis_id": resolved.hypothesis_id,
+                "revision": resolved.revision, "event_count": canonical_rca_state.event_count,
+            })
+            return result
 
         def validate_reflection_feedback(feedback: ReflectionFeedback) -> None:
             known_ids = {item.evidence_id for item in evidence_memory.pinned}
@@ -1675,63 +2770,94 @@ class DiagnosisHarness:
                 raise ValueError("Reflection referenced unknown Evidence IDs: " + ", ".join(sorted(set(bad))))
 
         def apply_reflection_delta(feedback: ReflectionFeedback, trigger: str) -> bool:
+            nonlocal reflection_constraint
+            current = active_hypothesis()
+            delta = feedback.hypothesis_delta
+            transition = delta.transition
+            if transition is None:
+                # Operational / audit-only feedback can carry no semantic mutation.
+                if any(getattr(delta, key) for key in ("claim", "component", "fault", "fault_code",
+                       "fault_explanation", "mechanism", "source_mechanism_status")) or feedback.proposed_obligations or feedback.contradiction_updates:
+                    trace.record("REFLECTION_DELTA_REJECTED", {"reason": "hypothesis_transition_required"})
+                    return False
+                for gap in feedback.proposed_evidence_gaps:
+                    admission = ObligationAdmissionPolicy.admit(gap, provenance_profiles=completion_provenance_profiles(), related_hypothesis=current.claim if current else "")
+                    trace.record("REFLECTION_GAP_ADMISSION", {"trigger": trigger, "status": admission.status,
+                                 "reasons": list(admission.reasons), "accepted_for": "audit_only"})
+                reflection_constraint = feedback.next_action_constraint
+                return False
+            if current is None:
+                proposed = IncidentHypothesis(evidence_gap="", **{
+                    key: getattr(delta, key) for key in ("claim", "component", "fault", "fault_code",
+                    "fault_explanation", "mechanism", "source_mechanism_status") if getattr(delta, key) is not None
+                })
+            else:
+                proposed = current
+            def stage_reflection(resolved):
+                return stage_reflection_delta(feedback, trigger, resolved)
+            try:
+                return semantic_transition(transition, proposed, stage_reflection)
+            except (SemanticTransitionError, RCAStateError, ValueError, RuntimeError) as exc:
+                trace.record("REFLECTION_DELTA_REJECTED", {"reason": str(exc)})
+                return False
+
+        def stage_reflection_delta(feedback: ReflectionFeedback, trigger: str, resolved: IncidentHypothesis) -> bool:
             """Apply only a genuinely new Runtime-owned Reflection Delta."""
             nonlocal obligation_created_count, blocking_contradiction_count
             nonlocal reflection_constraint, reflection_delta_accepts
-            current = hypotheses[-1] if hypotheses else None
+            nonlocal canonical_rca_state
+            current = active_hypothesis()
+            current_obligations = obligation_projection()
             before = (
                 self._hypothesis_semantic_fingerprint(current) if current else None,
                 tuple(sorted((item.id, item.claim.casefold(), item.status)
-                             for item in obligation_state.values())),
+                             for item in current_obligations.values())),
                 tuple(sorted((item.evidence_id, item.status, item.severity)
                              for item in (current.contradictions if current else ()))),
                 reflection_constraint,
             )
-            constraint = " ".join(str(feedback.next_action_constraint or "").split()).casefold()
-            allowed_constraints = {
-                "", "targeted_verification", "no_broad_exploration",
-                "finalize", "inconclusive",
-            }
-            if constraint not in allowed_constraints:
-                trace.record("REFLECTION_DELTA_REJECTED", {
-                    "trigger": trigger,
-                    "reason": "unknown_next_action_constraint",
-                    "constraint": feedback.next_action_constraint,
-                })
-                return False
+            constraint = feedback.next_action_constraint
 
-            next_obligations = dict(obligation_state)
+            next_obligations = dict(current_obligations)
             new_obligation_ids: list[str] = []
+            admissions: list[ObligationAdmissionDecision] = []
+            evidence_tools = tuple(
+                name for name in capabilities.planner_tool_names(tools)
+                if name not in {"finalize_diagnosis", "knowledge_retrieval"}
+            )
             proposals = [
                 *(item for item in feedback.proposed_evidence_gaps),
                 *(item for item in feedback.proposed_obligations),
             ]
             for proposal in proposals:
-                claim = " ".join(str(proposal.claim).split()).strip()
-                if not claim:
-                    continue
-                existing = next((
-                    item for item in next_obligations.values()
-                    if " ".join(item.claim.split()).casefold() == claim.casefold()
-                ), None)
-                if existing is not None:
+                admission = ObligationAdmissionPolicy.admit(
+                    proposal,
+                    provenance_profiles=completion_provenance_profiles(),
+                    related_hypothesis=current.claim if current else "",
+                    existing_obligations=tuple(next_obligations.values()),
+                    required_tools=tuple(getattr(proposal, "suggested_tools", ())),
+                    available_tools=evidence_tools,
+                )
+                trace.record("REFLECTION_GAP_ADMISSION", {
+                    "trigger": trigger, "status": admission.status,
+                    "obligation_id": admission.obligation_id,
+                    "reasons": list(admission.reasons),
+                })
+                if admission.status == "REJECTED" and proposal in feedback.proposed_obligations:
+                    raise SemanticTransitionError("obligation_admission_rejected", str(admission.reasons))
+                if not admission.admitted:
                     continue
                 supporting = tuple(getattr(proposal, "supporting_evidence_ids", ()) or ())
-                obligation = VerificationObligation(
-                    id=_obligation_id(claim),
-                    claim=claim,
-                    critical=bool(getattr(proposal, "critical", True)),
-                    status="OPEN",
-                    supporting_evidence_ids=supporting,
-                )
+                admissions.append(admission)
+                obligation = VerificationObligation.model_validate(admission.accepted_event().payload)
                 next_obligations[obligation.id] = obligation
                 new_obligation_ids.append(obligation.id)
-                obligation_created_count += 1
-                trace.record("OBLIGATION_CREATED", {
-                    **obligation.model_dump(),
-                    "reason": "reflection_delta_proposal",
-                    "trigger": trigger,
-                })
+                if supporting:
+                    trace.record("REFLECTION_SUPPORT_PROPOSAL", {
+                        "obligation_id": obligation.id,
+                        "evidence_ids": list(supporting),
+                        "accepted_for": "audit_only",
+                    })
 
             next_contradictions = {
                 item.evidence_id: item
@@ -1756,7 +2882,7 @@ class DiagnosisHarness:
                 )
 
             delta = feedback.hypothesis_delta
-            updated = current
+            updated = resolved.model_copy(update={"supporting_evidence_ids": ()})
             accepted_fields: list[str] = []
             if current is not None:
                 changes: dict[str, Any] = {}
@@ -1769,14 +2895,15 @@ class DiagnosisHarness:
                         if value != getattr(current, field):
                             changes[field] = value.strip()
                             accepted_fields.append(field)
-                support_ids = tuple(dict.fromkeys(
-                    (*current.supporting_evidence_ids,
-                     *feedback.supporting_evidence_ids,
+                proposed_support_ids = tuple(dict.fromkeys(
+                    (*feedback.supporting_evidence_ids,
                      *delta.supporting_evidence_ids)
                 ))
-                if support_ids != current.supporting_evidence_ids:
-                    changes["supporting_evidence_ids"] = support_ids
-                    accepted_fields.append("supporting_evidence_ids")
+                if proposed_support_ids:
+                    trace.record("REFLECTION_SUPPORT_PROPOSAL", {
+                        "evidence_ids": list(proposed_support_ids),
+                        "accepted_for": "audit_only",
+                    })
                 contradiction_ids = tuple(dict.fromkeys(
                     (*current.contradicting_evidence_ids,
                      *feedback.contradicting_evidence_ids,
@@ -1785,7 +2912,7 @@ class DiagnosisHarness:
                 if contradiction_ids != current.contradicting_evidence_ids:
                     changes["contradicting_evidence_ids"] = contradiction_ids
                     accepted_fields.append("contradicting_evidence_ids")
-                if next_obligations != obligation_state:
+                if next_obligations != current_obligations:
                     changes["verification_obligations"] = tuple(next_obligations.values())
                     changes["required_gaps"] = tuple(
                         item.claim for item in next_obligations.values()
@@ -1798,7 +2925,7 @@ class DiagnosisHarness:
                     changes["contradictions"] = tuple(next_contradictions.values())
                     accepted_fields.append("contradictions")
                 if changes:
-                    updated = current.model_copy(update=changes)
+                    updated = updated.model_copy(update=changes)
             elif new_obligation_ids:
                 accepted_fields.append("proposed_obligations")
 
@@ -1814,15 +2941,20 @@ class DiagnosisHarness:
                              for item in (updated.contradictions if updated else next_contradictions.values()))),
                 reflection_constraint,
             )
-            if before == after:
+            if before == after and updated.revision == (current.revision if current else 0):
                 trace.record("REFLECTION_NO_DELTA", {
                     "trigger": trigger,
                     "reason": "canonical_runtime_state_unchanged",
                 })
                 return False
 
-            obligation_state.clear()
-            obligation_state.update(next_obligations)
+            for admission in admissions:
+                canonical_rca_state = canonical_rca_state.reduce(admission.accepted_event())
+                obligation_created_count += 1
+                trace.record("OBLIGATION_CREATED", {
+                    **admission.accepted_event().payload, "source": "rca_state_reducer",
+                    "reason": "reflection_delta_proposal", "trigger": trigger,
+                })
             blocking_contradiction_count = sum(
                 1 for item in (updated.contradictions if updated else next_contradictions.values())
                 if item.blocks_finalization
@@ -1841,24 +2973,26 @@ class DiagnosisHarness:
                         if item.blocks_finalization
                     ),
                 })
-                if not hypotheses or hypotheses[-1] != updated:
-                    hypotheses.append(updated)
-                state.current_hypothesis = updated.model_dump()
+                updated = reduce_runtime_hypothesis(
+                    updated, reason="reflection_delta",
+                )
             reflection_delta_accepts += 1
             trace.record("REFLECTION_DELTA_ACCEPTED", {
                 "trigger": trigger,
                 "accepted_fields": sorted(set(accepted_fields)),
                 "new_obligation_ids": new_obligation_ids,
-                "runtime_hypothesis_version": len(hypotheses),
+                "runtime_hypothesis_version": len(canonical_rca_state.hypotheses),
                 "next_action_constraint": reflection_constraint,
+                "investigation_direction_changed": bool(new_obligation_ids or
+                    set(accepted_fields).intersection({"component", "fault", "fault_code", "mechanism", "contradictions"})),
             })
             return True
 
         def mark_blocked_capability(tool_name: str) -> None:
             nonlocal obligation_blocked_count
-            if not hypotheses:
+            current = active_hypothesis()
+            if current is None:
                 return
-            current = hypotheses[-1]
             updated_obligations = []
             changed = False
             for obligation in current.verification_obligations:
@@ -1921,166 +3055,67 @@ class DiagnosisHarness:
                     else current.source_mechanism_status
                 ),
             })
-            obligation_state.clear()
-            obligation_state.update({item.id: item for item in updated_obligations})
-            hypotheses[-1] = current
-            state.current_hypothesis = current.model_dump()
+            current = reduce_runtime_hypothesis(
+                current, reason="capability_blocked",
+            )
             trace.record("HYPOTHESIS_UPDATED", {
                 "reason": "capability_blocked",
                 "hypothesis": current.model_dump(),
             })
 
-        def targeted_contract_repair(tool_name: str, arguments: dict[str, Any],
-                                     error: dict[str, Any], *,
-                                     logical_repair_index: int = 1) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-            """Repair only missing executable fields, once per bounded budget.
 
-            This call is deliberately not a second Planner. It receives the
-            rejected argument object, the live Pydantic schema, and compact
-            runtime-owned state. It may add a required value only when the
-            provider can identify it from that state; it never fabricates an
-            Evidence ID, permission, or benchmark label.
-            """
-            nonlocal llm_calls, contract_repair_calls
-            spec = next((item for item in tools.specs() if item.name == tool_name), None)
-            if spec is None:
-                return None, {"status": "not_attempted", "reason": "unknown_tool"}
-            required = tuple(
-                name for name, field in spec.args_model.model_fields.items()
-                if field.is_required()
-            )
-            missing = tuple(
-                name for name in required
-                if name not in arguments or arguments.get(name) is None
-            )
-            if not missing:
-                return None, {"status": "not_attempted", "reason": "not_missing_required_field"}
-            if logical_repair_index > self.config.max_tool_contract_repairs:
-                return None, {"status": "not_attempted", "reason": "repair_budget_exhausted"}
-            provider = self.llm
-            if not hasattr(provider, "complete_json"):
-                return None, {"status": "not_attempted", "reason": "provider_has_no_json_api"}
 
-            contract_repair_calls += 1
-            trace.record("TOOL_CONTRACT_REPAIR_STARTED", {
-                "tool": tool_name,
-                "repair_index": contract_repair_calls,
-                "missing_fields": list(missing),
-            })
-            known_targets = sorted({
-                str(item.target).strip() for item in incident_evidence()
-                if str(item.target).strip()
-            })
-            repair_system = (
-                "You are a bounded tool-argument repairer for a read-only incident Agent. "
-                "Return one JSON object containing only missing required tool arguments. "
-                "Use a value only when it is explicitly present and unambiguous in the "
-                "provided structured state or known entity candidates. If it is ambiguous "
-                "or absent, return an empty object. Do not re-plan, add optional fields, "
-                "invent service names, infer benchmark labels, or emit prose."
+        def feasible_skill_ids() -> tuple[str, ...]:
+            """One capability filter shared by normal planning and recovery."""
+            return domain_registry.feasible_skill_ids(
+                available_tools=capabilities.planner_tool_names(tools),
             )
-            repair_user = json.dumps({
-                "tool_name": tool_name,
-                "rejected_arguments": arguments,
-                "validation_error": error,
-                "missing_required_fields": list(missing),
-                "required_schema": spec.args_model.model_json_schema(),
-                "current_hypothesis": state.current_hypothesis,
-                "known_entity_candidates": known_targets,
-            }, ensure_ascii=False, default=str)
-            try:
-                admit("contract_repair", count_llm=True)
-                timeout = provider_timeout(min(self.config.planner_llm_timeout_seconds, 30.0))
-                repaired = self._provider_call(
-                    complete_json_compat,
-                    provider, repair_system, repair_user,
-                    model=self.model or None,
-                    logical_timeout_seconds=timeout,
-                    hard_timeout_seconds=timeout,
-                    state_source=provider,
-                    state_attributes=("last_usage",),
-                )
-                add_usage(provider, stage="contract_repair")
-            except Exception as exc:
-                result = {
-                    "status": "failed",
-                    "failure_type": type(exc).__name__,
-                    "message": str(exc),
-                }
-                trace.record("TOOL_CONTRACT_REPAIR_RESULT", {
-                    "tool": tool_name, "repair_index": contract_repair_calls, **result,
-                })
-                return None, result
-            if not isinstance(repaired, dict):
-                result = {"status": "rejected", "reason": "repair_result_not_object"}
-                trace.record("TOOL_CONTRACT_REPAIR_RESULT", {
-                    "tool": tool_name, "repair_index": contract_repair_calls, **result,
-                })
-                return None, result
-            repaired_fields = {
-                name: repaired[name] for name in missing if name in repaired
-            }
-            merged = {**arguments, **repaired_fields}
-            validated, repaired_error = tools.validate_arguments(tool_name, merged)
-            result = {
-                "status": "accepted" if not repaired_error else "rejected",
-                "returned_fields": sorted(repaired_fields),
-                "normalized_arguments": dict(validated or merged),
-                "validation_error": repaired_error,
-            }
-            trace.record("TOOL_CONTRACT_REPAIR_RESULT", {
-                "tool": tool_name, "repair_index": contract_repair_calls, **result,
-            })
-            return (validated, result) if not repaired_error else (None, result)
 
-        def trigger_reflection(reason: str, *, review_feedback_text: str = "") -> str:
-            nonlocal reflection_calls, reflection_feedback, reflection_trigger, schema_repair_count
-            nonlocal llm_calls, reflection_no_delta_count, consecutive_reflection_no_delta
-            if (
-                CONVERGE_DISABLE_REFLECTIONS
-                and self.config.converge_disable_reflections
-                and state.step + 1 >= CONVERGE_START_STEP
-            ):
-                trace.record("REFLECTION_SKIPPED", {
-                    "reason": "converge_hard_call_budget",
-                    "trigger": reason,
-                    "converge_start_step": CONVERGE_START_STEP,
-                })
+        def trigger_reflection(*, review_feedback_text: str = "", **trigger_facts) -> str:
+            nonlocal active_skill
+            nonlocal reflection_calls, reflection_feedback, reflection_trigger, schema_repair_count, schema_repair_calls
+            nonlocal llm_calls
+            nonlocal reflection_no_delta_count, consecutive_reflection_no_delta
+            current = active_hypothesis()
+            trigger_decision = ProgressPolicy.evaluate(operational_facts(
+                "reflection_trigger",
+                contradiction_ids=tuple(item.evidence_id for item in canonical_rca_state.contradictions
+                                        if item.blocks_finalization),
+                **trigger_facts,
+            ))
+            if trigger_decision.reflection_trigger is None:
                 return ""
-            if not self.config.enable_reflection or self.config.max_reflection_calls == 0:
-                return ""
-            if consecutive_reflection_no_delta >= self.config.max_consecutive_reflection_calls:
-                trace.record("REFLECTION_BLOCKED", {
-                    "trigger": reason,
-                    "reason": "max_consecutive_reflection_without_runtime_delta",
-                    "max_consecutive_reflection_calls": self.config.max_consecutive_reflection_calls,
-                })
-                transition_phase("PLAN", "reflection_blocked_without_delta")
-                return ""
-            # Test doubles and old compatibility providers may only implement
-            # native planner calls. They simply cannot serve the optional role.
+            reason = trigger_decision.reflection_trigger.value
             provider = getattr(reflection_agent, "llm", None)
-            if not hasattr(provider, "complete_json") and not hasattr(provider, "complete_structured"):
-                trace.record("REFLECTION_SKIPPED", {
-                    "reason": "provider_has_no_json_reflection_api", "trigger": reason,
-                })
-                return ""
-            current = hypotheses[-1] if hypotheses else None
             signature = json.dumps({
                 "trigger": reason,
                 "hypothesis": self._material_hypothesis_fingerprint(current) if current else None,
                 "evidence": sorted(item.evidence_id for item in evidence_memory.pinned),
                 "review": review_feedback_text,
             }, sort_keys=True, ensure_ascii=False, default=str)
-            if signature in reflection_signatures:
-                trace.record("REFLECTION_SKIPPED", {
-                    "reason": "duplicate_trigger_signature", "trigger": reason,
+            permission = finalization_decision()
+            recovery = ProgressPolicy.evaluate(operational_facts(
+                "recovery", stage="reflection", recovery_count=reflection_calls,
+                recovery_limit=self.config.max_reflection_calls,
+                phase=budget_snapshot("reflection_schedule").phase,
+                finalization=permission,
+                targeted_recovery_allowed=not permission.allowed,
+                recovery_enabled=self.config.enable_reflection,
+                recovery_phase_restricted=CONVERGE_DISABLE_REFLECTIONS and self.config.converge_disable_reflections,
+                recovery_capability_available=hasattr(provider, "complete_structured"),
+                recovery_duplicate=signature in reflection_signatures,
+                consecutive_recovery_count=consecutive_reflection_no_delta,
+                consecutive_recovery_limit=self.config.max_consecutive_reflection_calls,
+            ))
+            if recovery.action == "stop":
+                blocked_without_delta = "max_consecutive_reflection_without_runtime_delta" in recovery.reasons
+                trace.record("REFLECTION_BLOCKED" if blocked_without_delta else "REFLECTION_SKIPPED", {
+                    "reason": recovery.reasons[0], "trigger": reason,
+                    "converge_start_step": CONVERGE_START_STEP,
+                    "max_consecutive_reflection_calls": self.config.max_consecutive_reflection_calls,
                 })
-                return ""
-            if reflection_calls >= self.config.max_reflection_calls:
-                trace.record("REFLECTION_SKIPPED", {
-                    "reason": "max_reflection_calls", "trigger": reason,
-                })
+                if blocked_without_delta:
+                    transition_phase("PLAN", "reflection_blocked_without_delta")
                 return ""
             reflection_signatures.add(signature)
             reflection_trigger = reason
@@ -2092,7 +3127,7 @@ class DiagnosisHarness:
             })
             snapshot = {
                 "current_hypothesis": current.model_dump() if current else None,
-                "relevant_evidence": [item.model_dump() for item in incident_evidence()
+                "relevant_evidence": [item.model_dump(exclude={"excerpt"}) for item in incident_evidence()
                                       if current is None or not current.supporting_evidence_ids
                                       or item.evidence_id in set(current.supporting_evidence_ids)
                                       or item.evidence_id in set(current.contradicting_evidence_ids)],
@@ -2112,6 +3147,20 @@ class DiagnosisHarness:
                 "review_feedback": review_feedback_text or None,
                 "prior_knowledge": prior_context.model_dump(mode="json") if prior_context else None,
             }
+            reflection_views = load_skill_views(feasible_skill_ids(), tools.official_aliases)
+            snapshot["feasible_skill_cards"] = [json.loads(view.card_json) for view in reflection_views]
+            snapshot["selected_semantic_projection"] = next(
+                (json.loads(view.semantic_json) for view in reflection_views if view.skill_id == active_skill), None,
+            )
+            snapshot["rca_state"] = canonical_rca_state.context_projection()
+            snapshot["capabilities"] = capabilities.planner_projection()
+            snapshot["hypothesis_scope"] = evidence_projector.hypothesis_scope_fingerprints(current)
+            snapshot["existing_evidence"] = evidence_memory.projection(
+                facts=projected_facts.values(), evidence_ids=canonical_rca_state.evidence_ids)
+            from debug_assistant.tools.provenance import registry_provenance_profiles, provenance_profile_catalog
+            snapshot["source_profiles"] = provenance_profile_catalog(registry_provenance_profiles(
+                tools, capabilities.planner_tool_names(tools)))
+            snapshot["available_tools"] = list(capabilities.planner_tool_names(tools))
             reflection_prior_capacity = dynamic_budget.available_prior_capacity(
                 critical_state_tokens=dynamic_budget.estimate_json_tokens({
                     "hypothesis": snapshot["current_hypothesis"],
@@ -2132,31 +3181,35 @@ class DiagnosisHarness:
                 bounded_reflection_prior.model_dump(mode="json")
                 if bounded_reflection_prior else None
             )
+            reflection_context = context_manager.build(
+                state, evidence_memory, observation_store,
+                max_context_chars=self.config.planner_context_chars,
+                max_context_tokens=dynamic_budget.context_token_budget(),
+                token_estimator=dynamic_budget.estimate_tokens,
+                include_agent_control_state=False, rca_state=canonical_rca_state,
+                role="reflection", max_request_chars=self.config.max_context_chars,
+                requested_ids=tuple(current.supporting_evidence_ids) if current else (),
+                request_renderer=lambda view: reflection_agent.render_envelope(snapshot, view),
+            )
             try:
                 admit("reflection", count_llm=True)
                 timeout = provider_timeout(self.config.planner_llm_timeout_seconds)
-                feedback = self._provider_call(
-                    reflection_agent.reflect, snapshot,
+                feedback = reflection_agent.reflect(
+                    snapshot, context_view=reflection_context.context_view,
                     logical_timeout_seconds=timeout,
+                    max_output_tokens=self.config.reflection_max_completion_tokens,
                     prompt_budget=dynamic_budget,
-                    hard_timeout_seconds=timeout,
-                    state_source=reflection_agent,
-                    state_attributes=(
-                        "last_usage", "last_call_count", "last_prompt_breakdown",
-                        "last_prompt_breakdowns",
-                        "last_normalization_actions", "last_metadata_drops",
-                        "last_metadata_warnings", "last_failure_type",
-                    ),
                 )
+                extra_calls = max(0, int(getattr(reflection_agent, "last_call_count", 1)) - 1)
                 add_usage(
                     reflection_agent, stage="reflection",
                     prompt_breakdown=getattr(reflection_agent, "last_prompt_breakdown", None),
                 )
-                extra_calls = max(0, int(getattr(reflection_agent, "last_call_count", 1)) - 1)
                 if extra_calls:
                     llm_calls += extra_calls
                     schema_repair_count += extra_calls
-                    if llm_calls > self.config.max_llm_calls:
+                    schema_repair_calls += extra_calls
+                    if ProgressPolicy.evaluate(operational_facts("post_usage")).action == "stop":
                         raise RuntimeError("max_llm_calls exceeded during reflection repair")
                     dynamic_budget.set_run_usage(
                         tokens_used=prompt_tokens + completion_tokens,
@@ -2168,6 +3221,10 @@ class DiagnosisHarness:
                         "call": reflection_calls, "trigger": reason,
                         "actions": list(reflection_agent.last_normalization_actions),
                     })
+                if getattr(reflection_agent, "last_symbol_normalizations", None):
+                    trace.record("MODEL_OUTPUT_CANONICALIZED", {
+                        "role": "reflection", "events": reflection_agent.last_symbol_normalizations,
+                    })
                 if (
                     getattr(reflection_agent, "last_metadata_drops", None)
                     or getattr(reflection_agent, "last_metadata_warnings", None)
@@ -2178,8 +3235,16 @@ class DiagnosisHarness:
                         "warnings": list(getattr(reflection_agent, "last_metadata_warnings", ())),
                     })
                 validate_reflection_feedback(feedback)
+                if feedback.skill_reselection and feedback.skill_reselection not in feasible_skill_ids():
+                    raise ValueError("Reflection Skill reselection requires a feasible canonical ID")
                 reflection_feedback = json.dumps(feedback.model_dump(), ensure_ascii=False)
                 delta_accepted = apply_reflection_delta(feedback, reason)
+                if feedback.skill_reselection and feedback.skill_reselection != active_skill:
+                    trace.record("SKILL_RESELECTION_ACCEPTED", {
+                        "from": active_skill, "to": feedback.skill_reselection,
+                        "source": "reflection_proposal", "semantic_guidance_visible": "next_planner_turn",
+                    })
+                    active_skill = feedback.skill_reselection
                 if delta_accepted:
                     consecutive_reflection_no_delta = 0
                 else:
@@ -2192,11 +3257,13 @@ class DiagnosisHarness:
                     "usage": dict(getattr(reflection_agent, "last_usage", {}) or {}),
                     "prompt_breakdown": dict(getattr(reflection_agent, "last_prompt_breakdown", {}) or {}),
                     "prompt_breakdowns": list(getattr(reflection_agent, "last_prompt_breakdowns", ()) or ()),
+                    "prompt_snapshots": [item.as_dict() for item in reflection_agent.last_prompt_snapshots],
                     **feedback.model_dump(),
                 })
                 transition_phase("PLAN", "reflection_completed", delta_accepted=delta_accepted)
                 return reflection_feedback
             except RunBudgetAdmissionExceeded as exc:
+                add_usage(reflection_agent, stage="reflection", call_status="failed")
                 llm_calls = max(0, llm_calls - 1)
                 reflection_calls = max(0, reflection_calls - 1)
                 dynamic_budget.set_run_usage(
@@ -2217,6 +3284,7 @@ class DiagnosisHarness:
                 })
                 return ""
             except PromptBudgetExceeded as exc:
+                add_usage(reflection_agent, stage="reflection", call_status="failed")
                 llm_calls = max(0, llm_calls - 1)
                 reflection_calls = max(0, reflection_calls - 1)
                 dynamic_budget.set_run_usage(
@@ -2235,6 +3303,7 @@ class DiagnosisHarness:
                 })
                 return ""
             except ReflectionContractExhausted as exc:
+                add_usage(reflection_agent, stage="reflection", call_status="failed")
                 transition_phase("INCONCLUSIVE", "reflection_contract_exhausted")
                 trace.record("REPAIR_FAILED", {
                     "layer": "reflection_contract",
@@ -2249,6 +3318,7 @@ class DiagnosisHarness:
                 })
                 raise
             except LLMDeadlineExceeded as exc:
+                add_usage(reflection_agent, stage="reflection", call_status="failed")
                 transition_phase("PLAN", "reflection_provider_timeout")
                 trace.record("REFLECTION_PROVIDER_FAILURE", {
                     "call": reflection_calls, "trigger": reason,
@@ -2262,6 +3332,7 @@ class DiagnosisHarness:
                 # rejection and must not consume a contract-repair slot.
                 return ""
             except Exception as exc:
+                add_usage(reflection_agent, stage="reflection", call_status="failed")
                 transition_phase("PLAN", "reflection_rejected_schema")
                 trace.record("REFLECTION_REJECTED_SCHEMA", {
                     "call": reflection_calls, "trigger": reason,
@@ -2272,378 +3343,207 @@ class DiagnosisHarness:
                 # not let a failed/timeout call reset the progress guard.
                 return ""
 
-        def hypothesis_can_finalize(hypothesis: IncidentHypothesis | None,
-                                    known_evidence_ids: set[str]) -> bool:
-            """Return the run-time completion predicate for this experiment arm.
-
-            Baseline keeps the same typed candidate and review protocol, but
-            deliberately omits the optimized evidence-sufficiency gate.  It
-            still requires enough known evidence IDs for the shared output
-            schema and evaluator to remain meaningful.
-            """
-            if hypothesis is None:
-                return False
-            if self.config.features.finalization_gate:
-                base_allowed = hypothesis.can_finalize(known_evidence_ids)
-            else:
-                base_allowed = len(set(hypothesis.supporting_evidence_ids)) >= 2
-            if not base_allowed or execution_mode != "dag":
-                return base_allowed
+        def finalization_decision() -> FinalizationDecision:
+            """Evaluate the one canonical Candidate publication contract."""
+            nonlocal last_convergence_decision
+            hypothesis = active_hypothesis()
             source_obligation = next(
                 (
-                    item for item in hypothesis.verification_obligations
+                    item for item in canonical_rca_state.obligations
                     if _is_source_mechanism_obligation(item)
                 ),
                 None,
             )
-            decision = evaluate_dag_finalization(
-                dag_state or VerificationDAGState(),
-                candidate_complete=all(
-                    bool(str(getattr(hypothesis, field) or "").strip())
-                    for field in ("component", "fault", "mechanism")
-                ) and len(set(hypothesis.supporting_evidence_ids)) >= 2,
-                evidence_sufficient=hypothesis.evidence_sufficient,
-                blocking_contradiction_open=any(
-                    item.blocks_finalization for item in hypothesis.contradictions
-                ),
-                source_requirement_satisfied=(
-                    source_obligation is None
-                    or source_obligation.status in {"SATISFIED", "NOT_APPLICABLE_BY_CAPABILITY"}
-                ),
-                # The existing Runtime's completion predicate already
-                # canonicalizes a newly completed candidate. A zero
-                # ``stable_rounds`` value here means the material hypothesis
-                # changed into its final form on this turn, not that the
-                # candidate is unsafe to route to Review.
-                hypothesis_stable=(hypothesis.stable_rounds >= 1 or base_allowed),
-                runtime_gate_allowed=True,
+            source_required = bool(
+                source_obligation
+                and source_obligation.status != "NOT_APPLICABLE_BY_CAPABILITY"
             )
-            trace.record("DAG_FINALIZATION_EVALUATED", {
-                "allowed": decision.finalize_allowed,
-                "terminal_status": decision.terminal_status,
-                "reasons": list(decision.reasons),
-                "dag_metrics": (dag_state or VerificationDAGState()).metrics(),
+            source_complete = True
+            if source_required and source_obligation is not None and hypothesis is not None:
+                cited_source_ids = set(source_evidence_ids()).intersection(
+                    source_obligation.supporting_evidence_ids
+                )
+                source_coverage = evaluate_source_claims(hypothesis.source_claims)
+                source_complete = bool(
+                    source_obligation.status == "SATISFIED"
+                    and cited_source_ids
+                    and (
+                        source_coverage["all_claims_covered"]
+                        if hypothesis.source_claims else True
+                    )
+                )
+            scopes = tuple(
+                evidence_projector.hypothesis_scope_fingerprints(hypothesis)
+                if hypothesis is not None else ()
+            )
+            decision = FinalizationPolicy.evaluate(
+                canonical_rca_state,
+                evidence_memory=evidence_memory,
+                evidence_sets=evidence_sets.values(),
+                projected_facts=projected_facts.values(),
+                facts=FinalizationFacts(
+                    hypothesis_scope_fingerprints=scopes,
+                    source_coverage_required=source_required,
+                    source_coverage_complete=source_complete,
+                    taxonomy_required=self.config.features.public_fault_taxonomy,
+                ),
+            )
+            convergence = ProgressPolicy.evaluate(operational_facts(
+                "convergence", finalization=decision,
+                hypothesis_stable=bool(hypothesis and hypothesis.stable_rounds >= 1),
+                open_obligation_ids=tuple(
+                    canonical_rca_state.open_critical_obligation_ids
+                ),
+                contradiction_ids=tuple(
+                    item.evidence_id
+                    for item in canonical_rca_state.contradictions
+                    if item.blocks_finalization
+                ),
+            )).convergence
+            last_convergence_decision = convergence
+            if self.config.features.semantic_convergence_v2:
+                trace.record("CONVERGENCE_DECISION", {
+                    **convergence.model_dump(mode="json"),
+                    "source": "canonical_finalization_policy",
+                })
+            else:
+                trace.record("PRELIMINARY_CONVERGENCE_DECISION", {
+                    **convergence.model_dump(mode="json"),
+                    "source": "canonical_finalization_policy",
+                })
+            trace.record("FINALIZATION_POLICY_EVALUATED", {
+                "step": state.step,
+                **decision.model_dump(mode="json"),
             })
-            return decision.finalize_allowed
+            return decision
 
-        def best_candidate_from_hypothesis() -> RootCauseCandidate | None:
-            if not hypotheses:
-                return None
-            hypothesis = hypotheses[-1]
-            known = {item.evidence_id for item in evidence_memory.pinned}
-            if not hypothesis_can_finalize(hypothesis, known):
-                return None
-            return self._candidate_from_hypothesis(hypothesis)
+        def record_terminal_convergence(*, terminal_status: str, reason: str) -> None:
+            """Emit one final A2 decision with explicit blocking semantics.
 
-        def finalize_candidate(candidate: RootCauseCandidate, source: str,
-                               *, hypothesis: IncidentHypothesis | None = None) -> RootCauseCandidate:
-            """The only candidate-producing boundary before Final Review."""
-            transition_phase("FINALIZE", source)
-            known_evidence_ids = {item.evidence_id for item in evidence_memory.pinned}
-            if execution_mode == "dag" and hypothesis is not None:
-                if not hypothesis_can_finalize(hypothesis, known_evidence_ids):
-                    raise DAGFinalizationBlocked(
-                        "DAG finalization predicate rejected the candidate"
-                    )
-            if any(not evidence_id.startswith("ev-") for evidence_id in candidate.evidence_ids):
-                raise RuntimeError("final candidate may cite only ev-* Evidence IDs")
-            if candidate.fault_code and not is_canonical_fault_code(candidate.fault_code):
-                trace.record("FAULT_TAXONOMY_REJECTED", {
-                    "fault_code": candidate.fault_code,
-                    "reason": "candidate fault code is outside the runtime canonical taxonomy",
-                })
-                raise RuntimeError("final candidate fault_code is not in canonical taxonomy")
-            if len(set(candidate.evidence_ids)) < 2:
-                raise RuntimeError("final candidate requires two distinct Evidence IDs")
-            if not set(candidate.evidence_ids).issubset(known_evidence_ids):
-                raise RuntimeError("final candidate cites unknown evidence")
-            candidate_ids = set(candidate.evidence_ids)
-
-            # Claim/causal metadata is an optional explanation of the frozen
-            # Hypothesis.  Providers sometimes copy a broader working-set
-            # citation list into these fields even though the Candidate core
-            # cites a narrower, validated set.  Do not turn that serialization
-            # drift into a runtime failure, and never promote the extra IDs:
-            # retain only metadata whose citations are already in the Candidate
-            # Evidence projection.  The Evidence and Review gates below remain
-            # unchanged.
-            dropped_mapping_count = 0
-            dropped_causal_count = 0
-            retained_mappings = []
-            for mapping in candidate.claim_evidence_mapping:
-                ids = set(mapping.evidence_ids)
-                if ids and ids.issubset(candidate_ids) and ids.issubset(known_evidence_ids):
-                    retained_mappings.append(mapping)
-                else:
-                    dropped_mapping_count += 1
-            retained_causal = []
-            for link in candidate.causal_chain_summary:
-                ids = set(link.evidence_ids)
-                if ids and ids.issubset(candidate_ids) and ids.issubset(known_evidence_ids):
-                    retained_causal.append(link)
-                else:
-                    dropped_causal_count += 1
+            The A1 path keeps its preliminary event above.  A2 additionally
+            records the terminal Runtime outcome, including budget and
+            capability bounds, so a safety stop cannot look like a semantic
+            PASS merely because the loop reached its max-step boundary.
+            """
+            nonlocal terminal_convergence_decision
             if (
-                dropped_mapping_count
-                or dropped_causal_count
-                or len(retained_mappings) != len(candidate.claim_evidence_mapping)
-                or len(retained_causal) != len(candidate.causal_chain_summary)
+                not self.config.features.semantic_convergence_v2
+                or execution_mode != "dag"
+                or self.config.context_projection_mode != "task_aware"
             ):
-                candidate = candidate.model_copy(update={
-                    "claim_evidence_mapping": tuple(retained_mappings),
-                    "causal_chain_summary": tuple(retained_causal),
-                })
-                trace.record("FINALIZATION_METADATA_NORMALIZED", {
+                terminal_convergence_decision = None
+                return
+            previous = last_convergence_decision
+            permission = finalization_decision()
+            current = active_hypothesis()
+            capability_blocked = bool(
+                canonical_rca_state.blocked_capability_obligation_ids
+                if hasattr(canonical_rca_state, "blocked_capability_obligation_ids")
+                else any(
+                    item.status == "BLOCKED_BY_CAPABILITY"
+                    for item in canonical_rca_state.obligations
+                )
+            )
+            decision = ProgressPolicy.evaluate(operational_facts(
+                "terminal", finalization=permission,
+                terminal_status=terminal_status, terminal_reason=reason,
+                previous_convergence=previous,
+                hypothesis_stable=bool(current and current.stable_rounds >= 1),
+                open_obligation_ids=tuple(
+                    canonical_rca_state.open_critical_obligation_ids
+                ),
+                contradiction_ids=tuple(
+                    item.evidence_id
+                    for item in canonical_rca_state.contradictions
+                    if item.blocks_finalization
+                ),
+                capability_blocked=capability_blocked,
+            )).convergence
+            trace.record("CONVERGENCE_DECISION", {
+                **decision.model_dump(mode="json"),
+                "source": "runtime_terminal_policy",
+                "canonical_reused": decision is previous,
+                "terminal_runtime_status": terminal_status,
+                "termination_reason": reason,
+            })
+            terminal_convergence_decision = decision
+
+        def finalize_candidate(source: str) -> RootCauseCandidate:
+            """Publish only the Candidate projected by FinalizationPolicy."""
+            transition_phase("FINALIZE", source)
+            decision = finalization_decision()
+            publication = ProgressPolicy.evaluate(operational_facts(
+                "publication", finalization=decision, stage=source,
+            ))
+            if publication.action == "stop":
+                trace.record("FINALIZATION_REJECTED", {
                     "source": source,
-                    "dropped_claim_mappings": dropped_mapping_count,
-                    "dropped_causal_links": dropped_causal_count,
-                    "reason": "optional structured metadata cited Evidence outside frozen Candidate",
+                    "reasons": [item.model_dump(mode="json") for item in decision.reasons],
                 })
-            mapping_ids = {
-                evidence_id
-                for mapping in candidate.claim_evidence_mapping
-                for evidence_id in mapping.evidence_ids
-            }
-            causal_ids = {
-                evidence_id
-                for link in candidate.causal_chain_summary
-                for evidence_id in link.evidence_ids
-            }
-            structured_ids = mapping_ids | causal_ids
-            if any(not evidence_id.startswith("ev-") or evidence_id not in known_evidence_ids
-                   for evidence_id in structured_ids):
-                raise RuntimeError("final candidate structured reasoning cites unknown evidence")
-            if not mapping_ids.issubset(candidate_ids) or not causal_ids.issubset(candidate_ids):
-                raise RuntimeError("final candidate structured reasoning cites evidence outside candidate")
-            # Older native providers do not yet emit the optional structured
-            # fields. Create a minimal auditable projection at this boundary;
-            # this is not a chain-of-thought copy and keeps the old contract
-            # compatible while making Review see a causal structure.
-            if not candidate.claim_evidence_mapping:
-                candidate = RootCauseCandidate.model_validate({
-                    **candidate.model_dump(),
-                    "claim_evidence_mapping": (
-                        {
-                            "claim": f"{candidate.component}: {candidate.fault}",
-                            "evidence_ids": tuple(candidate.evidence_ids),
-                        },
-                    ),
-                })
-            if not candidate.causal_chain_summary:
-                candidate = RootCauseCandidate.model_validate({
-                    **candidate.model_dump(),
-                    "causal_chain_summary": (
-                        {
-                            "cause": candidate.fault,
-                            "effect": candidate.mechanism,
-                            "evidence_ids": tuple(candidate.evidence_ids),
-                        },
-                    ),
-                })
-            if hypothesis is not None:
-                source_obligation = next(
-                    (
-                        item for item in hypothesis.verification_obligations
-                        if _is_source_mechanism_obligation(item)
-                    ),
-                    None,
-                )
-                if source_obligation is not None:
-                    source_capability_gaps = []
-                    if not source_workspace_available:
-                        source_capability_gaps.append("source_workspace")
-                    if "application_code" not in case.evidence_sources:
-                        source_capability_gaps.append("application_code")
-                    if "read_file" not in available_code_tools:
-                        source_capability_gaps.append("read_file")
-                    source_capability_available = not source_capability_gaps
-                    cited_source_ids = tuple(
-                        evidence_id for evidence_id in source_evidence_ids()
-                        if evidence_id in set(source_obligation.supporting_evidence_ids)
-                    )
-                    source_relevance = evaluate_source_claims(hypothesis.source_claims)
-                    source_state_valid = (
-                        source_obligation.status == "SATISFIED"
-                        and bool(cited_source_ids)
-                        and source_relevance["all_claims_covered"]
-                        if source_capability_available
-                        else source_obligation.status == "NOT_APPLICABLE_BY_CAPABILITY"
-                    )
-                    if not source_state_valid:
-                        trace.record("FINALIZATION_REJECTED", {
-                            "source": source,
-                            "reason": "source_obligation_not_runtime_validated",
-                            "obligation": source_obligation.model_dump(),
-                            "capability_available": source_capability_available,
-                            "capability_gaps": source_capability_gaps,
-                            "cited_source_evidence_ids": list(cited_source_ids),
-                            "source_relevance": source_relevance,
-                        })
-                        raise RuntimeError(
-                            "source verification obligation is not Runtime-validated"
-                        )
-                if self.config.features.finalization_gate and not hypothesis.can_finalize(known_evidence_ids):
-                    raise RuntimeError("final candidate is not supported by a complete hypothesis")
-                omitted_support = tuple(
-                    evidence_id for evidence_id in candidate.evidence_ids
-                    if evidence_id not in hypothesis.supporting_evidence_ids
-                )
-                if omitted_support:
-                    # Native tool calls carry two related representations of the
-                    # same state: the candidate's cited Evidence and the current
-                    # Hypothesis support set. Providers can omit an otherwise valid
-                    # candidate citation from the latter. Reconcile only known
-                    # ev-* IDs at this single deterministic boundary; unknown IDs
-                    # have already failed closed above.
-                    merged_support = tuple(dict.fromkeys(
-                        (*hypothesis.supporting_evidence_ids, *omitted_support)
-                    ))
-                    reconciled = hypothesis.model_copy(update={
-                        "supporting_evidence_ids": merged_support,
-                    })
-                    if self.config.features.finalization_gate and not reconciled.can_finalize(known_evidence_ids):
-                        raise RuntimeError("final candidate is not supported by a complete hypothesis")
-                    if hypotheses and hypotheses[-1] == hypothesis:
-                        hypotheses[-1] = reconciled
-                    state.current_hypothesis = reconciled.model_dump()
-                    trace.record("FINALIZATION_HYPOTHESIS_RECONCILED", {
-                        "source": source,
-                        "candidate_evidence_ids": list(candidate.evidence_ids),
-                        "omitted_supporting_evidence_ids": list(omitted_support),
-                        "supporting_evidence_ids": list(merged_support),
-                    })
+                raise FinalizationBlocked(decision)
+            candidate = decision.candidate
             trace.record("FINALIZATION_VALIDATED", {
                 "source": source,
                 "candidate": candidate.model_dump(),
-                "known_evidence_count": len(known_evidence_ids),
+                "decision": decision.model_dump(mode="json"),
             })
             trace.record("ROOT_CAUSE_CANDIDATE", {
                 **candidate.model_dump(), "source": source,
             })
             return candidate
 
-        def run_dag_action(call, validated: dict[str, Any], selection) -> ToolObservation:
-            """Route one Planner action through the fixed LangGraph topology."""
-            nonlocal dag_state, dag_replan_pending, dag_task_sequence
-            if dag_graph is None or dag_harness is None:
-                raise RuntimeError("DAG execution mode is not initialized")
-            dag_task_sequence += 1
-            task_id = f"vt-{state.step:04d}-{dag_task_sequence:04d}"
-            obligation_id = str(getattr(selection, "obligation_id", "") or "")
-            if not obligation_id:
-                obligation_id = f"dag-obligation-{task_id}"
-            dependencies: tuple[str, ...] = ()
-            if dag_state is not None and obligation_id:
-                prior_id = next(
-                    (
-                        item.get("task_id")
-                        for item in reversed(actions)
-                        if item.get("obligation_id") == obligation_id
-                        and item.get("dag_task_id")
-                    ),
-                    None,
-                )
-                if prior_id and dag_state.task(prior_id).status == "SATISFIED":
-                    dependencies = (prior_id,)
-            claim = " ".join(
-                str(
-                    getattr(selection, "evidence_gap", "")
-                    or getattr(selection, "current_hypothesis", "")
-                    or f"Acquire canonical evidence through {call.name}."
-                ).split()
-            ).strip()
-            requirement = " ".join(
-                str(
-                    getattr(selection, "evidence_gap", "")
-                    or getattr(selection, "expected_information_gain", "")
-                    or f"A successful {call.name} observation admitted as Evidence."
-                ).split()
-            ).strip()
-            task = VerificationTask(
-                task_id=task_id,
-                claim=claim or f"Acquire evidence through {call.name}.",
-                evidence_requirement=requirement or "Canonical Evidence from the existing Harness.",
-                dependencies=dependencies,
-                # A Planner-selected evidence acquisition task represents the
-                # current verification gap even when an older Provider does
-                # not emit an obligation ID. Keep it critical so successful
-                # task-linked Evidence remains visible to Context projection;
-                # failed acquisition remains fail-closed until replan.
-                critical=True,
-            )
-            dag_action_registry[task_id] = (call, dict(validated), call.name)
-            dag_task_metrics["planned"] += 1
-            trace.record("DAG_TASK_PLANNED", {
-                "task_id": task_id,
-                "claim": task.claim,
-                "evidence_requirement": task.evidence_requirement,
-                "dependencies": list(task.dependencies),
-                "critical": task.critical,
-                "obligation_id": obligation_id,
-                "step": state.step,
+        def observe_action_progress(*, canonical_progress: bool,
+                                    acquisition_progress: bool = False) -> RootCauseCandidate | None:
+            """Forward one operational decision; recovery still submits reducer events."""
+            nonlocal termination_reason
+            version_before_recovery = canonical_rca_state.event_count
+            if state.repeated_actions:
+                trigger_reflection(repeated_count=state.repeated_actions)
+            canonical_progress = canonical_progress or canonical_rca_state.event_count != version_before_recovery
+            facts = operational_facts("progress", canonical_progress=canonical_progress,
+                                      acquisition_progress=acquisition_progress)
+            decision = ProgressPolicy.evaluate(facts)
+            state.no_progress_count = decision.no_progress_count
+            trace.record("PROGRESS_POLICY_DECISION", {
+                "action": decision.action, "reasons": list(decision.reasons),
+                "no_progress_count": decision.no_progress_count,
+                "canonical_progress": canonical_progress, "acquisition_progress": acquisition_progress,
             })
-            replan_requested = False
-            replan_tasks: tuple[VerificationTask, ...] = ()
-            if dag_state is None:
-                dag_state = dag_harness.initialize(
-                    (task,),
-                    known_evidence_ids=(item.evidence_id for item in evidence_memory.pinned),
-                )
-            elif dag_replan_pending and dag_state.local_replan_count < dag_harness.max_local_replans:
-                replan_requested = True
-                replan_tasks = (task,)
-                trace.record("DAG_LOCAL_REPLAN_REQUESTED", {
-                    "task_id": task_id,
-                    "local_replan_count": dag_state.local_replan_count + 1,
-                    "reason": "previous verification task was blocked or contradicted",
-                })
-            else:
-                if dag_replan_pending:
-                    trace.record("DAG_LOCAL_REPLAN_LIMIT_REACHED", {
-                        "task_id": task_id,
-                        "local_replan_count": dag_state.local_replan_count,
-                    })
-                    dag_replan_pending = False
-                dag_state = dag_harness.add_tasks(dag_state, (task,))
-            graph_result = dag_graph.run(
-                dag_state,
-                replan_tasks=replan_tasks,
-                replan_requested=replan_requested,
-            )
-            if graph_result.get("terminal_status") == "FAILED":
-                raise RuntimeError(
-                    "DAG adapter failed: " + str(graph_result.get("error_message") or "unknown error")
-                )
-            dag_state = VerificationDAGState.model_validate(graph_result["dag_state"])
-            completed_task = dag_state.task(task_id)
-            observation = dag_observations.pop(task_id, None)
-            if observation is None:
-                raise RuntimeError(f"DAG task produced no Harness observation: {task_id}")
-            if completed_task.status == "SATISFIED":
-                dag_task_metrics["satisfied"] += 1
-                dag_replan_pending = False
-            elif completed_task.status == "CONTRADICTED":
-                dag_task_metrics["contradicted"] += 1
-                dag_replan_pending = True
-            else:
-                dag_task_metrics["blocked"] += 1
-                dag_replan_pending = True
-            trace.record("DAG_TASK_EXECUTED", {
-                "task_id": task_id,
-                "status": completed_task.status,
-                "evidence_ids": list(
-                    completed_task.supporting_evidence_ids
-                    or completed_task.contradicting_evidence_ids
-                ),
-                "dag_state_metrics": dag_state.metrics(),
-            })
-            return observation
+            if decision.action == "stop":
+                raise RuntimeError("investigation no-progress limit exceeded: " + ", ".join(decision.reasons))
+            if decision.action == "finalize":
+                termination_reason = "semantic_no_progress_sufficient_hypothesis"
+                return finalize_candidate(termination_reason)
+            if decision.action == "retry":
+                version_before = canonical_rca_state.event_count
+                trigger_reflection(no_progress_count=state.no_progress_count)
+                permission = finalization_decision()
+                decision = ProgressPolicy.evaluate(replace(
+                    facts, finalization=permission, recovery_available=False,
+                    canonical_progress=canonical_rca_state.event_count != version_before,
+                ))
+                state.no_progress_count = decision.no_progress_count
+                if decision.action == "stop":
+                    raise RuntimeError("investigation no-progress limit exceeded")
+                if decision.action == "finalize":
+                    ensure_candidate = permission.candidate
+                    assert ensure_candidate is not None
+                    termination_reason = "semantic_no_progress_sufficient_hypothesis"
+                    return finalize_candidate(termination_reason)
+            return None
+
+
+
+
+
+
 
         def investigate(step_limit: int, tool_limit: int, review_feedback: str = "",
                         review_baseline: RootCauseCandidate | None = None,
                         review_evidence_ids: frozenset[str] = frozenset(),
                         review_hypothesis: IncidentHypothesis | None = None) -> RootCauseCandidate:
             nonlocal active_skill, evidence_sufficient_step, evidence_sufficient_tool_calls
+            nonlocal evidence_admission_rejections
             nonlocal converge_read_file_calls
             nonlocal final_candidate_step, termination_reason
             nonlocal duplicate_calls
@@ -2651,17 +3551,27 @@ class DiagnosisHarness:
             nonlocal prior_context
             nonlocal llm_calls, planner_calls
             nonlocal consecutive_reflection_no_delta
-            nonlocal tool_contract_repairs
+
+            nonlocal runtime_action_constraint
+            nonlocal runtime_tool_visibility_override
+
+            nonlocal dag_state, interpretation_view, bootstrap_pending_observation_ids
             start_steps, start_tools = state.step, state.tool_calls
             prompt_compaction_attempts = 0
+            local_recovery_offered = False
 
             def progress_marker() -> ProgressMarker:
-                current = hypotheses[-1] if hypotheses else None
+                current = active_hypothesis()
                 hypothesis_identity = (
-                    json.dumps(current.model_dump(), ensure_ascii=False, sort_keys=True, default=str)
+                    json.dumps(self._material_hypothesis_fingerprint(current), sort_keys=True)
                     if current is not None else ""
                 )
+                scopes = set(evidence_projector.hypothesis_scope_fingerprints(current))
                 return ProgressMarker(
+                    qualified_requirements=frozenset((item.obligation_id, slot)
+                        for item in evidence_sets.values()
+                        if set(item.hypothesis_scope_fingerprints) == scopes
+                        for slot, evidence_ids in item.coverage.items() if evidence_ids),
                     evidence_ids=frozenset(item.evidence_id for item in evidence_memory.pinned),
                     hypothesis=(hypothesis_identity,),
                     open_obligations=frozenset(
@@ -2677,39 +3587,107 @@ class DiagnosisHarness:
                     ),
                 )
 
-            def visible_tool_names() -> tuple[str, ...] | None:
-                """Expose a capability/stage slice without changing authority.
+            def skill_tool_surface(skill_id: str) -> tuple[str, ...]:
+                """Return one Skill's permission- and capability-valid Tool surface."""
+                allowed = capabilities.planner_tool_names(tools)
+                names = list(domain_registry.tool_names_for_context(
+                    skill_id,
+                    available_tools=allowed,
+                ))
+                names.extend(
+                    tools.official_aliases[action["tool"]]
+                    for node in domain_registry.load_skill(skill_id).graph_nodes
+                    for action in node["actions"]
+                    if tools.official_aliases.get(action["tool"]) in set(allowed)
+                )
+                if "read_file" in names:
+                    names.extend(
+                        name for name in available_code_tools if name in set(allowed)
+                    )
+                if knowledge_enabled and "knowledge_retrieval" in set(allowed):
+                    names.append("knowledge_retrieval")
+                if "finalize_diagnosis" in set(allowed):
+                    names.append("finalize_diagnosis")
+                return tuple(dict.fromkeys(names))
 
-                The registry remains the permission and validation authority.
-                Capability state is applied on the initial turn as well; a
-                later Skill transition can further reduce the already-valid
-                surface without changing execution authority.
-                """
+            def visible_tool_names() -> tuple[str, ...] | None:
+                """Expose the union of capability-feasible canonical Skill surfaces."""
                 allowed = set(capabilities.planner_tool_names(tools))
-                if not self.config.features.lightweight_skills or not active_skill:
-                    return tuple(sorted(allowed))
-                skill_spec = INCIDENT_SKILLS.get(active_skill)
-                names = set(skill_spec.suggested_tools if skill_spec else ())
-                names.update(available_code_tools)
-                names.add("finalize_diagnosis")
-                if knowledge_enabled:
-                    names.add("knowledge_retrieval")
+                names = {
+                    tool_name
+                    for skill_id in feasible_skill_ids()
+                    for tool_name in skill_tool_surface(skill_id)
+                }
+                if runtime_tool_visibility_override is not None:
+                    requested = set(runtime_tool_visibility_override)
+                    available_override = requested.intersection(allowed)
+                    # A Router family can contain tools whose backing
+                    # capability became EMPTY/UNAVAILABLE after the prior
+                    # observation. Never send an empty native Tool schema:
+                    # fall back to the currently available registry slice and
+                    # let the next Runtime admission decide the action.
+                    names = available_override or allowed
+                # Keep the surface non-empty when a manifest has no applicable
+                # Skill projection for a newly registered executable Tool.
+                if not names and allowed:
+                    names = allowed
+                # Finalization is a Runtime permission, not merely a Planner
+                # convention.  When the canonical predicate is false, do not
+                # expose the terminal Tool for another doomed proposal.  The
+                # taxonomy/evidence blockers remain visible in control state;
+                # the Planner must select an evidence-changing action.
+                try:
+                    finalize_allowed = planner_finalization_projection().allowed
+                except NameError:
+                    finalize_allowed = False
+                if not finalize_allowed:
+                    names.discard("finalize_diagnosis")
                 return tuple(sorted(names.intersection(allowed)))
+
+            def load_domain_skill(skill_id: str):
+                if not skill_id:
+                    return None
+                try:
+                    skill = domain_registry.load_skill(skill_id)
+                except KeyError:
+                    return None
+                trace.record("SKILL_LOADED", {
+                    "step": state.step + 1,
+                    "skill_id": skill.skill_id,
+                    "manifest_sha256": domain_registry.manifest_sha256,
+                    "node_count": len(skill.nodes),
+                    "source_sha256": skill.source_sha256,
+                    "derived_sha256": skill.derived_sha256,
+                })
+                trace.record("SKILL_CONTEXT_SELECTED", {
+                    "step": state.step + 1,
+                    "skill_id": skill.skill_id,
+                    "source": "canonical_skill_projection",
+                })
+                return skill
 
             def ensure_review_progress(candidate: RootCauseCandidate,
                                         current_hypothesis: IncidentHypothesis | None) -> None:
-                if review_baseline is None or current_hypothesis is None:
-                    return
                 current_evidence_ids = {
                     item.evidence_id for item in evidence_memory.pinned
                 }
-                if self._review_progress_made(
-                        review_baseline, candidate, review_evidence_ids,
-                        current_evidence_ids, review_hypothesis, current_hypothesis):
+                decision = ProgressPolicy.evaluate(operational_facts(
+                    "review",
+                    baseline_candidate_fingerprint=(self._candidate_semantic_fingerprint(review_baseline)
+                                                    if review_baseline else None),
+                    candidate_fingerprint=self._candidate_semantic_fingerprint(candidate),
+                    baseline_hypothesis_fingerprint=(self._hypothesis_semantic_fingerprint(review_hypothesis)
+                                                     if review_hypothesis else None),
+                    hypothesis_fingerprint=(self._hypothesis_semantic_fingerprint(current_hypothesis)
+                                            if current_hypothesis else None),
+                    baseline_evidence_ids=tuple(sorted(review_evidence_ids)),
+                    evidence_ids=tuple(sorted(current_evidence_ids)),
+                ))
+                if decision.action == "continue":
                     return
                 trace.record("REVIEW_REFINALIZE_BLOCKED", {
                     "step": state.step,
-                    "reason": "review_feedback_has_no_semantic_progress",
+                    "reason": decision.reasons[0],
                     "baseline_candidate": review_baseline.model_dump(),
                     "candidate": candidate.model_dump(),
                     "baseline_evidence_ids": sorted(review_evidence_ids),
@@ -2719,81 +3697,450 @@ class DiagnosisHarness:
                     "Review feedback was not addressed before re-finalization"
                 )
 
-            while state.step - start_steps < step_limit:
-                progress_before_action = progress_marker()
-                tool_budget_remaining = max(0, tool_limit - (state.tool_calls - start_tools))
-                agent_steps_remaining = max(0, step_limit - (state.step - start_steps))
-                runtime_budget = budget_snapshot("investigation_loop")
-                if runtime_budget.phase == "finalize":
-                    fallback = best_candidate_from_hypothesis()
-                    if fallback is None:
-                        raise RuntimeError("finalization reserve reached without a complete hypothesis")
-                    ensure_review_progress(fallback, hypotheses[-1] if hypotheses else None)
-                    termination_reason = "finalization_reserve_sufficient_hypothesis"
-                    return finalize_candidate(
-                        fallback, termination_reason, hypothesis=hypotheses[-1],
+            def planner_finalization_projection() -> FinalizationDecision:
+                """Expose the exact typed Runtime decision to the Planner."""
+                return finalization_decision()
+
+            def planner_action_requirement() -> dict[str, Any]:
+                """Describe the one open semantic question the next Tool must target."""
+                current = active_hypothesis()
+                open_obligations = tuple(
+                    item for item in (
+                        canonical_rca_state.obligations
+                        if canonical_rca_state.obligations
+                        else (current.verification_obligations if current else ())
                     )
-                if state.tool_calls >= self.config.max_tool_calls:
-                    fallback = best_candidate_from_hypothesis()
-                    if fallback is None:
-                        raise RuntimeError("max_tool_calls exceeded before finalization")
-                    ensure_review_progress(fallback, hypotheses[-1] if hypotheses else None)
-                    termination_reason = "max_tool_calls_sufficient_hypothesis"
-                    return finalize_candidate(
-                        fallback, termination_reason, hypothesis=hypotheses[-1],
+                    if item.status == "OPEN" and item.blocks_finalization
+                )
+                active = open_obligations[0] if open_obligations else None
+                projection = planner_finalization_projection()
+                finalization_allowed = projection.allowed
+                blocking_contradictions = tuple(
+                    item for item in canonical_rca_state.contradictions
+                    if item.blocks_finalization and item.status == "OPEN"
+                )
+                missing_public_fault_code = bool(
+                    self.config.features.public_fault_taxonomy
+                    and current
+                    and not current.fault_code.strip()
+                    and not open_obligations
+                    and not blocking_contradictions
+                )
+                semantic_support_missing = bool(
+                    current
+                    and any(
+                        item.code == "direct_causal_support_missing"
+                        for item in projection.reasons
                     )
-                if (
-                    evidence_sufficient_tool_calls is not None
-                    and state.tool_calls - evidence_sufficient_tool_calls
-                    >= self.config.max_post_sufficiency_tool_calls
-                ):
-                    fallback = best_candidate_from_hypothesis()
-                    if fallback is not None:
-                        termination_reason = "post_sufficiency_tool_budget"
-                        trace.record("BUDGET_AWARE_CONVERGENCE", {
-                            "step": state.step,
-                            "tool_calls": state.tool_calls,
-                            "evidence_sufficient_step": evidence_sufficient_step,
-                            "evidence_sufficient_tool_calls": evidence_sufficient_tool_calls,
-                            "post_sufficiency_tool_calls": (
-                                state.tool_calls - evidence_sufficient_tool_calls
-                            ),
-                            "limit": self.config.max_post_sufficiency_tool_calls,
-                            "reason": "bounded verification window ended",
-                        })
-                        ensure_review_progress(fallback, hypotheses[-1])
-                        return finalize_candidate(
-                            fallback, termination_reason, hypothesis=hypotheses[-1],
+                )
+                # Do not tell the Planner to acquire evidence after the same
+                # Runtime predicate has explicitly allowed finalization. When
+                # the predicate is false without an OPEN obligation, retain
+                # the current gap as a recovery hint so the Planner can create
+                # or target the missing structured verification question.
+                needs_evidence = bool(
+                    active
+                    or (
+                        current
+                        and not finalization_allowed
+                        and not missing_public_fault_code
+                    )
+                )
+                return {
+                    "hypothesis": current.claim if current else "",
+                    "obligation_id": active.id if active else "",
+                    "open_obligation": active.claim if active else "",
+                    "verification_question": (
+                        active.verification_question if active else ""
+                    ),
+                    "evidence_need": (
+                        active.evidence_requirement
+                        if active else (
+                            "Revise the current evidence-supported RCA and populate the exact "
+                            "canonical public fault_code; the canonical EvidenceSet is closed, "
+                            "so do not create another Obligation or request a duplicate Tool."
+                            if missing_public_fault_code else
+                            "Acquire a new Evidence fact that directly supports the "
+                            "current RCA, or revise the RCA to match the strongest "
+                            "observed Evidence; do not repeat an executed action."
+                            if semantic_support_missing else
+                            (current.evidence_gap if needs_evidence and current else "")
                         )
+                    ),
+                    "must_acquire_new_canonical_evidence": needs_evidence,
+                    "must_not_repeat_acquired_data": True,
+                }
+
+
+
+
+
+            def execute_plan(result, turn_input, hypothesis) -> None:
+                """Execute one admitted plan through the sole DAG and ActionRuntime."""
+                nonlocal dag_state, active_skill, prior_context, duplicate_calls
+                nonlocal converge_read_file_calls, runtime_action_constraint
+                nonlocal runtime_tool_visibility_override
+                continuation = result.continuation
+                plan = continuation.admitted_plan
+                if plan is None or len(result.skill_selections) != 1:
+                    raise RuntimeError("admitted plan requires one committed semantic selection")
+                preflight = ContinuationPolicy.execution_barrier(
+                    canonical_rca_state, continuation,
+                    target_obligation_id=plan.tasks[0].target_obligation_id,
+                    state_snapshot_hash=turn_input.state_snapshot_hash,
+                )
+                if preflight.action != "execute":
+                    trace.record("SEMANTIC_BARRIER", {
+                        "step": state.step, "reason_code": preflight.reason,
+                        "committed_state_version": canonical_rca_state.event_count,
+                        "observation_ids": [],
+                    })
+                    transition_phase("PLAN", preflight.reason)
+                    return
+                selection = result.skill_selections[0]
+                previous_skill = active_skill
+                active_skill = selection.skill
+                load_domain_skill(active_skill)
+                if previous_skill != active_skill:
+                    trace.record("SKILL_TRANSITION", {
+                        "step": state.step, "from": previous_skill or None,
+                        "to": active_skill, "reason": selection.reason,
+                    })
+                trace.record("DOMAIN_SKILL_SELECTED", {
+                    "step": state.step, "skill_id": active_skill,
+                    "selection_authority": "planner_proposal_runtime_validated",
+                    "ordering": "before_tool_execution",
+                })
+                if hypothesis is None:
+                    raise RuntimeError("execution plan has no committed hypothesis")
+                if dag_state is None:
+                    dag_state = dag_harness.initialize(
+                        (), obligation_ids=(item.id for item in canonical_rca_state.obligations),
+                    )
+                else:
+                    project_obligation_ids_to_dag("plan_admission")
+                # Provider task IDs are local to the plan; DAG history is run scoped.
+                task_ids = {task.task_id: f"vt-{state.step:04d}-{task.task_id}" for task in plan.tasks}
+                dag_state = dag_harness.add_tasks(dag_state, (
+                    VerificationTask(
+                        task_id=task_ids[task.task_id], obligation_id=task.target_obligation_id,
+                        dependencies=tuple(task_ids[key] for key in task.dependencies),
+                    ) for task in plan.tasks
+                ))
+                dag_task_metrics["planned"] += len(plan.tasks)
+                for task in plan.tasks:
+                    trace.record("DAG_TASK_PLANNED", {
+                        "task_id": task_ids[task.task_id], "plan_task_id": task.task_id,
+                        "obligation_id": task.target_obligation_id,
+                        "dependencies": list(task.dependencies), "step": state.step,
+                    })
+                trace.record("EXECUTION_BURST_STARTED", {
+                    "step": state.step, "task_count": len(plan.tasks),
+                    "task_ids": list(task_ids.values()),
+                    "committed_state_version": plan.committed_state_version,
+                    "transport_profile": self.transport_profile,
+                })
+                burst_observation_ids: list[str] = []
+                executed = 0
+                barrier = None
+                burst_error = None
+                while barrier is None:
+                    pending = [task for task in plan.tasks
+                               if not dag_state.task(task_ids[task.task_id]).terminal]
+                    task = next((item for item in pending
+                                 if dag_state.task(task_ids[item.task_id]).status == "READY"), None)
+                    barrier_check = ContinuationPolicy.execution_barrier(
+                        canonical_rca_state, continuation,
+                        target_obligation_id=task.target_obligation_id if task else None,
+                        state_snapshot_hash=turn_input.state_snapshot_hash,
+                        ready=task is not None, complete=not pending,
+                    )
+                    if barrier_check.action != "execute":
+                        barrier = barrier_check
+                        break
+                    try:
+                        upstream = {
+                            key: asdict(observation_store.get(dag_state.task(task_ids[key]).result_ref))
+                            for key in task.dependencies
+                            if dag_state.task(task_ids[key]).status == "COMPLETED"
+                            and observation_store.get(dag_state.task(task_ids[key]).result_ref) is not None
+                        }
+                        call = compile_planned_action(
+                            task, tools,
+                            state_fields={**canonical_rca_state.context_projection(), "incident_id": case.case_id},
+                            upstream_observations=upstream,
+                        )
+                    except VerificationPlanError as exc:
+                        barrier = ContinuationPolicy.execution_barrier(
+                            canonical_rca_state, continuation,
+                            target_obligation_id=task.target_obligation_id, binding_reason=exc.reason_code,
+                        )
+                        break
+                    trace.record("ACTION_COMPILED", {
+                        "step": state.step, "task_id": task_ids[task.task_id],
+                        "plan_task_id": task.task_id, "operation": call.name,
+                        "arguments": call.arguments, "compiler": "deterministic",
+                        "provider_calls": 0,
+                    })
+                    permitted = skill_tool_surface(task.skill_id)
+                    context = ActionExecutionContext(
+                        action=ActionProposal(
+                            kind=ActionKind.TOOL, skill=task.skill_id, reason="admitted_plan_task",
+                            tool=call.name, arguments=call.arguments,
+                        ),
+                        permitted_tool_names=permitted,
+                        visible_tool_names=turn_input.visible_tool_names,
+                        capability_tool_names=tuple(capabilities.planner_tool_names(tools)),
+                        absolute_deadline=deadline.absolute_deadline,
+                        requested_for=InvestigationUse(task.target_obligation_id, task.target_fact_slot,
+                            tuple(evidence_projector.hypothesis_scope_fingerprints(hypothesis)),
+                            task.task_id, task.node_id),
+                    )
+                    admission = action_runtime.admit(context)
+                    if not admission.allowed:
+                        if admission.reason_code == "ACTION_ACQUISITION_ALREADY_ACQUIRED":
+                            duplicate_calls += 1
+                            state.repeated_actions += 1
+                        if admission.duplicate is not None:
+                            trace.record("ACQUISITION_DUPLICATE", {**asdict(admission.duplicate),
+                                "requested_for": asdict(context.requested_for)})
+                            if not interpretation_view.is_observation_visible(admission.duplicate.existing_observation_id):
+                                trace.record("EXISTING_ACQUISITION_NOT_VISIBLE", {
+                                    **asdict(admission.duplicate), "reason_code": "existing_acquisition_not_visible"})
+                        rejected_actions.append({
+                            "step": state.step, "tool": call.name,
+                            "arguments": call.arguments, "reason": admission.reason_code,
+                            "existing_observation_id": admission.duplicate.existing_observation_id if admission.duplicate else None,
+                        })
+                        trace.record("ACTION_REJECTED", rejected_actions[-1])
+                        barrier = ContinuationPolicy.execution_barrier(
+                            canonical_rca_state, continuation,
+                            target_obligation_id=task.target_obligation_id,
+                            binding_reason=admission.reason_code,
+                        )
+                        break
+                    capacity = ProgressPolicy.evaluate(operational_facts(
+                        "admission", stage="tool",
+                        tool_limit=min(self.config.max_tool_calls, start_tools + tool_limit),
+                    ))
+                    if capacity.action == "stop":
+                        barrier = ContinuationPolicy.execution_barrier(
+                            canonical_rca_state, continuation,
+                            target_obligation_id=task.target_obligation_id,
+                            binding_reason=capacity.reasons[0],
+                        )
+                        break
+                    read_phase = budget_snapshot("plan_source_read_gate").phase
+                    if call.name == "read_file" and read_phase in {"converge", "source_verify"}:
+                        read_limit = (self.config.converge_max_read_file_calls
+                                      if read_phase == "converge" else self.config.source_verify_max_read_file_calls)
+                        if converge_read_file_calls >= read_limit:
+                            barrier = ContinuationPolicy.execution_barrier(
+                                canonical_rca_state, continuation,
+                                target_obligation_id=task.target_obligation_id,
+                                binding_reason="source_read_file_budget_exhausted",
+                            )
+                            break
+                        converge_read_file_calls += 1
+                    dag_state, selected = dag_harness.select_ready(dag_state, task_ids[task.task_id])
+                    assert selected is not None
+                    action = {
+                        "step": state.step, "skill": task.skill_id, "skill_reason": selection.reason,
+                        "tool": call.name, "arguments": admission.arguments,
+                        "obligation_id": task.target_obligation_id,
+                        "target_fact_slot": task.target_fact_slot,
+                        "requested_for": asdict(context.requested_for),
+                        "semantic_intents": [item.model_dump() for item in task.semantic_intents],
+                        "dag_task_id": selected.task_id, "plan_task_id": task.task_id,
+                        "action_rationale": selection.evidence_gap,
+                        "expected_information_gain": selection.expected_information_gain,
+                        "action_class": "acquisition", "information_gain": "pending_semantic",
+                    }
+                    actions.append(action)
+                    try:
+                        observation = execute_tool(
+                            admission.arguments, call.name, permitted_tools=permitted,
+                            visible_tools=turn_input.visible_tool_names,
+                            requested_for=context.requested_for, action_record=action,
+                        )
+                    except Exception as exc:
+                        burst_error = exc
+                        dag_state = dag_harness.apply_execution(dag_state, VerificationTaskExecution(
+                            task_id=selected.task_id, status="FAILED", reason=type(exc).__name__,
+                        ))
+                        dag_task_metrics["failed"] += 1
+                        barrier = ContinuationPolicy.execution_barrier(
+                            canonical_rca_state, continuation,
+                            target_obligation_id=task.target_obligation_id, failed=True,
+                        )
+                        break
+                    if isinstance(observation, DuplicateAcquisition):
+                        barrier = ContinuationPolicy.execution_barrier(canonical_rca_state, continuation,
+                            target_obligation_id=task.target_obligation_id,
+                            binding_reason="acquisition_already_acquired")
+                        break
+                    state.tool_calls += 1
+                    state.repeated_actions = 0
+                    admit_tool_observation(
+                        observation, tool_name=call.name, arguments=admission.arguments,
+                        obligation=canonical_rca_state.obligation(task.target_obligation_id),
+                        hypothesis=hypothesis,
+                    )
+                    dag_state = dag_harness.apply_execution(dag_state, VerificationTaskExecution(
+                        task_id=selected.task_id, status="COMPLETED" if observation.ok else "FAILED",
+                        result_ref=observation.observation_id, reason=observation.error_type or "",
+                    ))
+                    dag_task_metrics["completed" if observation.ok else "failed"] += 1
+                    executed += 1
+                    burst_observation_ids.append(observation.observation_id)
+                    action.update({
+                        "observation_id": observation.observation_id,
+                        "outcome": "ok" if observation.ok else "error",
+                        "error_type": observation.error_type,
+                        "observation_status": observation.metadata.get("status"),
+                        "new_evidence_count": 0, "obligation_progress_count": 0,
+                        "hypothesis_changed": False, "new_evidence_ids": [],
+                        "semantic_information_gain": False,
+                    })
+                    trace.record("DAG_TASK_EXECUTED", {
+                        "task_id": selected.task_id, "status": dag_state.task(selected.task_id).status,
+                        "result_ref": observation.observation_id, "dag_state_metrics": dag_state.metrics(),
+                    })
+                    if call.name == "knowledge_retrieval":
+                        retrieved = getattr(knowledge_tool, "last_result", None)
+                        retrieved_context = getattr(knowledge_tool, "last_prior_context", None)
+                        if retrieved_context is not None:
+                            prior_context = retrieved_context
+                            trace.record("KNOWLEDGE_RETRIEVED", {
+                                "stage": "on_demand",
+                                **retrieved.diagnostics.model_dump(mode="json"),
+                                "candidate_count": len(retrieved.candidates),
+                            })
+                            if retrieved.diagnostics.degraded:
+                                trace.record("KNOWLEDGE_RETRIEVAL_DEGRADED", {
+                                    "stage": "on_demand",
+                                    "reason": retrieved.diagnostics.reason,
+                                })
+                            trace.record("PRIOR_CONTEXT_PACKED", {
+                                "stage": "on_demand",
+                                "context_id": retrieved_context.context_id,
+                                "source_types": list(retrieved_context.source_types),
+                                "candidate_count": len(retrieved_context.candidates),
+                                "packed_chars": retrieved_context.packed_chars,
+                                "packed_tokens": retrieved_context.packed_tokens,
+                            })
+                    if call.name == "code_search":
+                        retrieval_metadata = dict(observation.metadata or {})
+                        trace.record("RETRIEVAL_MODE", {
+                            "requested_mode": retrieval_metadata.get("requested_mode", "lexical"),
+                            "effective_mode": retrieval_metadata.get("effective_mode", "lexical"),
+                            "degraded": bool(retrieval_metadata.get("degraded", False)),
+                            "reason": retrieval_metadata.get("reason", ""),
+                        })
+                        trace.record("RETRIEVAL_RESULT_SUMMARY", {
+                            "tool": call.name,
+                            "matches": retrieval_metadata.get("matches", 0),
+                            "candidate_only": retrieval_metadata.get("information_source") == "candidate_retrieval",
+                        })
+                    if not observation.ok:
+                        barrier = ContinuationPolicy.execution_barrier(
+                            canonical_rca_state, continuation,
+                            target_obligation_id=task.target_obligation_id, failed=True,
+                        )
+                trace.record("EXECUTION_BURST_COMPLETED", {
+                    "step": state.step, "executed_task_count": executed,
+                    "observation_ids": burst_observation_ids, "reason_code": barrier.reason,
+                })
+                trace.record("SEMANTIC_BARRIER", {
+                    "step": state.step, "reason_code": barrier.reason,
+                    "target_obligation_id": barrier.target_obligation_id,
+                    "committed_state_version": canonical_rca_state.event_count,
+                    "observation_ids": burst_observation_ids,
+                })
+                runtime_action_constraint = json.dumps({
+                    "reason_code": barrier.reason, "observation_ids": burst_observation_ids,
+                    "open_obligation_ids": list(canonical_rca_state.open_critical_obligation_ids),
+                }, sort_keys=True)
+                runtime_tool_visibility_override = None
+                transition_phase("PLAN", barrier.reason)
+                if burst_error is not None:
+                    raise burst_error
+
+
+            while True:
+                progress_before_action = progress_marker()
+                for blocked_tool in sorted(pending_capability_blocks):
+                    mark_blocked_capability(blocked_tool)
+                pending_capability_blocks.clear()
+                permission = finalization_decision()
+                runtime_budget = budget_snapshot("investigation_loop")
                 dynamic_budget.set_run_usage(
                     tokens_used=prompt_tokens + completion_tokens,
-                    llm_calls_used=llm_calls,
-                    cost_used=run_cost,
+                    llm_calls_used=llm_calls, cost_used=run_cost,
                 )
                 pressure_before_planner = dynamic_budget.decision(
                     "planner_admission", tokens_used=prompt_tokens,
                     llm_calls_used=llm_calls, cost_used=run_cost,
                 )
-                if pressure_before_planner.state is BudgetState.HARD_PRESSURE:
-                    fallback = best_candidate_from_hypothesis()
-                    if fallback is not None:
-                        termination_reason = "token_budget_sufficient_hypothesis"
-                        trace.record("BUDGET_AWARE_CONVERGENCE", {
-                            "step": state.step,
-                            "tokens_used": prompt_tokens + completion_tokens,
-                            "remaining_run_tokens": pressure_before_planner.remaining_run_tokens,
-                            "state": pressure_before_planner.state.value,
-                            "reason": pressure_before_planner.reason,
+                phase_remaining = dynamic_budget.lifecycle_payload(
+                    tokens_used=prompt_tokens + completion_tokens, llm_calls_used=llm_calls
+                )["phase_remaining"]["llm_calls"]
+                review_seconds = self.config.obligation_review_min_seconds + self.config.llm_cleanup_margin_seconds
+                closing_pressure = (runtime_budget.phase == "finalize" or phase_remaining <= 3
+                    or state.tool_calls >= min(self.config.max_tool_calls, start_tools + tool_limit)
+                    or deadline.remaining() <= self.config.finalization_reserve_seconds)
+                if (not permission.allowed and closing_pressure and active_hypothesis() is not None
+                        and (incident_evidence() or any(row.get("observation_id") for row in actions))
+                        and state.step < min(self.config.max_steps, start_steps + step_limit)
+                        and deadline.remaining() > review_seconds
+                        and dynamic_budget.lifecycle_phase in {"investigation", "investigation_recovery"}):
+                    dynamic_budget.begin_consolidation(
+                        llm_calls_used=sum(row.attempt_count for row in provider_gateway.records),
+                        review_seconds=review_seconds)
+                    trace.record("BUDGET_CONSOLIDATION_STARTED", {
+                        "step": state.step, "budget": budget_payload(runtime_budget),
+                        "tool_calls_allowed": 0, "review_permission": permission.allowed})
+                consolidation = dynamic_budget.lifecycle_phase == "consolidation"
+                continuation = ProgressPolicy.evaluate(operational_facts(
+                    "loop", finalization=permission, phase=runtime_budget.phase,
+                    consolidation_available=consolidation,
+                    step_limit=min(self.config.max_steps, start_steps + step_limit),
+                    tool_limit=min(self.config.max_tool_calls, start_tools + tool_limit),
+                    hard_pressure=pressure_before_planner.state is BudgetState.HARD_PRESSURE,
+                    automatic_finalization=execution_mode == "dag",
+                    post_sufficiency_calls=(state.tool_calls - evidence_sufficient_tool_calls
+                                            if evidence_sufficient_tool_calls is not None else None),
+                    post_sufficiency_limit=self.config.max_post_sufficiency_tool_calls,
+                ))
+                trace.record("PROGRESS_POLICY_DECISION", {
+                    "boundary": "loop", "action": continuation.action,
+                    "reasons": list(continuation.reasons),
+                })
+                if continuation.action == "stop":
+                    reason = continuation.reasons[0]
+                    if reason == "global_deadline":
+                        raise TimeoutError("global run deadline exceeded")
+                    raise RuntimeError(reason + " budget exhausted before finalization")
+                if continuation.action == "finalize":
+                    candidate = permission.candidate
+                    assert candidate is not None
+                    final_candidate_step = state.step
+                    reason = continuation.reasons[0]
+                    termination_reason = (
+                        "runtime_convergence_auto_finalize"
+                        if reason == "canonical_finalization_allowed"
+                        else "step_budget_sufficient_hypothesis" if reason == "max_steps"
+                        else reason + "_sufficient_hypothesis"
+                    )
+                    ensure_review_progress(candidate, active_hypothesis())
+                    if reason == "canonical_finalization_allowed":
+                        trace.record("RUNTIME_CONVERGENCE_AUTO_FINALIZE", {
+                            "step": state.step, "candidate": candidate.model_dump(),
+                            "reason": "canonical FinalizationPolicy allows publication",
                         })
-                        ensure_review_progress(fallback, hypotheses[-1])
-                        return finalize_candidate(
-                            fallback, termination_reason, hypothesis=hypotheses[-1],
-                        )
-                dynamic_budget.set_run_usage(
-                    tokens_used=prompt_tokens + completion_tokens,
-                    llm_calls_used=llm_calls,
-                    cost_used=run_cost,
-                )
+                    return finalize_candidate(termination_reason)
+                tool_budget_remaining = max(0, tool_limit - (state.tool_calls - start_tools))
+                agent_steps_remaining = max(0, step_limit - (state.step - start_steps))
                 dynamic_state = dynamic_budget.decision(
                     "planner_context", tokens_used=prompt_tokens,
                     llm_calls_used=llm_calls,
@@ -2805,12 +4152,15 @@ class DiagnosisHarness:
                 prior_capacity = dynamic_budget.available_prior_capacity(
                     critical_state_tokens=dynamic_budget.estimate_json_tokens({
                         "incident": {"summary": case.summary, "system": case.system},
-                        "hypothesis": hypotheses[-1].model_dump() if hypotheses else None,
+                        "hypothesis": (
+                            active_hypothesis().model_dump()
+                            if active_hypothesis() is not None else None
+                        ),
                     }),
                     verified_evidence_tokens=dynamic_budget.estimate_json_tokens(current_evidence_payload),
                     required_control_tokens=dynamic_budget.estimate_json_tokens({
                         "actions": actions[-8:], "rejected_actions": rejected_actions[-4:],
-                        "obligations": hypotheses[-1].verification_obligations if hypotheses else (),
+                        "obligations": canonical_rca_state.obligations,
                     }),
                     output_protocol_reserve=dynamic_budget.capability.protocol_safety_reserve_tokens,
                 )
@@ -2830,8 +4180,40 @@ class DiagnosisHarness:
                         "available_prior_capacity": prior_capacity,
                         "context_state": dynamic_state.state.value,
                     })
+                planner_finalization = planner_finalization_projection()
+                finalization_allowed = planner_finalization.allowed
+                finalization_blockers = [
+                    item.model_dump(mode="json")
+                    for item in planner_finalization.reasons
+                ]
+                terminal_projection_allowed = finalization_allowed
+                if not terminal_projection_allowed and active_hypothesis() is not None:
+                    # Public taxonomy completion has one bounded semantic
+                    # repair case: all canonical evidence/obligation gates
+                    # are already clear and only the exact taxonomy code is
+                    # missing. Permit the declared semantic request to provide
+                    # that code without forcing a second no-op Tool call.
+                    # Any evidence, contradiction, or lifecycle blocker keeps
+                    # semantic-only projection disabled.
+                    current = active_hypothesis()
+                    assert current is not None
+                    if (
+                        self.config.features.public_fault_taxonomy
+                        and not current.fault_code.strip()
+                        and {
+                            item.code for item in planner_finalization.reasons
+                        } == {"taxonomy_code_missing"}
+                    ):
+                        terminal_projection_allowed = True
+                        trace.record("SEMANTIC_CODE_COMPLETION_ALLOWED", {
+                            "step": state.step + 1,
+                            "reason": "only_public_fault_code_missing",
+                            "supporting_evidence_ids": list(
+                                current.supporting_evidence_ids
+                            ),
+                        })
                 control_state = self._planner_control_state(
-                    case, hypotheses, actions, review_feedback,
+                    case, canonical_rca_state, actions, review_feedback,
                     tool_budget_remaining=tool_budget_remaining,
                     agent_steps_remaining=agent_steps_remaining,
                     llm_calls_remaining=max(0, self.config.max_llm_calls - llm_calls),
@@ -2841,35 +4223,65 @@ class DiagnosisHarness:
                     available_code_tools=available_code_tools,
                     capability_states=capabilities.states,
                     visible_tool_names=visible_tool_names(),
+                    feasible_skill_ids=feasible_skill_ids(),
                     source_evidence_ids=source_evidence_ids(),
                     reflection_feedback=reflection_feedback,
                     tool_health=tool_circuit.summary(),
                     reflection_trigger=reflection_trigger,
-                    next_action_constraint=reflection_constraint,
-                    entities=entities,
-                    capabilities=capabilities,
-                    router_decision=router_decision,
-                    prior_context=bounded_prior,
-                    compact=self.config.features.planner_state_envelope,
+                    next_action_constraint=(
+                        runtime_action_constraint or reflection_constraint
+                    ),
+                    finalization_allowed=finalization_allowed,
+                    finalization_blockers=finalization_blockers,
+                    active_action_requirement=planner_action_requirement(),
                     canonical_task_context=(
                         execution_mode == "dag"
                         and self.config.context_projection_mode == "task_aware"
                     ),
                     dag_state=dag_state,
+                    citable_evidence_ids=tuple(item.evidence_id for item in incident_evidence()),
+                    evidence_verdicts=tuple(
+                        {
+                            "evidence_id": fact.evidence_id,
+                            "obligation_id": fact.obligation_id,
+                            "relation": str(getattr(fact, "relation", "")),
+                            "fulfillment": str(getattr(fact, "fulfillment", "")),
+                            "fact": str(getattr(fact, "fact", ""))[:360],
+                        }
+                        for fact in projected_facts.values()
+                    ),
+                    domain_skill_id=active_skill,
                 )
                 exposed_tools = visible_tool_names()
-                if exposed_tools is not None and (active_skill or state.step > 0):
+                if exposed_tools is not None:
                     trace.record("TOOL_EXPOSURE_SLICE", {
                         "step": state.step + 1,
                         "active_skill": active_skill,
                         "tools": list(exposed_tools),
-                        "reason": "stage_and_capability_aware_provider_catalog",
+                        "policy_version": self.config.tool_exposure_policy_version,
+                        "registry_authority": "CloudOpsSnapshotToolRegistry",
+                        "reason": (
+                            "runtime_replan_tool_surface"
+                            if runtime_tool_visibility_override is not None
+                            else "stage_and_capability_aware_provider_catalog"
+                        ),
+                        "runtime_override": (
+                            list(runtime_tool_visibility_override)
+                            if runtime_tool_visibility_override is not None else []
+                        ),
                     })
-                control_prefix = (
-                    ("PLANNER_STATE:\n" if self.config.features.planner_state_envelope
-                     else "AGENT_CONTROL_STATE:\n")
-                    + json.dumps(control_state, ensure_ascii=False)
-                    + "\n\nDIAGNOSTIC_CONTEXT:\n"
+                # The current role envelope is accounted for by ContextManager's
+                # request renderer. No legacy control-prefix reservation.
+                planner_context_char_limit = self.config.planner_context_chars
+                review_recovery_focus = bool(review_feedback)
+                focused_runtime_action = bool(
+                    (runtime_action_constraint and runtime_tool_visibility_override)
+                    or review_recovery_focus
+                )
+                context_char_budget = (
+                    min(planner_context_char_limit, 12000)
+                    if focused_runtime_action
+                    else planner_context_char_limit
                 )
                 dynamic_context_tokens = dynamic_budget.context_token_budget(
                     state=dynamic_state.state,
@@ -2877,14 +4289,34 @@ class DiagnosisHarness:
                 closure_ids = tuple(dict.fromkeys(
                     evidence_id
                     for evidence_id in (
-                        *(hypotheses[-1].supporting_evidence_ids if hypotheses else ()),
+                        *(
+                            active_hypothesis().supporting_evidence_ids
+                            if active_hypothesis() is not None else ()
+                        ),
                         *(
                             evidence_id
-                            for claim in (hypotheses[-1].source_claims if hypotheses else ())
+                            for claim in (
+                                active_hypothesis().source_claims
+                                if active_hypothesis() is not None else ()
+                            )
                             for evidence_id in claim.evidence_ids
                         ),
                         *(
                             source_evidence_ids()
+                            if runtime_budget.phase in {"source_verify", "converge", "verify_only", "finalize"}
+                            else ()
+                        ),
+                        # RCAState is the canonical admitted-Evidence index.
+                        # A Planner hypothesis can temporarily omit a partial
+                        # or revised-branch fact even though that fact is still
+                        # needed to understand why the closed obligation was
+                        # satisfied. Retain a bounded recent tail during
+                        # closure so ContextManager cannot evict the exact
+                        # configuration that produced the diagnosis. This is
+                        # prompt visibility only; it does not promote support
+                        # or alter Evidence/Obligation lifecycle.
+                        *(
+                            canonical_rca_state.evidence_ids[-8:]
                             if runtime_budget.phase in {"source_verify", "converge", "verify_only", "finalize"}
                             else ()
                         ),
@@ -2895,27 +4327,121 @@ class DiagnosisHarness:
                     trace.record("CLOSURE_CONTEXT_PACK", {
                         "phase": runtime_budget.phase,
                         "retained_evidence_ids": list(closure_ids),
+                        "canonical_state_evidence_tail": list(
+                            canonical_rca_state.evidence_ids[-8:]
+                        ),
                         "reason": "retain hypothesis/source-claim Evidence during bounded closure",
                     })
-                context_result = context_manager.build(
-                    state, evidence_memory, observation_store,
+                def semantic_input_projection():
+                    current_permission = finalization_decision()
+                    projection = {
+                                **canonical_rca_state.context_projection(),
+                                "incident": {"summary": case.summary, "namespace": case.namespace, "system": case.system},
+                                "capabilities": capabilities.planner_projection(),
+                                "state_version": canonical_rca_state.event_count,
+                                "hypothesis_scope": evidence_projector.hypothesis_scope_fingerprints(active_hypothesis()),
+                                "incident_id": case.case_id,
+                                "review_feedback": review_feedback,
+                                "reflection_feedback": reflection_feedback,
+                                "action_admission_feedback": (json.loads(runtime_action_constraint)
+                                    if runtime_action_constraint else None),
+                                "evidence_hypothesis_id": evidence_projector.hypothesis_id(active_hypothesis()),
+                                "pending_observation_ids": list(dict.fromkeys((
+                                    *bootstrap_pending_observation_ids,
+                                    *(row['observation_id'] for row in actions
+                                      if row.get('step') == state.step and row.get('observation_id')
+                                      and observation_store.get(row['observation_id']).ok),
+                                ))),
+                                "visible_observations": interpretation_view.reference_metadata.get("visible_observations", []),
+                                "existing_evidence": evidence_memory.projection(
+                                    facts=projected_facts.values(), evidence_ids=canonical_rca_state.evidence_ids,
+                                ),
+                                "acquisitions": action_runtime.acquisition_projection(actions),
+                                "acquisition_snapshot_identity": action_runtime.snapshot_identity,
+                                "evidence_gaps": [
+                                    {"obligation_id": item.id, "required_fact_slots": list(item.required_fact_slots),
+                                     "question": item.verification_question,
+                                     "coverage": {
+                                         slot: sorted({key for evidence_set in evidence_sets.values()
+                                                       if evidence_set.obligation_id == item.id
+                                                       and evidence_set.hypothesis_id == evidence_projector.hypothesis_id(active_hypothesis())
+                                                       and set(evidence_set.hypothesis_scope_fingerprints) == set(evidence_projector.hypothesis_scope_fingerprints(active_hypothesis()))
+                                                       for key in evidence_set.coverage.get(slot, ())})
+                                         for slot in item.required_fact_slots
+                                     }, "blocked_capabilities": list(item.blocked_capabilities)}
+                                    for item in canonical_rca_state.obligations if item.status == "OPEN"
+                                ],
+                                "finalization_readiness": {
+                                    "allowed": current_permission.allowed,
+                                    "conditions": current_permission.conditions.model_dump(mode="json"),
+                                    "reasons": [reason.model_dump(mode="json") for reason in current_permission.reasons],
+                                },
+                            }
+
+                    rows = requirement_table(projection)
+                    allowed = {}
+                    observations = {obs.observation_id: obs for obs in observation_store.all()}
+                    projection['admissible_observation_refs'] = [ref for ref, obs in observations.items()
+                        if evidence_projector.incident_observation_available(obs)]
+                    for evidence in evidence_memory.pinned:
+                        obs = observation_store.get(evidence.raw_observation_id)
+                        if obs is not None:
+                            observations[evidence.evidence_id] = obs
+                    for ref, obs in observations.items():
+                        allowed[ref] = []
+                        for row in rows:
+                            obligation = canonical_rca_state.obligation(row['obligation_id'])
+                            try:
+                                evidence_pipeline._validate_constraints(obligation, (row['slot'],), obs)
+                            except EvidencePipelineError:
+                                continue
+                            allowed[ref].append([row['obligation_id'], row['slot']])
+                    projection['source_requirement_slots'] = allowed
+                    return projection
+
+                semantic_metadata = semantic_input_projection()
+                def render_interpretation_context(view):
+                    envelope_input = planner.create_interpretation_input(
+                        state, view, visible_tool_names=exposed_tools,
+                        active_skill_id=active_skill, feasible_skill_ids=feasible_skill_ids(),
+                        skill_tool_names_by_id={skill_id: skill_tool_surface(skill_id)
+                                               for skill_id in feasible_skill_ids()},
+                        semantic_projection=semantic_metadata,
+                        budget_projection=request_budget_status(),
+                    )
+                    return planner.render_interpretation_envelope(
+                        envelope_input, terminal_projection_allowed=terminal_projection_allowed,
+                        context_resolution_remaining=PlanningSession.CONTEXT_ROUND_LIMIT,
+                        consolidation_allowed=consolidation,
+                    )
+                context_build_kwargs = dict(
+                    local_requests=context_manager.retained_local_requests(
+                        interpretation_view, evidence_memory, observation_store),
                     max_context_chars=(
-                        None if dynamic_context_tokens is not None else self.config.max_context_chars
+                        None if dynamic_context_tokens is not None else context_char_budget
                     ),
                     max_context_tokens=dynamic_context_tokens,
                     token_estimator=dynamic_budget.estimate_tokens,
                     max_steps=step_limit, max_tool_calls=tool_limit,
-                    requested_ids=closure_ids,
+                    requested_ids=(*closure_ids, *bootstrap_pending_observation_ids, *(row["observation_id"] for row in actions
+                        if row.get("step") == state.step and row.get("observation_id"))),
                     include_agent_control_state=False,
-                    external_context_chars=len(control_prefix),
+                    role="interpretation", max_request_chars=self.config.max_context_chars,
+                    evidence_references=semantic_metadata["existing_evidence"],
+                    reference_ids=tuple(row['existing_observation_id'] for row in rejected_actions[-6:]
+                                        if row.get('existing_observation_id')),
+                    request_renderer=render_interpretation_context,
                     pressure_state=dynamic_state.state.value,
                     verification_dag_state=(
                         dag_state
                         if self.config.context_projection_mode == "task_aware"
                         else None
                     ),
+                    rca_state=canonical_rca_state,
                 )
-                context = control_prefix + context_result.text
+                context_result = context_manager.build(state, evidence_memory, observation_store, **context_build_kwargs)
+                interpretation_view = context_result.context_view
+                context = interpretation_view.text
                 if dynamic_state.state is not BudgetState.NORMAL:
                     trace.record("CONTEXT_PRESSURE", {
                         "stage": "planner",
@@ -2959,13 +4485,20 @@ class DiagnosisHarness:
                     "source_workspace_available": source_workspace_available,
                     "available_code_tools": list(available_code_tools),
                     "diagnostic_context_chars": len(context_result.text),
-                    "control_state_chars": len(control_prefix),
+                    "control_state_chars": 0,
                     "planner_context_chars": len(context),
+                    "planner_context_char_limit": context_char_budget,
+                    "focused_runtime_action": focused_runtime_action,
+                    "review_recovery_focus": review_recovery_focus,
                     "budget_tokens": context_result.budget_tokens,
                     "used_tokens": context_result.used_tokens,
                     "context_state": dynamic_state.state.value,
                     "input_hard_capacity": dynamic_state.input_hard_capacity,
                     "prior_capacity": prior_capacity,
+                    "prompt_snapshot": (
+                        context_result.prompt_snapshot.as_dict()
+                        if context_result.prompt_snapshot is not None else None
+                    ),
                 })
                 rehydrated = [
                     item for item in context_result.selected
@@ -2978,7 +4511,6 @@ class DiagnosisHarness:
                         "evidence_ids": [item.get("id") for item in rehydrated],
                         "reason": "active_context_projection",
                     })
-                planner_call_context = context
                 planner_phase = budget_snapshot("planner_start").phase
                 converge_budget_kwargs: dict[str, Any] = {}
                 if planner_phase in {"converge", "source_verify"}:
@@ -2997,12 +4529,6 @@ class DiagnosisHarness:
                     )
                     remaining_reads = max(
                         0, phase_read_limit - converge_read_file_calls
-                    )
-                    planner_call_context += (
-                        "\n\nRUNTIME_SOURCE_CONTROL: This is a Runtime-enforced bounded source-investigation turn. "
-                        f"Keep hidden reasoning within {phase_reasoning_limit} tokens, "
-                        f"use at most {remaining_reads} further read_file call(s), and close the "
-                        "current evidence gap or finalize; do not open a new investigation branch."
                     )
                     converge_budget_kwargs["max_output_tokens"] = phase_output_limit
                     converge_budget_kwargs["enable_thinking"] = CONVERGE_ENABLE_THINKING
@@ -3023,11 +4549,38 @@ class DiagnosisHarness:
                         ),
                         "enforcement": "runtime_adapter_completion_cap_and_action_gate",
                     })
+
                 prompt_budget_retry = False
                 contract_retry_for_step = False
+
+                def record_planner_request_snapshot(status: str) -> None:
+                    snapshots = list(
+                        getattr(planning_session, "last_request_snapshots", ()) or ()
+                    )
+                    if not snapshots:
+                        snapshots = list(getattr(planner, "last_request_snapshots", ()) or ())
+                    if not snapshots:
+                        snapshot = getattr(planner, "last_request_snapshot", None)
+                        snapshots = [snapshot] if snapshot else []
+                    for snapshot in snapshots:
+                        if not snapshot:
+                            continue
+                        payload = dict(snapshot)
+                        payload["runtime_status"] = status
+                        payload["step"] = state.step + 1
+
+                        trace.record("PLANNER_REQUEST_SNAPSHOT", payload)
+                    if not snapshots and status == "timeout_before_snapshot":
+                        trace.record("PLANNER_REQUEST_SNAPSHOT_UNAVAILABLE", {
+                            "step": state.step + 1,
+                            "reason": "provider process terminated before child state returned",
+                            "contract_retry": contract_retry_for_step,
+                        })
+
                 while True:
                     trace.record("PLANNER_CALL_STARTED", {
                         "step": state.step + 1,
+                        "transport_profile": planner.transport_profile.value,
                         "logical_timeout_seconds": self.config.planner_llm_timeout_seconds,
                         "contract_retry": contract_retry_for_step,
                         "budget": budget_payload(budget_snapshot("planner_start")),
@@ -3038,33 +4591,318 @@ class DiagnosisHarness:
                             allow_targeted_recovery=contract_retry_for_step,
                         )
                         planner_timeout = provider_timeout(self.config.planner_llm_timeout_seconds)
+                        planner_completion_cap = self.config.planner_max_completion_tokens
+                        if focused_runtime_action:
+                            planner_completion_cap = min(planner_completion_cap, 1800)
+                        # A Review rejection supplies a bounded correction
+                        # target. Keep the recovery call inside the remaining
+                        # investigation allocation instead of reserving a
+                        # full exploratory completion after the context and
+                        # Review call have already consumed most of it.
+                        if review_recovery_focus:
+                            planner_completion_cap = min(planner_completion_cap, 1600)
                         planner_kwargs = {
-                            "max_output_tokens": self.config.planner_max_completion_tokens,
+                            "max_output_tokens": planner_completion_cap,
+                            "active_skill_id": active_skill,
+                            "feasible_skill_ids": feasible_skill_ids(),
+                            "skill_tool_names_by_id": {
+                                skill_id: skill_tool_surface(skill_id)
+                                for skill_id in feasible_skill_ids()
+                            },
+                            "context_snapshot": (
+                                context_result.prompt_snapshot.as_dict()
+                                if context_result.prompt_snapshot is not None else {}
+                            ),
+                            "semantic_projection": semantic_input_projection(),
+                            "budget_projection": control_state.get(
+                                "REMAINING_BUDGET", {}
+                            ),
+                            "action_ledger": tuple(
+                                control_state.get("EXECUTED_ACTION_SUMMARY", {}).get(
+                                    "shown", ()
+                                )
+                            ),
+                            "terminal_projection_allowed": terminal_projection_allowed,
                             **dict(converge_budget_kwargs),
                         }
-                        try:
-                            planner_parameters = inspect.signature(planner.propose).parameters
-                            accepts_kwargs = any(
-                                item.kind is inspect.Parameter.VAR_KEYWORD
-                                for item in planner_parameters.values()
+                        if review_recovery_focus:
+                            planner_kwargs["max_output_tokens"] = min(
+                                int(planner_kwargs.get("max_output_tokens", planner_completion_cap)),
+                                1600,
                             )
-                            planner_kwargs = {
-                                key: value for key, value in planner_kwargs.items()
-                                if key in planner_parameters or accepts_kwargs
-                            }
-                        except (TypeError, ValueError):
-                            planner_kwargs = {}
-                        result = self._provider_call(
-                            planner.propose,
-                            state, planner_call_context,
-                            logical_timeout_seconds=planner_timeout,
-                            **planner_kwargs,
-                            prompt_budget=dynamic_budget,
+                        turn_input = planner.create_interpretation_input(
+                            state,
+                            interpretation_view,
                             visible_tool_names=exposed_tools,
-                            hard_timeout_seconds=planner_timeout,
-                            state_source=planner,
-                            state_attributes=("last_prompt_breakdown", "last_prompt_breakdowns"),
+                            active_skill_id=planner_kwargs["active_skill_id"],
+                            feasible_skill_ids=planner_kwargs["feasible_skill_ids"],
+                            skill_tool_names_by_id=planner_kwargs["skill_tool_names_by_id"],
+                            context_snapshot=planner_kwargs["context_snapshot"],
+                            semantic_projection=planner_kwargs["semantic_projection"],
+                            budget_projection=planner_kwargs["budget_projection"],
+                            action_ledger=planner_kwargs["action_ledger"],
                         )
+                        # Avoid attributing a prior turn's request to a
+                        # timeout or exception in the current Provider call.
+                        planner.last_request_snapshot = None
+                        planning_session.last_request_snapshots = ()
+                        committed_hypothesis = None
+
+                        def commit_interpretation(selection, response):
+                            nonlocal committed_hypothesis, bootstrap_pending_observation_ids
+                            nonlocal evidence_admission_rejections
+                            nonlocal evidence_sufficient_step, evidence_sufficient_tool_calls
+                            prior_hypothesis = active_hypothesis()
+                            proposed = (prior_hypothesis if selection.hypothesis_transition.kind == "KEEP_CURRENT"
+                                        else IncidentHypothesis(claim=selection.current_hypothesis, evidence_gap=""))
+                            def stage_planner(resolved):
+                                for acknowledgement in selection.operational_acknowledgements:
+                                    observation = observation_store.get(acknowledgement.observation_ref)
+                                    if (observation is None or not observation.ok
+                                            or not interpretation_view.is_observation_visible(observation.observation_id)):
+                                        raise SemanticTransitionError("operational_acknowledgement_invalid")
+                                    trace.record("OBSERVATION_OPERATIONALLY_ACKNOWLEDGED", acknowledgement.model_dump())
+                                staged_selection = replace(selection, hypothesis_id=resolved.hypothesis_id,
+                                                           revision=resolved.revision)
+                                # CURRENT evidence stays scoped to the previous revision.
+                                for proposal_index, proposal in enumerate(selection.evidence_proposals):
+                                    if proposal.hypothesis_target == "CURRENT":
+                                        if prior_hypothesis is None:
+                                            raise SemanticTransitionError("current_hypothesis_missing")
+                                        admit_planner_evidence(proposal, turn_input=turn_input, proposal_index=proposal_index, hypothesis=prior_hypothesis)
+                                for item in canonical_rca_state.obligations:
+                                    if selection.hypothesis_transition.kind != "KEEP_CURRENT" and item.status == "SATISFIED":
+                                        canonical_rca_state_reset(item.id)
+                                build_hypothesis(staged_selection)
+                                proposed_hypothesis = active_hypothesis()
+                                for proposal_index, proposal in enumerate(selection.evidence_proposals):
+                                    if proposal.hypothesis_target == "PROPOSED":
+                                        admit_planner_evidence(proposal, turn_input=turn_input, proposal_index=proposal_index, hypothesis=proposed_hypothesis)
+                                # New revision qualification never borrows previous coverage.
+                                for obligation in canonical_rca_state.obligations:
+                                    qualify_current_evidence_set(obligation, proposed_hypothesis,
+                                                                 reason="semantic_transition_qualification")
+                                record_semantic_decision(
+                                    selection, prior_hypothesis, proposed_hypothesis,
+                                )
+                            try:
+                                semantic_transition(selection.hypothesis_transition, proposed, stage_planner)
+                            except (SemanticTransitionError, RCAStateError, RuntimeError, ValueError) as exc:
+                                error = PlannerContractError(str(exc), validation_errors=[str(exc)])
+                                error.metadata["error_type"] = getattr(exc, "code", "semantic_transition_invalid")
+                                details = getattr(exc, 'details', {})
+                                if isinstance(details, dict) and details.get('capability_gaps'):
+                                    error.metadata['capability_feedback'] = {
+                                        'required_capabilities': details['capability_gaps'],
+                                        'capability_states': details['capability_states'],
+                                    }
+                                index = details.get('proposal_index') if isinstance(details, dict) else None
+                                if isinstance(index, int) and 0 <= index < len(selection.evidence_proposals):
+                                    proposal = selection.evidence_proposals[index]
+                                    projection = turn_input.semantic_projection
+                                    refs = [row['requirement_ref'] for row in requirement_table(projection)
+                                            if row['obligation_id'] == proposal.obligation_id
+                                            and row['slot'] in proposal.covered_fact_slots]
+                                    error.metadata['requirement_feedback'] = targeting_feedback(projection, index,
+                                        proposal.obligation_id, refs, proposal.hypothesis_target)
+                                    error.metadata['requirement_feedback']['rejected_refs'] = refs
+                                    error.metadata['requirement_feedback']['reason_code'] = error.metadata['error_type']
+                                trace.record("SEMANTIC_TRANSITION_REJECTED", {"reason_code": error.metadata["error_type"],
+                                                                            "reason": str(exc), "details": getattr(exc, "details", {})})
+                                raise error from exc
+                            committed_hypothesis = active_hypothesis()
+                            bootstrap_pending_observation_ids = ()
+                            evidence_admission_rejections = 0
+                            permission = finalization_decision()
+                            if permission.allowed and evidence_sufficient_step is None:
+                                evidence_sufficient_step = state.step + 1
+                                evidence_sufficient_tool_calls = state.tool_calls
+                                trace.record("EVIDENCE_SUFFICIENT", {
+                                    "step": state.step + 1, "evidence_sufficient": True,
+                                    "hypothesis": committed_hypothesis.model_dump(),
+                                })
+                        def authorize_contract_retry(exc: BaseException) -> None:
+                            nonlocal contract_retry_for_step, planner_contract_retry_used
+                            contract_retry_for_step = True
+                            planner_contract_retry_used = True
+                            planner_metadata = _safe_planner_metadata_for_trace(exc)
+                            trace.record("PLANNER_CONTRACT_RETRY", {
+                                "step": state.step + 1,
+                                "retry_index": 1,
+                                "reason": "core structured Planner contract failure",
+                                "planner_metadata": planner_metadata or {},
+                            })
+                            admit(
+                                "planner", count_llm=True,
+                                allow_targeted_recovery=True,
+                            )
+
+                        def resolve_local_context(batch, previous_input, round_index):
+                            nonlocal interpretation_view, context_result, turn_input
+                            # Publish physical usage before admitting another model request.
+                            add_usage(planner, stage='planner', prompt_breakdown=planner.last_prompt_breakdown)
+                            before_version = canonical_rca_state.event_count
+                            context_result = context_manager.resolve_context_requests(
+                                batch, view=previous_input.context_view, state=state,
+                                memory=evidence_memory, observation_store=observation_store,
+                                build_kwargs={**context_build_kwargs, 'request_renderer': lambda view:
+                                    planner.render_interpretation_envelope(planner.with_context_view(previous_input, view),
+                                        terminal_projection_allowed=planner_kwargs.get('terminal_projection_allowed'),
+                                        context_resolution_remaining=PlanningSession.CONTEXT_ROUND_LIMIT - round_index)})
+                            interpretation_view = context_result.context_view
+                            turn_input = planner.with_context_view(previous_input, interpretation_view)
+                            if canonical_rca_state.event_count != before_version:
+                                raise RuntimeError('local context resolution cannot commit semantics')
+                            trace.record('LOCAL_CONTEXT_RESOLVED', {
+                                'turn_id': previous_input.turn_id, 'context_resolution_round': round_index,
+                                'state_version': before_version, 'requests': batch.model_dump(mode='json'),
+                                'visible_source_ranges': interpretation_view.visible_source_ranges,
+                                'provider_calls': 0, 'tool_calls': 0, 'semantic_commits': 0})
+                            admit('planner', count_llm=True)
+                            return turn_input
+
+                        def local_context_feedback(exc, round_index):
+                            trace.record('LOCAL_CONTEXT_RESOLUTION_FEEDBACK', {
+                                'context_resolution_round': round_index, **exc.feedback,
+                                'tool_calls': 0, 'semantic_commits': 0})
+                            admit('planner', count_llm=True)
+
+                        retry_budget = LogicalTurnRetryBudget()
+                        logical_record_cursor = len(provider_gateway.records)
+                        interpretation_result = planning_session.run(
+                            turn_input, logical_timeout_seconds=planner_timeout,
+                            prompt_budget=dynamic_budget, max_output_tokens=planner_kwargs.get("max_output_tokens"),
+                            terminal_projection_allowed=planner_kwargs.get("terminal_projection_allowed"),
+                            consolidation_allowed=consolidation, budget_status_provider=request_budget_status,
+                            on_contract_retry=authorize_contract_retry, retry_budget=retry_budget,
+                            on_interpretation_commit=commit_interpretation,
+                            on_context_request=resolve_local_context,
+                            on_context_feedback=local_context_feedback,
+                        )
+                        interpretation_snapshots = interpretation_result.request_snapshots
+                        # Publish the sole reasoning request usage before deterministic Phase B.
+                        add_usage(planner, stage="planner", prompt_breakdown=planner.last_prompt_breakdown)
+                        selected = interpretation_result.skill_selections[0]
+                        previous_skill = active_skill
+                        active_skill = selected.skill
+                        load_domain_skill(active_skill)
+                        if previous_skill != active_skill:
+                            trace.record("SKILL_TRANSITION", {"step": state.step + 1, "from": previous_skill or None,
+                                "to": active_skill, "reason": selected.reason})
+                        permission = finalization_decision()
+                        if permission.allowed:
+                            result = replace(interpretation_result, planner_result=replace(
+                                interpretation_result.planner_result, plan=EnrichedVerificationPlan(tasks=()),
+                                continuation=PlanAdmissionDecision("finalize", "canonical_finalization_allowed",
+                                    committed_state_version=canonical_rca_state.event_count)))
+                        elif consolidation:
+                            if interpretation_result.next_action_intent is not None:
+                                raise RuntimeError("consolidation cannot admit a Tool intent")
+                            trace.record("BUDGET_CONSOLIDATION_BLOCKED", {
+                                "step": state.step + 1,
+                                "reasons": [item.model_dump(mode="json") for item in permission.reasons]})
+                            result = replace(interpretation_result, planner_result=replace(
+                                interpretation_result.planner_result, plan=EnrichedVerificationPlan(tasks=()),
+                                continuation=PlanAdmissionDecision("replan", "budget_consolidation",
+                                    committed_state_version=canonical_rca_state.event_count)))
+                        elif (selected.hypothesis_transition.kind == "INITIAL" and canonical_rca_state.obligations
+                              and interpretation_view.visible_observation_ids):
+                            bootstrap_pending_observation_ids = interpretation_view.visible_observation_ids
+                            trace.record("BOOTSTRAP_INTERPRETATION_PENDING", {
+                                "observation_ids": list(interpretation_view.visible_observation_ids),
+                                "state_version": canonical_rca_state.event_count, "tool_calls": 0})
+                            result = replace(interpretation_result, planner_result=replace(
+                                interpretation_result.planner_result, plan=EnrichedVerificationPlan(tasks=()),
+                                continuation=PlanAdmissionDecision("replan", "bootstrap_retained_observation_interpretation",
+                                    committed_state_version=canonical_rca_state.event_count)))
+                        else:
+                            local_available = not local_recovery_offered and context_manager.has_local_recovery(
+                                interpretation_view, observation_store)
+                            external_probe = planner.create_turn_input(
+                                state, '', visible_tool_names=visible_tool_names(), active_skill_id=active_skill,
+                                feasible_skill_ids=feasible_skill_ids(),
+                                skill_tool_names_by_id={skill_id: skill_tool_surface(skill_id) for skill_id in feasible_skill_ids()},
+                                semantic_projection=semantic_input_projection()) if local_available else None
+                            if local_available and not any(row['available_choice_refs'] for row in
+                                    external_probe.semantic_projection.get('gap_choice_surface', ())):
+                                local_recovery_offered = True
+                                trace.record('LOCAL_CONTEXT_RECOVERY_AVAILABLE', {'state_version': canonical_rca_state.event_count,
+                                    'reason_code': 'local_context_recovery_available'})
+                                result = replace(interpretation_result, planner_result=replace(
+                                    interpretation_result.planner_result, plan=EnrichedVerificationPlan(tasks=()),
+                                    continuation=PlanAdmissionDecision('replan', 'local_context_recovery_available',
+                                        committed_state_version=canonical_rca_state.event_count)))
+                            else:
+                                # A closed Tool gap can still admit semantic progress.
+                                # ContinuationPolicy admits the empty plan; ProgressPolicy
+                                # bounds actual noops instead of forcing Reflection here.
+                                def committed_planning_input():
+                                    return planner.create_turn_input(
+                                        state, "", visible_tool_names=visible_tool_names(),
+                                        active_skill_id=active_skill, feasible_skill_ids=feasible_skill_ids(),
+                                        skill_tool_names_by_id={skill_id: skill_tool_surface(skill_id) for skill_id in feasible_skill_ids()},
+                                        context_snapshot=planner_kwargs["context_snapshot"], semantic_projection=semantic_input_projection(),
+                                        budget_projection=budget_payload(budget_snapshot("action_planning_start")),
+                                        action_ledger=tuple(actions))
+                                turn_input = committed_planning_input()
+                                committed_hypothesis = active_hypothesis()
+                                selected = replace(selected, skill=active_skill)
+                                turn_input = replace(turn_input, turn_id=interpretation_result.turn_input.turn_id)
+                                generated_version = canonical_rca_state.event_count
+                                trace.record("PLANNER_GAP_SURFACE", {"step": state.step + 1, "turn_id": turn_input.turn_id,
+                                    "visible_choice_count": len(turn_input.action_choices),
+                                    "gap_choices": turn_input.semantic_projection.get("gap_choice_surface", []),
+                                    "acquisitions": turn_input.semantic_projection.get("acquisitions", [])})
+                                compilation_started = time.monotonic()
+                                compilation_failure = None
+                                try:
+                                    compiled = planner.compile_next_action(turn_input,
+                                        interpretation_result.next_action_intent, interpretation_result.response)
+                                except PlannerContractError as exc:
+                                    intent = interpretation_result.next_action_intent
+                                    compilation_failure = VerificationPlanError(
+                                        exc.metadata.get('error_type') or 'plan_compilation_rejected', detail=json.dumps({
+                                            'error': str(exc), 'operation': intent.operation if intent else None,
+                                            'target_obligation_id': intent.obligation_id if intent else None,
+                                            'target_fact_slot': intent.slot if intent else None,
+                                            'validation_details': exc.metadata.get('validation_details', [])}, sort_keys=True))
+                                    compiled = replace(interpretation_result.planner_result,
+                                        plan=EnrichedVerificationPlan(tasks=()))
+                                trace.record("NEXT_ACTION_INTENT_COMPILED", {
+                                    "turn_id": turn_input.turn_id, "state_version": generated_version,
+                                    "operation": interpretation_result.next_action_intent.operation
+                                        if interpretation_result.next_action_intent else None,
+                                    "task_count": len(compiled.plan.tasks), "llm_calls": 0,
+                                    "latency_seconds": time.monotonic() - compilation_started})
+                                planned = replace(interpretation_result, planner_result=compiled, turn_input=turn_input)
+                                planning_session.last_request_snapshots = interpretation_snapshots
+                                # Re-read Runtime owners; do not accept model-copied snapshot metadata.
+                                current_input = planner.create_turn_input(state, "", visible_tool_names=visible_tool_names(),
+                                    active_skill_id=active_skill, feasible_skill_ids=feasible_skill_ids(),
+                                    skill_tool_names_by_id={skill_id: skill_tool_surface(skill_id) for skill_id in feasible_skill_ids()},
+                                    context_snapshot=planner_kwargs["context_snapshot"], semantic_projection=semantic_input_projection(),
+                                    budget_projection=json.loads(turn_input.budget_projection_json), action_ledger=tuple(actions))
+                                continuation = ContinuationPolicy.admit_plan(canonical_rca_state, planned.plan,
+                                    state_snapshot_hash=current_input.state_snapshot_hash,
+                                    generated_state_version=generated_version, generated_snapshot_hash=turn_input.state_snapshot_hash,
+                                    schema_sha256_by_operation={spec.name: registry_schema_sha256(spec) for spec in tools.specs()},
+                                    registry=tools, acquisition_projection=current_input.semantic_projection,
+                                    compilation_failure=compilation_failure)
+                                records = tuple(provider_gateway.records[logical_record_cursor:])
+                                result = replace(planned, planner_result=replace(planned.planner_result,
+                                    skill_selections=(selected,), continuation=continuation),
+                                    request_snapshots=planning_session.last_request_snapshots, provider_calls=records,
+                                    usage=tuple(sorted(aggregate_provider_usage(records).items())), contract_retry_count=retry_budget.used,
+                                    context_resolution_rounds=interpretation_result.context_resolution_rounds)
+                        trace.record("PLAN_ADMISSION_DECISION", {"step": state.step + 1,
+                            "action": result.continuation.action, "reason_code": result.continuation.reason,
+                            "detail": result.continuation.detail,
+                            "committed_state_version": canonical_rca_state.event_count,
+                            "planning_snapshot_hash": turn_input.state_snapshot_hash,
+                            "task_count": len(result.plan.tasks), "target_obligation_ids":
+                            [task.target_obligation_id for task in result.continuation.admitted_plan.tasks]
+                            if result.continuation.admitted_plan else []})
+                        record_planner_request_snapshot("completed")
                         break
                     except RunBudgetAdmissionExceeded as exc:
                         llm_calls = max(0, llm_calls - 1)
@@ -3077,6 +4915,7 @@ class DiagnosisHarness:
                         trace.record("BUDGET_ADMISSION_REJECTED", {
                             "stage": "planner",
                             "step": state.step + 1,
+                            "failure_category": "run_budget_admission_exceeded",
                             "reason": exc.decision.reason,
                             "budget_before_call": exc.decision.remaining_run_tokens,
                             "estimated_call_cost": exc.decision.breakdown,
@@ -3086,15 +4925,24 @@ class DiagnosisHarness:
                                 - exc.decision.breakdown.get("required_run_tokens", 0),
                             ),
                         })
-                        fallback = best_candidate_from_hypothesis()
-                        if fallback is None:
+                        record_budget_rejection(
+                            "planner",
+                            exc.decision.reason or "run_budget_admission_exceeded",
+                        )
+                        permission = finalization_decision()
+                        salvage = ProgressPolicy.evaluate(operational_facts(
+                            "salvage", stage="planner_admission", finalization=permission,
+                        ))
+                        if salvage.action == "stop":
                             raise
                         termination_reason = "pre_call_budget_admission_sufficient_hypothesis"
-                        ensure_review_progress(fallback, hypotheses[-1])
-                        return finalize_candidate(
-                            fallback, termination_reason, hypothesis=hypotheses[-1],
-                        )
+                        assert permission.candidate is not None
+                        ensure_review_progress(permission.candidate, active_hypothesis())
+                        return finalize_candidate(termination_reason)
                     except PromptBudgetExceeded as exc:
+                        if committed_hypothesis is not None:
+                            record_planner_request_snapshot("planning_budget_rejected")
+                            raise
                         # Admission happens before the agent can render its
                         # complete provider payload. This was a local
                         # compaction attempt, not an LLM call.
@@ -3104,6 +4952,7 @@ class DiagnosisHarness:
                         decision = exc.decision
                         trace.record("CONTEXT_PRESSURE", {
                             "stage": "planner",
+                            "failure_category": "prompt_capacity_exceeded",
                             "context_state": decision.state.value,
                             "reason": decision.reason,
                             "estimated_prompt_tokens": decision.estimated_prompt_tokens,
@@ -3111,32 +4960,47 @@ class DiagnosisHarness:
                             "breakdown": decision.breakdown,
                             "compaction_applied": True,
                         })
-                        if prompt_compaction_attempts > 2:
+                        record_budget_rejection(
+                            "planner",
+                            decision.reason or "prompt_capacity_exceeded",
+                        )
+                        if ProgressPolicy.evaluate(operational_facts(
+                            "recovery", stage="prompt_compaction", recovery_count=prompt_compaction_attempts - 1,
+                            recovery_limit=2,
+                        )).action == "stop":
                             raise RuntimeError(
                                 "hard prompt capacity remains exceeded after bounded context compaction"
                             ) from exc
                         prompt_budget_retry = True
                         break
                     except LLMDeadlineExceeded as exc:
+                        record_planner_request_snapshot("timeout")
                         trace.record("PLANNER_CALL_TIMEOUT", {
                             "step": state.step + 1,
                             "error_type": type(exc).__name__, "message": str(exc),
                         })
-                        fallback = best_candidate_from_hypothesis()
-                        if fallback is None:
+                        permission = finalization_decision()
+                        salvage = ProgressPolicy.evaluate(operational_facts(
+                            "salvage", stage="planner_timeout", finalization=permission,
+                        ))
+                        if salvage.action == "stop":
                             raise
                         final_candidate_step = state.step
                         termination_reason = "planner_timeout_sufficient_hypothesis"
                         trace.record("TIMEOUT_FINALIZATION_FALLBACK", {
                             "error_type": type(exc).__name__, "message": str(exc),
-                            "hypothesis": hypotheses[-1].model_dump(),
+                            "hypothesis": (
+                                active_hypothesis().model_dump()
+                                if active_hypothesis() is not None else None
+                            ),
                         })
-                        ensure_review_progress(fallback, hypotheses[-1] if hypotheses else None)
+                        assert permission.candidate is not None
+                        ensure_review_progress(permission.candidate, active_hypothesis())
                         return finalize_candidate(
-                            fallback, "sufficient_hypothesis_timeout_fallback",
-                            hypothesis=hypotheses[-1],
+                            "sufficient_hypothesis_timeout_fallback"
                         )
                     except PlannerContractError as exc:
+                        record_planner_request_snapshot("contract_error")
                         planner_failure = {
                             "step": state.step + 1,
                             "error_type": type(exc).__name__, "message": str(exc),
@@ -3145,38 +5009,22 @@ class DiagnosisHarness:
                         if planner_metadata is not None:
                             planner_failure["planner_metadata"] = planner_metadata
                         trace.record("PLANNER_CALL_FAILED", planner_failure)
-                        if not contract_retry_for_step:
-                            contract_retry_for_step = True
-                            planner_contract_retry_used = True
-                            trace.record("PLANNER_CONTRACT_RETRY", {
+                        if isinstance(exc, PlannerContractExhausted):
+                            trace.record("PLANNER_CONTRACT_EXHAUSTED", {
                                 "step": state.step + 1,
-                                "retry_index": 1,
-                                "reason": "core structured Planner contract failure",
+                                "retry_count": 1,
                                 "planner_metadata": planner_metadata or {},
                             })
-                            planner_call_context = (
-                                context
-                                + "\n\nBOUNDED_CONTRACT_RETRY: The previous Planner response violated the "
-                                "structured tool contract. Return exactly one valid native tool call; preserve "
-                                "the current semantic state and do not guess missing Evidence IDs. "
-                                f"Contract error: {str(exc)}. Use empty strings/lists instead of null for "
-                                "optional incident controls. For finalize_diagnosis, include evidence_ids and "
-                                "copy the same known ev-* IDs into supporting_evidence_ids."
-                            )
-                            continue
-                        trace.record("PLANNER_CONTRACT_EXHAUSTED", {
-                            "step": state.step + 1,
-                            "retry_count": 1,
-                            "planner_metadata": planner_metadata or {},
-                        })
-                        trace.record("REPAIR_FAILED", {
-                            "layer": "planner_contract",
-                            "logical_turn": state.step + 1,
-                            "repair_attempts": 1,
-                            "reason": "bounded_planner_contract_retry_exhausted",
-                        })
-                        raise PlannerContractExhausted(exc) from exc
+                            trace.record("REPAIR_FAILED", {
+                                "layer": "planner_contract",
+                                "logical_turn": state.step + 1,
+                                "repair_attempts": 1,
+                                "reason": "bounded_planner_contract_retry_exhausted",
+                            })
+                            raise
+                        raise
                     except PromptBudgetExceeded as exc:
+                        record_planner_request_snapshot("prompt_budget_error")
                         planner_failure = {
                             "step": state.step + 1,
                             "error_type": type(exc).__name__, "message": str(exc),
@@ -3187,26 +5035,32 @@ class DiagnosisHarness:
                         trace.record("PLANNER_CALL_FAILED", planner_failure)
                         raise
                     except Exception as exc:
+                        record_planner_request_snapshot("runtime_error")
                         planner_failure = {
                             "step": state.step + 1,
                             "error_type": type(exc).__name__, "message": str(exc),
                         }
                         trace.record("PLANNER_CALL_FAILED", planner_failure)
                         raise
+                    finally:
+                        add_usage(
+                            planner, stage="planner",
+                            prompt_breakdown=getattr(planner, "last_prompt_breakdown", None),
+                        )
                 if prompt_budget_retry:
                     # Re-enter the outer loop so ContextManager can compact
                     # L2/L3 while preserving Critical State and Evidence.
                     continue
-                add_usage(
-                    result, stage="planner",
-                    prompt_breakdown=getattr(planner, "last_prompt_breakdown", None),
-                )
                 dynamic_budget.clear_context_state_override()
                 trace.record("PLANNER_CALL_COMPLETED", {
                     "step": state.step + 1,
                     "prompt_breakdown": dict(planner.last_prompt_breakdown),
                     "prompt_breakdowns": list(getattr(planner, "last_prompt_breakdowns", ()) or ()),
-                    "usage": dict(result.response.usage or {}),
+                    "usage": result.usage_dict,
+                    "physical_request_count": result.physical_request_count,
+                    "provider_attempt_count": result.provider_attempt_count,
+                    "contract_retry_count": result.contract_retry_count,
+                    "context_resolution_rounds": result.context_resolution_rounds,
                 })
                 trace.record("PLANNER_RESPONSE_AUDIT", {
                     "step": state.step + 1,
@@ -3216,7 +5070,10 @@ class DiagnosisHarness:
                     "tool_names": [call.name for call in result.tool_calls],
                 })
                 state.step += 1
-                trace.record("AGENT_STEP", {"step": state.step, "tool_call_count": len(result.tool_calls)})
+                trace.record("AGENT_STEP", {
+                    "step": state.step, "tool_call_count": len(result.tool_calls),
+                    "planned_task_count": len(result.plan.tasks),
+                })
                 for audit in getattr(result, "tool_call_audits", ()):
                     trace.record("PROVIDER_TOOL_CALL_AUDIT", {
                         "step": state.step,
@@ -3248,633 +5105,391 @@ class DiagnosisHarness:
                         raise ConvergenceBudgetExhausted(
                             "convergence planner reasoning limit exceeded"
                         )
-                if not result.tool_calls:
-                    if planner_phase in {"converge", "source_verify"}:
-                        trace.record("CONVERGE_OUTPUT_CAP_EXHAUSTED", {
-                            "step": state.step,
-                            "provider_completion_cap_tokens": phase_output_limit,
-                            "max_reasoning_tokens": phase_reasoning_limit,
-                            "reason": "provider returned no executable action after bounded completion envelope",
-                            "hypothesis": hypotheses[-1].model_dump() if hypotheses else None,
-                        })
-                        raise ConvergenceBudgetExhausted(
-                            "convergence planner response contained no executable action"
-                        )
-                    raise RuntimeError("Diagnosis Agent returned no action")
-                if len(result.tool_calls) != len(result.skill_selections):
-                    raise RuntimeError("every incident action must carry a Skill selection")
-                tool_repairs_this_turn = 0
-                tool_contract_replan_requested = False
-                for call, selection in zip(result.tool_calls, result.skill_selections):
-                    previous_skill = active_skill
-                    active_skill = selection.skill
-                    trace.record("SKILL_SELECTED", {
-                        "step": state.step, "skill": selection.skill, "reason": selection.reason,
-                        "current_hypothesis": selection.current_hypothesis,
-                        "evidence_gap": selection.evidence_gap, "tool": call.name,
-                        "source_mechanism_status": selection.source_mechanism_status,
-                        "obligation_id": selection.obligation_id,
-                        "expected_information_gain": selection.expected_information_gain,
-                    })
-                    if selection.compatibility_normalizations:
-                        trace.record("PLANNER_COMPATIBILITY_NORMALIZED", {
-                            "step": state.step,
-                            "tool": call.name,
-                            "actions": list(selection.compatibility_normalizations),
-                            "reason": "provider-native incident argument compatibility",
-                        })
-                    if selection.reasoning_metadata_normalizations:
-                        trace.record("PLANNER_REASONING_METADATA_NORMALIZED", {
-                            "step": state.step,
-                            "tool": call.name,
-                            "actions": list(selection.reasoning_metadata_normalizations),
-                        })
-                    if selection.reasoning_metadata_drops or selection.reasoning_metadata_warnings:
-                        trace.record("PLANNER_REASONING_METADATA_DROPPED", {
-                            "step": state.step,
-                            "tool": call.name,
-                            "dropped_items": list(selection.reasoning_metadata_drops),
-                            "warnings": list(selection.reasoning_metadata_warnings),
-                            "reason": "optional structured metadata was not used; flat projections remain authoritative",
-                        })
-                    suggested_tools = INCIDENT_SKILLS[selection.skill].suggested_tools
-                    if call.name != "finalize_diagnosis" and call.name not in suggested_tools:
-                        trace.record("SKILL_TOOL_DEVIATION", {
-                            "step": state.step, "skill": selection.skill, "tool": call.name,
-                            "reason": "tool is outside the Skill's suggested tools; allowed because suggestions are guidance",
-                        })
-                    if previous_skill != active_skill:
-                        trace.record("SKILL_TRANSITION", {
-                            "step": state.step, "from": previous_skill or None, "to": active_skill,
-                            "reason": selection.reason,
-                        })
-                    known_evidence_ids = {item.evidence_id for item in evidence_memory.pinned}
-                    hypothesis = build_hypothesis(selection)
-                    finalization_diagnostics = hypothesis.finalization_diagnostics(known_evidence_ids)
-                    if hypothesis.evidence_sufficient and finalization_diagnostics:
-                        hypothesis = hypothesis.model_copy(update={"evidence_sufficient": False})
-                        trace.record("EVIDENCE_SUFFICIENCY_DOWNGRADED", {
-                            "step": state.step,
-                            "reason": "structured completion criteria not met",
-                            "diagnostics": finalization_diagnostics,
-                        })
-                    if not hypotheses or hypotheses[-1] != hypothesis:
-                        hypotheses.append(hypothesis)
-                        trace.record("HYPOTHESIS_STABILITY", {
-                            "step": state.step,
-                            "stable_rounds": hypothesis.stable_rounds,
-                            "material_fingerprint": self._material_hypothesis_fingerprint(hypothesis),
-                        })
-                    state.current_hypothesis = hypothesis.model_dump()
-                    if (
-                        hypothesis.contradictions
-                        and any(item.blocks_finalization for item in hypothesis.contradictions)
-                    ):
-                        trigger_reflection("blocking_contradiction")
-                    if (
-                        len(hypotheses) > 2
-                        and self._has_material_hypothesis_instability(
-                            previous_hypothesis, hypothesis,
-                        )
-                    ):
-                        trigger_reflection("hypothesis_instability")
-                    deterministic_sufficiency = hypothesis_can_finalize(
-                        hypothesis, known_evidence_ids,
-                    )
-                    trace.record("EVIDENCE_SUFFICIENCY_EVALUATED", {
-                        "step": state.step,
-                        "tool": call.name,
-                        "planner_declared": selection.evidence_sufficiency == "sufficient",
-                        "evidence_sufficient": bool(deterministic_sufficiency),
-                        "supporting_evidence_count": len(hypothesis.supporting_evidence_ids),
-                        "required_gap_count": len(hypothesis.required_gap_projection()),
-                        "open_critical_obligation_count": sum(
-                            1 for item in hypothesis.verification_obligations
-                            if item.blocks_finalization and item.status == "OPEN"
-                        ),
-                        "blocking_contradiction_count": sum(
-                            1 for item in hypothesis.contradictions
-                            if item.blocks_finalization and item.status == "OPEN"
-                        ),
-                        "diagnostics": finalization_diagnostics,
-                    })
-                    # Positive edge only: old traces could contain a false
-                    # EVIDENCE_SUFFICIENT payload when the Planner declared
-                    # sufficient but the deterministic predicate rejected it.
-                    if deterministic_sufficiency and evidence_sufficient_step is None:
-                        evidence_sufficient_step = state.step
-                        evidence_sufficient_tool_calls = state.tool_calls
-                        trace.record("EVIDENCE_SUFFICIENT", {
-                            "step": state.step,
-                            "evidence_sufficient": True,
-                            "planner_declared": selection.evidence_sufficiency == "sufficient",
-                            "hypothesis": hypothesis.model_dump(),
-                        })
-                    validated, error = tools.validate_arguments(call.name, call.arguments)
-                    repair_attempted = False
-                    repair_result_for_admission = None
-                    if error:
-                        repair_attempted = True
-                        rejection = {
-                            "step": state.step,
-                            "tool": call.name,
-                            "arguments": dict(call.arguments),
-                            "reason": "tool_contract_validation",
-                            "validation_error": error,
-                            "instruction": (
-                                "Repair only the rejected tool arguments on the next Planner turn; "
-                                "do not invent values or repeat the invalid fingerprint."
-                            ),
-                        }
-                        tool_repairs_this_turn += 1
-                        repaired, repair_result = targeted_contract_repair(
-                            call.name, dict(call.arguments), error,
-                            logical_repair_index=tool_repairs_this_turn,
-                        )
-                        if repaired is not None:
-                            validated = repaired
-                            call = type(call)(call.id, call.name, dict(repaired))
-                            rejection["repair_status"] = "accepted"
-                            repair_result_for_admission = repair_result
-                        else:
-                            tool_contract_repairs += 1
-                            rejection["repair_status"] = repair_result.get("status", "rejected")
-                            rejection["repair_index"] = tool_contract_repairs
-                            rejected_actions.append(rejection)
-                            trace.record("TOOL_CONTRACT_REJECTED", rejection)
-                            trace.record("TOOL_CONTRACT_REPAIR_REQUESTED", {
-                                "step": state.step,
-                                "tool": call.name,
-                                "repair_index": tool_contract_repairs,
-                                "max_repairs": self.config.max_tool_contract_repairs,
-                                "missing_or_invalid_fields": repair_result.get("missing_fields", []),
-                                "repair_result": repair_result,
-                            })
-                            trace.record("REPAIR_FAILED", {
-                                "layer": "tool_contract",
-                                "logical_turn": state.step,
-                                "tool": call.name,
-                                "repair_attempts": tool_contract_repairs,
-                                "reason": "targeted_tool_contract_repair_rejected",
-                            })
-                            trace.record("TOOL_CONTRACT_REPAIR_EXHAUSTED", {
-                                "step": state.step,
-                                "tool": call.name,
-                                "repair_index": tool_repairs_this_turn,
-                                "max_repairs": self.config.max_tool_contract_repairs,
-                            })
-                            # A failed repair exits this logical Planner turn.
-                            # The next Planner turn may choose a different
-                            # action, but it cannot spend a second repair in
-                            # this turn.
-                            tool_contract_replan_requested = True
-                            break
-                    trace.record("TOOL_CONTRACT_ADMITTED", {
-                        "step": state.step,
-                        "tool": call.name,
-                        "validation_result": "valid",
-                        "validated_arguments": dict(validated),
-                        "repair_attempted": repair_attempted,
-                        "repair": repair_result_for_admission,
-                    })
-                    read_gate_phase = budget_snapshot("converge_read_gate").phase
-                    phase_read_limit = (
-                        self.config.converge_max_read_file_calls
-                        if read_gate_phase == "converge"
-                        else self.config.source_verify_max_read_file_calls
-                    )
-                    if (
-                        read_gate_phase in {"converge", "source_verify"}
-                        and call.name == "read_file"
-                        and converge_read_file_calls >= phase_read_limit
-                    ):
-                        rejection = {
-                            "step": state.step,
-                            "tool": call.name,
-                            "reason": "source_read_file_budget_exhausted",
-                            "limit": phase_read_limit,
-                            "calls_used": converge_read_file_calls,
-                        }
-                        trace.record("CONVERGE_READ_FILE_REJECTED", rejection)
-                        fallback = best_candidate_from_hypothesis()
-                        if fallback is not None:
-                            termination_reason = "converge_read_file_budget_sufficient_hypothesis"
-                            ensure_review_progress(fallback, hypotheses[-1])
-                            return finalize_candidate(
-                                fallback, termination_reason, hypothesis=hypotheses[-1],
-                            )
-                        raise ConvergenceBudgetExhausted(
-                            "convergence read_file budget exhausted before a complete hypothesis"
-                        )
-                    if call.name != "finalize_diagnosis" and state.tool_calls - start_tools >= tool_limit:
-                        trace.record("ACTION_REJECTED", {
-                            "reason": "tool_budget_exhausted", "tool": call.name,
-                            "step": state.step, "tool_calls": state.tool_calls,
-                        })
-                        continue
-                    final_candidate = None
-                    re_finalization = call.name == "finalize_diagnosis" and review_baseline is not None
-                    if call.name == "finalize_diagnosis":
-                        if self.config.features.finalization_gate and not hypothesis.can_finalize(known_evidence_ids):
-                            trace.record("REFLECTION_TRIGGER", {
-                                "reason": "premature_finalize", "step": state.step,
-                            })
-                            # Reflection is an optional recovery aid.  Its
-                            # absence must never turn an invalid finalization
-                            # into an accepted candidate.
-                            trigger_reflection("premature_finalize")
-                            rejection = {
-                                "step": state.step,
-                                "tool": call.name,
-                                "reason": "premature_finalize",
-                                "instruction": "Continue investigation or close the missing critical hypothesis state before finalizing.",
-                            }
-                            rejected_actions.append(rejection)
-                            trace.record("ACTION_REJECTED", rejection)
-                            continue
-                        final_candidate = self._candidate_from_final_hypothesis(
-                            hypothesis, validated,
-                            known_evidence_ids=known_evidence_ids,
-                        )
-                        ensure_review_progress(final_candidate, hypothesis)
-                    if (call.name != "finalize_diagnosis"
-                            and hypothesis_can_finalize(hypothesis, known_evidence_ids)
-                            and not selection.remaining_evidence_need):
-                        candidate = self._candidate_from_hypothesis(hypothesis)
-                        final_candidate_step = state.step
-                        termination_reason = "sufficient_hypothesis"
-                        ensure_review_progress(candidate, hypothesis)
-                        trace.record("EVIDENCE_SUFFICIENT_FINALIZATION", {
-                            "step": state.step, "rejected_tool": call.name,
-                            "reason": "no remaining critical evidence need",
-                        })
-                        return finalize_candidate(
-                            candidate, "structured_sufficient_hypothesis", hypothesis=hypothesis,
-                        )
-                    fingerprint = f"{call.name}:{json.dumps(validated, sort_keys=True, ensure_ascii=False)}"
-                    action_probe = ActionProposal(
-                        kind=ActionKind.TOOL, skill=selection.skill,
-                        reason=selection.reason, tool=call.name, arguments=validated,
-                    )
-                    allowed, guard_reason = loop_guard.observe_action(action_probe, state)
-                    if re_finalization:
-                        # The semantic Review guard above has already decided whether
-                        # this is a meaningful re-submission. Exact action fingerprints
-                        # alone cannot reject the valid case where new Evidence was
-                        # acquired while the candidate text stayed unchanged.
-                        allowed, guard_reason = True, "review_semantic_progress"
-                    if not allowed:
-                        trace.record("PROGRESS_GUARD_REJECTED", {
-                            "step": state.step, "tool": call.name,
-                            "fingerprint": fingerprint, "reason": guard_reason,
-                        })
-                        raise RuntimeError("duplicate action limit exceeded")
-                    if fingerprint in fingerprints and not re_finalization:
-                        duplicate_calls += 1
-                        state.repeated_actions += 1
-                        prior_action = next(
-                            (item for item in reversed(actions)
-                             if item.get("fingerprint") == fingerprint), None,
-                        )
-                        prior_observation_id = (
-                            prior_action.get("observation_id") if prior_action else None
-                        )
-                        if prior_observation_id and observation_store.get(prior_observation_id):
-                            context_manager.rehydrate(prior_observation_id)
-                            state.rehydration_count += 1
-                            state.observation_reuse_count += 1
-                            trace.record("OBSERVATION_REHYDRATED", {
-                                "observation_id": prior_observation_id,
-                                "fingerprint": fingerprint,
-                                "reason": "duplicate_action_reused_shared_observation",
-                            })
-                        rejection = {
-                            "step": state.step,
-                            "tool": call.name,
-                            "arguments": validated,
-                            "fingerprint": fingerprint,
-                            "reason": "duplicate_fingerprint",
-                            "action_class": "duplicate",
-                            "instruction": "Do not request this action again; use its existing Evidence or choose a different critical check.",
-                        }
-                        rejected_actions.append(rejection)
-                        trace.record("ACTION_REJECTED", rejection)
-                        if self.config.features.no_progress_detection:
-                            loop_guard.observe_semantic_progress(
-                                state,
-                                evidence_ids=(item.evidence_id for item in evidence_memory.pinned),
-                                hypothesis=hypotheses[-1] if hypotheses else None,
-                                obligations=(hypotheses[-1].verification_obligations if hypotheses else ()),
-                                contradictions=(hypotheses[-1].contradictions if hypotheses else ()),
-                                review_feedback=review_feedback,
-                                meaningful_progress=False,
-                            )
-                        if self.config.features.no_progress_detection and state.no_progress_count >= self.config.max_no_progress:
-                            reflected = trigger_reflection("semantic_no_progress")
-                            if reflected:
-                                loop_guard.no_progress = 0
-                                state.no_progress_count = 0
-                                continue
-                            fallback = best_candidate_from_hypothesis()
-                            if fallback is None:
-                                raise RuntimeError("semantic no-progress limit exceeded")
-                            ensure_review_progress(fallback, hypotheses[-1] if hypotheses else None)
-                            termination_reason = "semantic_no_progress_sufficient_hypothesis"
-                            return finalize_candidate(
-                                fallback, termination_reason, hypothesis=hypotheses[-1],
-                            )
-                        continue
-                    fingerprints.add(fingerprint)
-                    action = {
-                        "step": state.step, "skill": selection.skill, "skill_reason": selection.reason,
-                        "tool": call.name, "arguments": validated, "fingerprint": fingerprint,
-                        "obligation_id": selection.obligation_id,
-                        "expected_information_gain": selection.expected_information_gain,
-                    }
-                    actions.append(action)
-                    if call.name == "finalize_diagnosis":
-                        trace.record("FINALIZATION_PROPOSED", {
-                            "step": state.step,
-                            "hypothesis_valid": hypothesis_can_finalize(hypothesis, known_evidence_ids),
-                        })
-                        candidate = final_candidate or RootCauseCandidate.model_validate(validated)
-                        final_candidate_step = state.step
-                        termination_reason = "explicit_finalize"
-                        return finalize_candidate(
-                            candidate, "explicit_finalize", hypothesis=hypothesis,
-                        )
-                    tool = tools.get(call.name)
-                    if (
-                        budget_snapshot("converge_read_file_execute").phase in {"converge", "source_verify"}
-                        and call.name == "read_file"
-                    ):
-                        converge_read_file_calls += 1
-                    if execution_mode == "dag":
-                        observation = run_dag_action(call, validated, selection)
-                    else:
-                        observation = execute_tool(tool, validated, call.name)
-                        state.tool_calls += 1
-                        admit_tool_observation(
-                            observation,
-                            tool_name=call.name,
-                            arguments=validated,
-                        )
-                    action["observation_id"] = observation.observation_id
-                    action["outcome"] = "ok" if observation.ok else "error"
-                    action["error_type"] = observation.error_type
-                    action["observation_status"] = observation.metadata.get("status")
-                    action["semantic_negative"] = observation.metadata.get("semantic_negative")
-                    if call.name == "knowledge_retrieval":
-                        retrieved = getattr(knowledge_tool, "last_result", None)
-                        retrieved_context = getattr(knowledge_tool, "last_prior_context", None)
-                        if retrieved_context is not None:
-                            prior_context = retrieved_context
-                            trace.record("KNOWLEDGE_RETRIEVED", {
-                                "stage": "on_demand",
-                                **retrieved.diagnostics.model_dump(mode="json"),
-                                "candidate_count": len(retrieved.candidates),
-                            })
-                            if retrieved.diagnostics.degraded:
-                                trace.record("KNOWLEDGE_RETRIEVAL_DEGRADED", {
-                                    "stage": "on_demand",
-                                    "reason": retrieved.diagnostics.reason,
-                                })
-                            trace.record("PRIOR_CONTEXT_PACKED", {
-                                "stage": "on_demand",
-                                "context_id": retrieved_context.context_id,
-                                "source_types": list(retrieved_context.source_types),
-                                "candidate_count": len(retrieved_context.candidates),
-                                "packed_chars": retrieved_context.packed_chars,
-                                "packed_tokens": retrieved_context.packed_tokens,
-                            })
-                    if call.name == "code_search":
-                        retrieval_metadata = dict(observation.metadata or {})
-                        trace.record("RETRIEVAL_MODE", {
-                            "requested_mode": retrieval_metadata.get("requested_mode", "lexical"),
-                            "effective_mode": retrieval_metadata.get("effective_mode", "lexical"),
-                            "degraded": bool(retrieval_metadata.get("degraded", False)),
-                            "reason": retrieval_metadata.get("reason", ""),
-                        })
-                        trace.record("RETRIEVAL_RESULT_SUMMARY", {
-                            "tool": call.name,
-                            "matches": retrieval_metadata.get("matches", 0),
-                            "candidate_only": retrieval_metadata.get("information_source") == "candidate_retrieval",
-                        })
-                    if not observation.ok:
-                        trace.record("REFLECTION_TRIGGER", {"reason": "no_progress", "step": state.step})
-                    progress_after_action = progress_marker()
-                    dynamic_progress = progress_made(
-                        progress_before_action, progress_after_action,
-                    )
-                    action["new_evidence_count"] = len(
-                        progress_after_action.evidence_ids - progress_before_action.evidence_ids
-                    )
-                    action["obligation_progress_count"] = max(
-                        0,
-                        len(progress_before_action.open_obligations)
-                        - len(progress_after_action.open_obligations),
-                    )
-                    action["hypothesis_changed"] = (
-                        progress_before_action.hypothesis != progress_after_action.hypothesis
-                    )
-                    action["information_gain"] = (
-                        "high" if action["new_evidence_count"] > 0
-                        or action["obligation_progress_count"] > 0
-                        or action["hypothesis_changed"] else "none"
-                    )
-                    # Gold required-group matching is evaluator-only. Keep a
-                    # clearly marked obligation proxy in the runtime artifact
-                    # instead of leaking evaluator facts into planning.
-                    action["required_evidence_group_progress"] = {
-                        "status": "obligation_proxy",
-                        "progress_count": action["obligation_progress_count"],
-                        "new_evidence_count": action["new_evidence_count"],
-                        "note": "Gold group matching is evaluator-only",
-                    }
-                    if not observation.ok:
-                        action["action_class"] = "failed"
-                    elif action["new_evidence_count"] > 0 or action["obligation_progress_count"] > 0:
-                        action["action_class"] = (
-                            "necessary" if selection.obligation_id
-                            or action["obligation_progress_count"] > 0
-                            else "useful_noncritical"
-                        )
-                    else:
-                        action["action_class"] = "zero_information_gain"
-                    dynamic_state_after_action = dynamic_budget.decision(
-                        "post_tool_progress",
-                        tokens_used=prompt_tokens,
-                        llm_calls_used=llm_calls,
-                        cost_used=run_cost,
-                    )
-                    trace.record("DYNAMIC_PROGRESS_CHECK", {
-                        "step": state.step,
-                        "tool": call.name,
-                        "progress": dynamic_progress,
-                        "context_state": dynamic_state_after_action.state.value,
-                        "evidence_count": len(progress_after_action.evidence_ids),
-                        "open_obligation_count": len(progress_after_action.open_obligations),
-                        "blocking_contradiction_count": len(progress_after_action.blocking_contradictions),
-                        "component_count": len(progress_after_action.components),
-                        "obligation_id": selection.obligation_id,
-                        "expected_information_gain": selection.expected_information_gain,
-                        "new_evidence_count": action["new_evidence_count"],
-                        "obligation_progress_count": action["obligation_progress_count"],
-                        "hypothesis_changed": action["hypothesis_changed"],
-                        "information_gain": action["information_gain"],
-                        "action_class": action["action_class"],
-                        "required_evidence_group_progress": action[
-                            "required_evidence_group_progress"
-                        ],
-                    })
-                    if self.config.features.no_progress_detection:
-                        loop_guard.observe_semantic_progress(
-                            state,
-                            evidence_ids=(item.evidence_id for item in evidence_memory.pinned),
-                            hypothesis=hypotheses[-1] if hypotheses else None,
-                            obligations=(hypotheses[-1].verification_obligations if hypotheses else ()),
-                            contradictions=(hypotheses[-1].contradictions if hypotheses else ()),
-                            review_feedback=review_feedback,
-                            meaningful_progress=action["action_class"] not in {
-                                "zero_information_gain", "failed",
-                            },
-                        )
-                    if self.config.features.no_progress_detection and state.no_progress_count >= self.config.max_no_progress:
-                        reflected = trigger_reflection("semantic_no_progress")
-                        if reflected:
-                            loop_guard.no_progress = 0
-                            state.no_progress_count = 0
-                            continue
-                        fallback = best_candidate_from_hypothesis()
-                        if fallback is None:
-                            raise RuntimeError("semantic no-progress limit exceeded")
-                        ensure_review_progress(fallback, hypotheses[-1] if hypotheses else None)
-                        termination_reason = "semantic_no_progress_sufficient_hypothesis"
-                        return finalize_candidate(
-                            fallback, "semantic_no_progress_sufficient_hypothesis",
-                            hypothesis=hypotheses[-1],
-                        )
-                if tool_contract_replan_requested:
-                    trace.record("REPAIR_FAILED_REPLAN", {
-                        "logical_turn": state.step,
-                        "reason": "tool_contract_repair_failed; return to PLAN",
-                    })
-                    transition_phase("PLAN", "tool_contract_repair_failed")
-                    continue
-            fallback = best_candidate_from_hypothesis()
-            if fallback is not None:
-                termination_reason = "step_budget_sufficient_hypothesis"
-                ensure_review_progress(fallback, hypotheses[-1] if hypotheses else None)
-                return finalize_candidate(
-                    fallback, termination_reason, hypothesis=hypotheses[-1],
+                if evidence_admission_rejections:
+                    trigger_reflection(admission_rejection_count=evidence_admission_rejections)
+                continuation = result.continuation
+                if not isinstance(continuation, PlanAdmissionDecision):
+                    raise RuntimeError("Planner result requires typed post-commit plan admission")
+                if continuation.action == "finalize":
+                    termination_reason = "post_commit_finalization"
+                    return finalize_candidate(termination_reason)
+                semantic_progress = progress_made(
+                    progress_before_action, progress_marker(),
                 )
-            raise RuntimeError("incident step budget exhausted before finalization")
+                if continuation.reason == "plan_acquisition_already_acquired":
+                    duplicate_calls += 1
+                    state.repeated_actions += 1
+                    trace.record("ACTION_REJECTED", {"step": state.step,
+                        "reason": continuation.reason, "detail": continuation.detail})
+                acquired_before = action_runtime.acquired_keys()
+                if continuation.action == "execute":
+                    execute_plan(result, turn_input, committed_hypothesis)
+                progress_candidate = observe_action_progress(
+                    canonical_progress=semantic_progress,
+                    acquisition_progress=bool(action_runtime.acquired_keys() - acquired_before),
+                )
+                if progress_candidate is not None:
+                    return progress_candidate
+                if continuation.action != "execute":
+                    trace.record("SEMANTIC_BARRIER", {
+                        "step": state.step, "reason_code": continuation.reason,
+                        "committed_state_version": continuation.committed_state_version,
+                        "observation_ids": [],
+                    })
+                    runtime_action_constraint = json.dumps({
+                        "reason_code": continuation.reason,
+                        "admission_detail": continuation.detail,
+                        "open_obligation_ids": list(canonical_rca_state.open_critical_obligation_ids),
+                    }, sort_keys=True)
+                    transition_phase("PLAN", continuation.reason)
+                    continue
 
-        def apply_review_rejection(decision: ReviewDecision) -> tuple[bool, bool]:
-            """Convert Review findings into a bounded recovery decision.
-
-            Returns ``(recoverable, contradiction_requires_reflection)``. Review
-            never chooses tools or re-investigates; it only supplies grounding
-            findings for this deterministic Runtime transition.
-            """
-            nonlocal obligation_created_count, blocking_contradiction_count
-            current = hypotheses[-1] if hypotheses else None
-            claims = tuple(dict.fromkeys(
+        def apply_review_rejection(
+            decision: ReviewDecision,
+            rejected_candidate: RootCauseCandidate,
+        ) -> tuple[ProgressDecision, bool]:
+            """Admit typed Review gaps through the common Obligation policy."""
+            nonlocal canonical_rca_state, obligation_created_count
+            current = active_hypothesis()
+            causal_gap_audit = tuple(dict.fromkeys(
                 " ".join(str(item).split()).strip()
-                for item in (*decision.missing_evidence, *decision.causal_gaps)
+                for item in decision.causal_gaps
                 if " ".join(str(item).split()).strip()
             ))
-            next_obligations = dict(obligation_state)
             created: list[str] = []
-            for claim in claims:
-                existing = next((
-                    item for item in next_obligations.values()
-                    if " ".join(item.claim.split()).casefold() == claim.casefold()
-                ), None)
-                if existing is not None:
-                    continue
-                obligation = VerificationObligation(
-                    id=_obligation_id(claim),
-                    claim=claim,
-                    critical=True,
-                    status="OPEN",
-                    supporting_evidence_ids=(),
+            actionable: list[str] = []
+            rejected: list[dict[str, Any]] = []
+            evidence_tools = tuple(
+                name for name in capabilities.planner_tool_names(tools)
+                if name not in {"finalize_diagnosis", "knowledge_retrieval"}
+            )
+            for proposal in decision.gap_proposals:
+                admission = ObligationAdmissionPolicy.admit_review_gap(
+                    proposal,
+                    provenance_profiles=completion_provenance_profiles(),
+                    candidate=rejected_candidate,
+                    reported_unsupported_claims=decision.unsupported_claims,
+                    related_hypothesis=(current.claim if current else ""),
+                    existing_obligations=canonical_rca_state.obligations,
+                    available_tools=evidence_tools,
                 )
-                next_obligations[obligation.id] = obligation
-                created.append(obligation.id)
+                trace.record("REVIEW_GAP_ADMISSION", {
+                    "round": review_rounds,
+                    "status": admission.status,
+                    "reasons": list(admission.reasons),
+                    "obligation_id": admission.obligation_id,
+                    "unsupported_claim": proposal.unsupported_claim,
+                    "claim_kind": proposal.claim_kind,
+                    "suggested_tools": list(proposal.suggested_tools),
+                })
+                if admission.status == "REJECTED":
+                    rejected.append({
+                        "claim": proposal.claim,
+                        "reasons": list(admission.reasons),
+                    })
+                    continue
+                if not admission.actionable:
+                    continue
+                actionable.append(admission.obligation_id)
+                if admission.status == "DUPLICATE":
+                    continue
+                canonical_rca_state = canonical_rca_state.reduce(admission.accepted_event())
+                created.append(admission.obligation_id)
                 obligation_created_count += 1
+                obligation = canonical_rca_state.obligation(admission.obligation_id)
                 trace.record("OBLIGATION_CREATED", {
                     **obligation.model_dump(),
-                    "reason": "review_missing_evidence",
+                    "reason": "review_gap_proposal_admitted",
                     "review_round": review_rounds,
+                    "source": "rca_state_reducer",
                 })
 
-            if next_obligations != obligation_state:
-                obligation_state.clear()
-                obligation_state.update(next_obligations)
-                if current is not None:
-                    updated = current.model_copy(update={
-                        "verification_obligations": tuple(next_obligations.values()),
-                        "required_gaps": tuple(
-                            item.claim for item in next_obligations.values()
-                            if item.blocks_finalization
-                        ),
-                        "evidence_sufficient": False,
-                    })
-                    hypotheses[-1] = updated
-                    state.current_hypothesis = updated.model_dump()
+            if created:
+                project_obligation_ids_to_dag("review_recovery")
                 trace.record("REVIEW_RECOVERY_OBLIGATIONS", {
                     "round": review_rounds,
                     "obligation_ids": created,
-                    "reason": "recoverable_missing_evidence",
+                    "reason": "typed_review_gap_admitted",
+                    "causal_gaps_audit_only": list(causal_gap_audit),
+                    "rejected_proposals": rejected,
                 })
 
             blocking = tuple(dict.fromkeys(
                 (*decision.blocking_contradictions, *decision.contradictions)
             ))
             contradiction_requires_reflection = bool(blocking)
-            recoverability = decision.recoverability
-            recoverable = bool(
-                not recoverability.unrecoverable
-                and (
-                    recoverability.recoverable
-                    or claims
-                    or decision.targeted_followup
-                    or decision.suggested_investigation
-                    or contradiction_requires_reflection
-                )
-            )
+            recovery = ProgressPolicy.evaluate(operational_facts(
+                "review_recovery",
+                review_recovery_permitted=decision.recoverability.unrecoverable is False,
+                actionable_obligation_ids=tuple(actionable),
+                review_contradiction_ids=blocking,
+            ))
             trace.record("REVIEW_RECOVERY_DECISION", {
                 "round": review_rounds,
-                "recoverable": recoverable,
-                "unrecoverable": recoverability.unrecoverable,
-                "missing_evidence_count": len(claims),
+                "recoverable": recovery.action == "retry",
+                "progress_action": recovery.action,
+                "progress_reasons": list(recovery.reasons),
+                "unrecoverable": decision.recoverability.unrecoverable,
+                "gap_proposal_count": len(decision.gap_proposals),
+                "actionable_gap_count": len(actionable),
+                "rejected_gap_count": len(rejected),
+                "missing_evidence_audit_count": len(decision.missing_evidence),
+                "causal_gap_audit_count": len(causal_gap_audit),
                 "blocking_contradiction_count": len(blocking),
                 "targeted_followup": decision.targeted_followup or decision.suggested_investigation,
             })
-            return recoverable, contradiction_requires_reflection
+            return recovery, contradiction_requires_reflection
+
+        def review_inconclusive_report() -> None:
+            """Give an INCONCLUSIVE report the same independent Review gate.
+
+            This path is deliberately report-only: Review may assess whether
+            the partial diagnosis is traceable and score its likely cause, but
+            it cannot manufacture a Candidate or promote the run to PASS.
+            Operational/provider failures remain explicitly UNAVAILABLE.
+            """
+            nonlocal decision, review_rounds, review_record_cursor
+            nonlocal llm_calls, review_calls
+            if not self.config.enable_review or status != "INCONCLUSIVE":
+                return
+            # A hard deadline or physical call exhaustion cannot be repaired by
+            # another provider request.  The report still records Review as
+            # unavailable through the normal terminal projection.
+            if termination_reason in {
+                "physical_call_budget_exhausted",
+                "run_deadline_after_review",
+                "provider_timeout_after_review",
+            }:
+                return
+            if (
+                termination_reason in {"planner_contract_exhausted", "reflection_contract_exhausted"}
+                and not canonical_rca_state.semantic_records
+                and not evidence_memory.pinned
+            ):
+                # A pure protocol/context failure has no diagnostic material
+                # for an independent report assessment; preserve its zero
+                # semantic/external-effect boundary and mark Review unavailable.
+                return
+            review_rounds += 1
+            transition_phase("REVIEW", "inconclusive_report")
+            review_record_cursor = len(provider_gateway.records)
+            review_usage_accounted = False
+            admitted = False
+            started_at = time.monotonic()
+            configured_timeout = float(self.config.review_llm_timeout_seconds)
+            try:
+                admit("review", count_llm=True)
+                admitted = True
+                review_timeout = provider_timeout(self.config.review_llm_timeout_seconds)
+                trace.record("REVIEW_CALL_STARTED", {
+                    "round": review_rounds,
+                    "stage": "inconclusive_report",
+                    "configured_timeout": configured_timeout,
+                    "effective_timeout": review_timeout,
+                    "remaining_run_deadline": deadline.remaining(),
+                    "report_only": True,
+                })
+                current_hypothesis = active_hypothesis()
+                blocking_contradictions = tuple(
+                    item.model_dump()
+                    for item in canonical_rca_state.contradictions
+                    if item.blocks_finalization
+                )
+                source_context = self._source_mechanism_coverage(
+                    case,
+                    current_hypothesis,
+                    source_workspace_available=source_workspace_available,
+                    available_code_tools=available_code_tools,
+                    source_evidence_ids=source_evidence_ids(),
+                    source_relevance=evaluate_source_claims(
+                        current_hypothesis.source_claims if current_hypothesis else ()
+                    ),
+                )
+                source_context["finalization_conditions"] = (
+                    finalization_decision().conditions.model_dump(mode="json")
+                )
+                review_evidence = incident_evidence()
+                frozen_report = build_diagnostic_report(
+                    case=case,
+                    run_status="INCONCLUSIVE",
+                    termination_reason=termination_reason,
+                    candidate=None,
+                    rca_state=canonical_rca_state,
+                    evidence_memory=evidence_memory,
+                    projected_facts=projected_facts.values(),
+                )
+                from debug_assistant.tools.provenance import (
+                    provenance_profile_catalog,
+                    registry_provenance_profiles,
+                )
+                review_input = dict(
+                    canonical_questions=tuple(
+                        question.model_dump(mode="json")
+                        for question in canonical_rca_state.obligations
+                    ),
+                    blocking_contradictions=blocking_contradictions,
+                    source_mechanism_context=source_context,
+                    open_critical_obligations=tuple(
+                        item.model_dump()
+                        for item in canonical_rca_state.obligations
+                        if item.blocks_finalization
+                    ),
+                    source_profiles=provenance_profile_catalog(
+                        registry_provenance_profiles(
+                            tools, capabilities.planner_tool_names(tools)
+                        )
+                    ),
+                    evidence_acquisition_tools=tuple(
+                        name for name in capabilities.planner_tool_names(tools)
+                        if name not in {"finalize_diagnosis", "knowledge_retrieval"}
+                    ),
+                    diagnostic_report=frozen_report.model_copy(
+                        update={"evidence_links": ()}
+                    ),
+                )
+                requested_ids = tuple(dict.fromkeys(
+                    item.evidence_id for item in review_evidence
+                ))
+                review_context = context_manager.build(
+                    state,
+                    evidence_memory,
+                    observation_store,
+                    max_context_chars=self.config.planner_context_chars,
+                    max_context_tokens=dynamic_budget.context_token_budget(),
+                    token_estimator=dynamic_budget.estimate_tokens,
+                    include_agent_control_state=False,
+                    rca_state=canonical_rca_state,
+                    role="review",
+                    max_request_chars=self.config.max_context_chars,
+                    requested_ids=requested_ids,
+                    request_renderer=lambda view: reviewer.render_envelope(
+                        None, review_evidence, view, **review_input
+                    ),
+                )
+                trace.record("REVIEW_CONTEXT_VIEW", {
+                    "role": "review",
+                    "report_only": True,
+                    "visible_observation_ids": list(
+                        review_context.context_view.visible_observation_ids
+                    ),
+                    "visible_evidence_refs": list(
+                        review_context.context_view.visible_evidence_refs
+                    ),
+                    "body_coverage": json.loads(
+                        review_context.context_view.body_coverage_json
+                    ),
+                })
+                model_decision = reviewer.review(
+                    None,
+                    review_evidence,
+                    **review_input,
+                    context_view=review_context.context_view,
+                    logical_timeout_seconds=review_timeout,
+                    prompt_budget=dynamic_budget,
+                    max_output_tokens=self.config.review_max_completion_tokens,
+                    repair_max_output_tokens=self.config.review_repair_max_completion_tokens,
+                    allow_terminal_reserve=False,
+                )
+                account_review_attempts(reviewer)
+                add_usage(
+                    reviewer,
+                    stage="review",
+                    prompt_breakdown=getattr(reviewer, "last_prompt_breakdown", None),
+                )
+                review_usage_accounted = True
+                record_review_trace(
+                    round_number=review_rounds,
+                    configured_timeout=configured_timeout,
+                    effective_timeout=review_timeout,
+                    remaining_run_deadline=deadline.remaining(),
+                    started_at=started_at,
+                    reviewer=reviewer,
+                )
+                decision = enforce_review_consistency(model_decision)
+                trace.record("REPORT_REVIEWED", {
+                    "round": review_rounds,
+                    "decision": decision.decision,
+                    "confidence_score": decision.confidence_score,
+                    "confidence_reason": decision.confidence_reason,
+                    "report_only": True,
+                    "run_status_remains": "INCONCLUSIVE",
+                })
+            except (RunBudgetAdmissionExceeded, PromptBudgetExceeded) as exc:
+                if admitted:
+                    llm_calls = max(0, llm_calls - 1)
+                    review_calls = max(0, review_calls - 1)
+                    dynamic_budget.set_review_calls_used(review_calls)
+                    dynamic_budget.set_run_usage(
+                        tokens_used=prompt_tokens + completion_tokens,
+                        llm_calls_used=llm_calls,
+                        cost_used=run_cost,
+                    )
+                trace.record("REPORT_REVIEW_UNAVAILABLE", {
+                    "round": review_rounds,
+                    "error_type": type(exc).__name__,
+                    "reason": str(exc),
+                    "report_only": True,
+                })
+            except Exception as exc:
+                if admitted and not review_usage_accounted:
+                    materialize_review_attempts(
+                        reviewer,
+                        max(1, int(getattr(reviewer, "last_call_count", 0) or 0)),
+                        effective_timeout=max(0.0, deadline.remaining()),
+                        started_at=started_at,
+                        terminal_error=exc,
+                    )
+                    account_review_attempts(reviewer)
+                    add_usage(
+                        reviewer,
+                        stage="review",
+                        prompt_breakdown=getattr(reviewer, "last_prompt_breakdown", None),
+                    )
+                    review_usage_accounted = True
+                trace.record("REPORT_REVIEW_UNAVAILABLE", {
+                    "round": review_rounds,
+                    "error_type": type(exc).__name__,
+                    "reason": str(exc),
+                    "report_only": True,
+                })
 
         candidate = None
         decision = None
+        report = None
+        report_review = None
         status = "FAILED"
         error_type = error_message = ""
         try:
             candidate = investigate(self.config.max_steps, self.config.max_tool_calls)
+            if candidate is None:
+                status = "INCONCLUSIVE"
+                termination_reason = termination_reason or "investigation_inconclusive"
             if not self.config.enable_review:
-                status = "PASS"
+                # A candidate without the independent terminal critic is a
+                # deliverable report, never a successful RCA result.
+                status = "INCONCLUSIVE"
                 termination_reason = "review_disabled"
-            while self.config.enable_review and review_rounds < self.config.max_review_rounds:
+            # A missing Candidate is a report-only terminal path.  It must not
+            # enter the Candidate recovery loop or dereference candidate-owned
+            # claims/evidence; the bounded report Review runs after this block.
+            while self.config.enable_review and candidate is not None:
+                if ProgressPolicy.evaluate(operational_facts(
+                    "recovery", stage="review_round", recovery_count=review_rounds,
+                    recovery_limit=self.config.max_review_rounds,
+                )).action == "stop":
+                    break
                 review_rounds += 1
                 transition_phase("REVIEW", "candidate_finalized", review_round=review_rounds)
                 review_usage_accounted = False
+                review_record_cursor = len(provider_gateway.records)
                 try:
                     admit("review", count_llm=True)
                     review_started_at = time.monotonic()
-                    review_attempt_state = multiprocessing.Value("i", 0)
+                    review_attempt_state = {"count": 0}
 
                     def on_review_attempt_started(attempt: dict[str, Any]) -> None:
-                        review_attempt_state.value = max(
-                            review_attempt_state.value,
+                        review_attempt_state["count"] = max(
+                            review_attempt_state["count"],
                             int(attempt.get("call_index", 0) or 0),
                         )
 
@@ -3899,10 +5514,10 @@ class DiagnosisHarness:
                     })
                     blocking_contradictions = tuple(
                         item.model_dump()
-                        for item in (hypotheses[-1].contradictions if hypotheses else ())
+                        for item in canonical_rca_state.contradictions
                         if item.blocks_finalization
                     )
-                    current_hypothesis = hypotheses[-1] if hypotheses else None
+                    current_hypothesis = active_hypothesis()
                     source_context = self._source_mechanism_coverage(
                         case,
                         current_hypothesis,
@@ -3913,32 +5528,63 @@ class DiagnosisHarness:
                             current_hypothesis.source_claims if current_hypothesis else ()
                         ),
                     )
+                    # Capability/status projections are context, not a second
+                    # source gate. Review sees the canonical publication facts.
+                    source_context["finalization_conditions"] = (
+                        finalization_decision().conditions.model_dump(mode="json")
+                    )
                     open_critical_obligations = tuple(
                         item.model_dump()
                         for item in (
-                            current_hypothesis.verification_obligations
-                            if current_hypothesis else ()
+                            canonical_rca_state.obligations
+                            if canonical_rca_state is not None else ()
                         )
                         if item.blocks_finalization
                     )
+                    from debug_assistant.tools.provenance import provenance_profile_catalog, registry_provenance_profiles
+                    review_evidence = incident_evidence()
+                    frozen_report = build_diagnostic_report(
+                        case=case, run_status="PASS",
+                        termination_reason=termination_reason,
+                        candidate=candidate, rca_state=canonical_rca_state,
+                        evidence_memory=evidence_memory,
+                        projected_facts=projected_facts.values(),
+                    )
+                    review_input = dict(
+                        canonical_questions=tuple(question.model_dump(mode="json")
+                            for question in canonical_rca_state.obligations),
+                        blocking_contradictions=blocking_contradictions,
+                        source_mechanism_context=source_context,
+                        open_critical_obligations=open_critical_obligations,
+                        source_profiles=provenance_profile_catalog(registry_provenance_profiles(
+                            tools, capabilities.planner_tool_names(tools))),
+                        evidence_acquisition_tools=tuple(name for name in capabilities.planner_tool_names(tools)
+                            if name not in {"finalize_diagnosis", "knowledge_retrieval"}),
+                        # Review receives the same frozen report identity but
+                        # obtains Evidence bodies through its own ContextView;
+                        # do not duplicate every source excerpt in the prompt.
+                        diagnostic_report=frozen_report.model_copy(update={"evidence_links": ()}),
+                    )
+                    review_context = context_manager.build(
+                        state, evidence_memory, observation_store,
+                        max_context_chars=self.config.planner_context_chars,
+                        max_context_tokens=dynamic_budget.context_token_budget(),
+                        token_estimator=dynamic_budget.estimate_tokens,
+                        include_agent_control_state=False, rca_state=canonical_rca_state,
+                        role="review", max_request_chars=self.config.max_context_chars,
+                        requested_ids=candidate.evidence_ids,
+                        request_renderer=lambda view: reviewer.render_envelope(
+                            candidate, review_evidence, view, **review_input))
+                    trace.record("REVIEW_CONTEXT_VIEW", {"role": "review",
+                        "visible_observation_ids": list(review_context.context_view.visible_observation_ids),
+                        "visible_evidence_refs": list(review_context.context_view.visible_evidence_refs),
+                        "body_coverage": json.loads(review_context.context_view.body_coverage_json)})
                     try:
-                        model_decision = self._provider_call(
-                            reviewer.review,
-                            candidate, incident_evidence(),
-                            blocking_contradictions=blocking_contradictions,
-                            source_mechanism_context=source_context,
-                            open_critical_obligations=open_critical_obligations,
+                        model_decision = reviewer.review(
+                            candidate, review_evidence, **review_input,
+                            context_view=review_context.context_view,
                             logical_timeout_seconds=review_timeout,
                             on_attempt_started=on_review_attempt_started,
-                            hard_timeout_seconds=review_timeout,
-                            state_source=reviewer,
-                            state_attributes=(
-                                "last_usage", "last_schema_repaired", "last_repair_attempted",
-                                "last_deterministic_normalized", "last_schema_error", "last_call_count",
-                                "last_attempts", "last_failure_type",
-                                "last_prompt_breakdown",
-                                "last_prompt_breakdowns",
-                            ),
                             prompt_budget=dynamic_budget,
                             max_output_tokens=self.config.review_max_completion_tokens,
                             repair_max_output_tokens=self.config.review_repair_max_completion_tokens,
@@ -3947,6 +5593,7 @@ class DiagnosisHarness:
                             allow_terminal_reserve=False,
                         )
                     except RunBudgetAdmissionExceeded as exc:
+                        add_usage(reviewer, stage="review", call_status="failed")
                         # Review is the terminal semantic gate. A run-budget
                         # admission rejection must remain INCONCLUSIVE and
                         # must never be misreported as a Review PASS.
@@ -3976,6 +5623,7 @@ class DiagnosisHarness:
                         error_type, error_message = type(exc).__name__, str(exc)
                         break
                     except PromptBudgetExceeded as exc:
+                        add_usage(reviewer, stage="review", call_status="failed")
                         # Review is the terminal semantic gate. If even its
                         # complete payload cannot fit, stop fail-closed as
                         # INCONCLUSIVE; never invoke the provider with an
@@ -4007,7 +5655,7 @@ class DiagnosisHarness:
                         break
                     except Exception as exc:
                         materialize_review_attempts(
-                            reviewer, review_attempt_state.value,
+                            reviewer, review_attempt_state["count"],
                             effective_timeout=review_timeout,
                             started_at=review_started_at,
                             terminal_error=exc,
@@ -4043,36 +5691,6 @@ class DiagnosisHarness:
                         reviewer=reviewer,
                     )
                     decision = enforce_review_consistency(model_decision)
-                    review_gate_gaps = []
-                    if open_critical_obligations:
-                        review_gate_gaps.append(
-                            "A critical verification obligation remains open."
-                        )
-                    if (
-                        source_context.get("application_code_declared")
-                        and source_context.get("workspace_available")
-                        and source_context.get("status") in {"unknown", "gap"}
-                        and not source_context.get("source_relevance", {}).get("all_claims_covered")
-                    ):
-                        review_gate_gaps.append(
-                            "The application-level mechanism is not supported by cited source Evidence."
-                        )
-                    if decision.decision == "PASS" and review_gate_gaps:
-                        decision = decision.model_copy(update={
-                            "decision": "REJECT",
-                            "causal_gaps": tuple(dict.fromkeys(
-                                (*decision.causal_gaps, *review_gate_gaps)
-                            )),
-                            "reason": (
-                                "Deterministic Review gate rejected PASS while critical source "
-                                "coverage remains unresolved. " + decision.reason
-                            ),
-                        })
-                        trace.record("REVIEW_PASS_DOWNGRADED", {
-                            "round": review_rounds,
-                            "reason": "critical source verification remains unresolved",
-                            "causal_gaps": review_gate_gaps,
-                        })
                     if decision.decision != model_decision.decision:
                         trace.record("REVIEW_PASS_DOWNGRADED", {
                             "round": review_rounds,
@@ -4081,15 +5699,15 @@ class DiagnosisHarness:
                             "missing_evidence": list(model_decision.missing_evidence),
                             "contradictions": list(model_decision.contradictions),
                         })
-                    if llm_calls > self.config.max_llm_calls:
+                    if ProgressPolicy.evaluate(operational_facts("post_usage")).action == "stop":
                         raise RuntimeError("max_llm_calls exceeded during review repair")
                 except ReviewSchemaError as exc:
                     if not review_usage_accounted:
                         account_review_attempts(reviewer)
-                        add_usage(
-                            reviewer, stage="review",
-                            prompt_breakdown=getattr(reviewer, "last_prompt_breakdown", None),
-                        )
+                    add_usage(
+                        reviewer, stage="review",
+                        prompt_breakdown=getattr(reviewer, "last_prompt_breakdown", None),
+                    )
                     trace.record("REVIEW_ERROR", {
                         "round": review_rounds, "error_type": type(exc).__name__,
                         "message": str(exc), "validation_error": reviewer.last_schema_error,
@@ -4104,10 +5722,13 @@ class DiagnosisHarness:
                         "candidate": candidate.model_dump() if candidate is not None else None,
                         "reason": "Final Review structured contract remained invalid after one bounded repair",
                         "review_rounds": review_rounds,
-                        "hypothesis": hypotheses[-1].model_dump() if hypotheses else None,
+                        "hypothesis": (
+                            active_hypothesis().model_dump()
+                            if active_hypothesis() is not None else None
+                        ),
                         "open_obligations": [
                             item.model_dump() for item in (
-                                hypotheses[-1].verification_obligations if hypotheses else ()
+                                canonical_rca_state.obligations
                             ) if item.blocks_finalization
                         ],
                     })
@@ -4143,26 +5764,39 @@ class DiagnosisHarness:
                     status = "PASS"
                     termination_reason = "final_review_pass"
                     break
-                recoverable, contradiction_requires_reflection = apply_review_rejection(decision)
+                recovery, contradiction_requires_reflection = apply_review_rejection(
+                    decision, candidate,
+                )
                 trace.record("REVIEW_REJECT", {
                     "round": review_rounds,
-                    "recoverable": recoverable,
+                    "recoverable": recovery.action == "retry",
                     "contradiction_requires_reflection": contradiction_requires_reflection,
                 })
-                if not recoverable:
-                    transition_phase("INCONCLUSIVE", "review_unrecoverable")
+                if recovery.action == "stop":
+                    review_stop_reason = (
+                        "review_unrecoverable" if decision.recoverability.unrecoverable
+                        else "review_recovery_unavailable"
+                    )
+                    transition_phase("INCONCLUSIVE", review_stop_reason)
                     trace.record("REVIEW_RECOVERY_BLOCKED", {
                         "round": review_rounds,
-                        "reason": "review_declared_unrecoverable_or_no_targeted_path",
+                        "reason": review_stop_reason,
+                        "progress_reasons": list(recovery.reasons),
                     })
                     status = "INCONCLUSIVE"
-                    termination_reason = "review_unrecoverable"
+                    termination_reason = review_stop_reason
                     break
-                if review_rounds == self.config.max_review_rounds:
+                if ProgressPolicy.evaluate(operational_facts(
+                    "recovery", stage="review_round", recovery_count=review_rounds,
+                    recovery_limit=self.config.max_review_rounds,
+                )).action == "stop":
                     status = "INCONCLUSIVE"
                     termination_reason = "review_bound_exhausted"
                     break
-                if review_recovery_cycles >= self.config.max_review_recovery_cycles:
+                if ProgressPolicy.evaluate(operational_facts(
+                    "recovery", stage="review_recovery", recovery_count=review_recovery_cycles,
+                    recovery_limit=self.config.max_review_recovery_cycles,
+                )).action == "stop":
                     transition_phase("INCONCLUSIVE", "review_recovery_bound_exhausted")
                     trace.record("REVIEW_RECOVERY_BLOCKED", {
                         "round": review_rounds,
@@ -4178,11 +5812,26 @@ class DiagnosisHarness:
                     "cycle": review_recovery_cycles,
                     "max_cycles": self.config.max_review_recovery_cycles,
                 })
+                dynamic_budget.begin_investigation_recovery(
+                    tokens_used=prompt_tokens + completion_tokens,
+                    llm_calls_used=llm_calls,
+                )
+                trace.record("BUDGET_RECOVERY_PHASE_STARTED", {
+                    "from": "review",
+                    "to": "investigation_recovery",
+                    "reason": "review_reject_recoverable",
+                    "round": review_rounds,
+                    "cycle": review_recovery_cycles,
+                    "budget_lifecycle": dynamic_budget.lifecycle_payload(
+                        tokens_used=prompt_tokens + completion_tokens,
+                        llm_calls_used=llm_calls,
+                    ),
+                })
                 rejected_candidate = candidate
                 rejected_evidence_ids = frozenset(
                     item.evidence_id for item in evidence_memory.pinned
                 )
-                rejected_hypothesis = hypotheses[-1] if hypotheses else None
+                rejected_hypothesis = active_hypothesis()
                 review_feedback_json = json.dumps(decision.model_dump(), ensure_ascii=False)
                 reflection_result = ""
                 if contradiction_requires_reflection:
@@ -4190,7 +5839,7 @@ class DiagnosisHarness:
                         "reason": "review_reasoning_contradiction", "round": review_rounds,
                     })
                     reflection_result = trigger_reflection(
-                        "review_reasoning_contradiction", review_feedback_text=review_feedback_json,
+                        review_recovery_required=True, review_feedback_text=review_feedback_json,
                     )
                 else:
                     transition_phase("PLAN", "review_reject_recoverable")
@@ -4198,20 +5847,41 @@ class DiagnosisHarness:
                     "review": decision.model_dump(),
                     "reflection": json.loads(reflection_result) if reflection_result else None,
                 }, ensure_ascii=False)
+                # Recovery turns can spend a bounded Planner turn rebinding a
+                # Review-created Obligation before an executable Action is
+                # admitted.  Reserve two such turns explicitly so the
+                # configured post-reject action/tool bounds are not consumed
+                # by contract-preserving replans.  This does not expand the
+                # global token or LLM allocation.
+                recovery_step_limit = self.config.max_post_reject_steps + 2
+                trace.record("REVIEW_RECOVERY_BOUND_APPLIED", {
+                    "round": review_rounds,
+                    "cycle": review_recovery_cycles,
+                    "configured_steps": self.config.max_post_reject_steps,
+                    "effective_steps": recovery_step_limit,
+                    "reason": "bounded obligation_rebind_turns_do_not_replace_evidence_actions",
+                })
                 candidate = investigate(
-                    self.config.max_post_reject_steps, self.config.max_post_reject_tool_calls,
+                    recovery_step_limit, self.config.max_post_reject_tool_calls,
                     review_feedback=combined_feedback,
                     review_baseline=rejected_candidate,
                     review_evidence_ids=rejected_evidence_ids,
                     review_hypothesis=rejected_hypothesis,
                 )
-        except DAGFinalizationBlocked as exc:
+        except ContextResolutionError as exc:
+            status = 'INCONCLUSIVE'
+            termination_reason = exc.reason_code
+            error_type, error_message = type(exc).__name__, str(exc)
+            trace.record('INCIDENT_INCONCLUSIVE', {'reason_code': termination_reason,
+                'step': state.step, 'tool_calls': state.tool_calls})
+        except FinalizationBlocked as exc:
             status = "INCONCLUSIVE"
-            termination_reason = "dag_finalization_blocked"
+            termination_reason = "finalization_policy_blocked"
             trace.record("INCIDENT_INCONCLUSIVE", {
                 "error_type": type(exc).__name__,
                 "failure_category": termination_reason,
                 "message": str(exc),
+                "finalization_decision": exc.decision.model_dump(mode="json"),
                 "dag_metrics": dag_state.metrics() if dag_state is not None else {},
                 "step": state.step,
                 "tool_calls": state.tool_calls,
@@ -4223,6 +5893,7 @@ class DiagnosisHarness:
             trace.record("INCIDENT_INCONCLUSIVE", {
                 "error_type": type(exc).__name__,
                 "failure_category": termination_reason,
+                "budget_failure_category": "run_budget_admission_exceeded",
                 "message": str(exc),
                 "budget_before_call": exc.decision.remaining_run_tokens,
                 "estimated_call_cost": exc.decision.breakdown,
@@ -4236,10 +5907,13 @@ class DiagnosisHarness:
             trace.record("PROVISIONAL_CANDIDATE", {
                 "candidate": candidate.model_dump() if candidate is not None else None,
                 "reason": "convergence response exhausted the Runtime output envelope before producing an action",
-                "hypothesis": hypotheses[-1].model_dump() if hypotheses else None,
+                "hypothesis": (
+                    active_hypothesis().model_dump()
+                    if active_hypothesis() is not None else None
+                ),
                 "open_obligations": [
                     item.model_dump() for item in (
-                        hypotheses[-1].verification_obligations if hypotheses else ()
+                        canonical_rca_state.obligations
                     ) if item.blocks_finalization
                 ],
             })
@@ -4257,10 +5931,13 @@ class DiagnosisHarness:
             trace.record("PROVISIONAL_CANDIDATE", {
                 "candidate": candidate.model_dump() if candidate is not None else None,
                 "reason": "Reflection core structured contract failed after one bounded repair",
-                "hypothesis": hypotheses[-1].model_dump() if hypotheses else None,
+                "hypothesis": (
+                    active_hypothesis().model_dump()
+                    if active_hypothesis() is not None else None
+                ),
                 "open_obligations": [
                     item.model_dump() for item in (
-                        hypotheses[-1].verification_obligations if hypotheses else ()
+                        canonical_rca_state.obligations
                     ) if item.blocks_finalization
                 ],
             })
@@ -4280,10 +5957,13 @@ class DiagnosisHarness:
             trace.record("PROVISIONAL_CANDIDATE", {
                 "candidate": candidate.model_dump() if candidate is not None else None,
                 "reason": "Planner core structured contract failed after one bounded retry",
-                "hypothesis": hypotheses[-1].model_dump() if hypotheses else None,
+                "hypothesis": (
+                    active_hypothesis().model_dump()
+                    if active_hypothesis() is not None else None
+                ),
                 "open_obligations": [
                     item.model_dump() for item in (
-                        hypotheses[-1].verification_obligations if hypotheses else ()
+                        canonical_rca_state.obligations
                     ) if item.blocks_finalization
                 ],
             })
@@ -4302,14 +5982,21 @@ class DiagnosisHarness:
                 "step": state.step, "tool_calls": state.tool_calls,
             })
             error_type, error_message = type(exc).__name__, str(exc)
+        except ProviderCallLimitExceeded as exc:
+            status = "INCONCLUSIVE"
+            termination_reason = "physical_call_budget_exhausted"
+            trace.record("BUDGET_ADMISSION_REJECTED", {
+                "boundary": "physical_api_attempt", "reason": str(exc),
+                "physical_calls": sum(row.attempt_count for row in provider_gateway.records),
+                "provider_calls": 0, "step": state.step})
+            error_type, error_message = type(exc).__name__, str(exc)
         except LLMDeadlineExceeded as exc:
             # Once a candidate has entered the Review lifecycle, a later
             # provider timeout means that no candidate has reached a valid
             # terminal boundary. Keep the candidate as explicitly provisional
             # for trace/run diagnostics, while status remains INCONCLUSIVE and
             # the evaluator cannot accept it without a PASS Review decision.
-            # Initial investigation timeouts retain the historical FAILED
-            # semantics.
+            # Initial investigation timeouts remain execution failures.
             if review_rounds > 0:
                 status = "INCONCLUSIVE"
                 termination_reason = "provider_timeout_after_review"
@@ -4388,16 +6075,102 @@ class DiagnosisHarness:
                 failure_payload["planner_metadata"] = planner_metadata
             trace.record("INCIDENT_FAILED", failure_payload)
             error_type, error_message = type(exc).__name__, str(exc)
+        # Investigation failures that still produce an ordinary INCONCLUSIVE
+        # terminal state receive one independent report Review.  This does not
+        # alter status or admit a RootCauseCandidate.
+        review_inconclusive_report()
         if status == "PASS":
             transition_phase("DONE", termination_reason or "review_pass")
         else:
             transition_phase("INCONCLUSIVE", termination_reason or "terminal_failure")
+        record_terminal_convergence(
+            terminal_status=status,
+            reason=termination_reason or "review_pass",
+        )
+        terminal_outcome = self._terminal_outcome(
+            status,
+            termination_reason,
+            convergence_status=(
+                terminal_convergence_decision.status
+                if terminal_convergence_decision is not None else ""
+            ),
+            failure_category=self._termination_failure_category(status, termination_reason),
+        )
+        # Output status is a projection of the canonical terminal classification.
+        if terminal_outcome.outcome_class == "SEMANTIC" and terminal_outcome.status.startswith("INCONCLUSIVE"):
+            status = "INCONCLUSIVE"
+        report_review_status = (
+            "DISABLED" if not self.config.enable_review
+            else "PASS" if decision is not None and decision.decision == "PASS"
+            else "REJECT" if decision is not None
+            else "UNAVAILABLE"
+        )
+        report_review_reason = (
+            decision.reason if decision is not None
+            else (error_message or termination_reason or "Review did not complete")
+        )
+        report = build_diagnostic_report(
+            case=case, run_status=status,
+            termination_reason=termination_reason,
+            candidate=candidate, rca_state=canonical_rca_state,
+            evidence_memory=evidence_memory,
+            projected_facts=projected_facts.values(),
+            review_status=report_review_status,
+            review_reason=report_review_reason,
+            review_confidence_score=(
+                decision.confidence_score if decision is not None else None
+            ),
+            review_confidence_reason=(
+                decision.confidence_reason if decision is not None else ""
+            ),
+        )
+        trace.record("DIAGNOSTIC_REPORT_BUILT", {
+            "status": report.status,
+            "review_status": report.review_status,
+            "semantic_record_ids": list(report.semantic_record_ids),
+            "supporting_evidence_ids": list(report.supporting_evidence_ids),
+            "open_required_questions": list(report.open_required_questions),
+            "open_exploratory_questions": list(report.open_exploratory_questions),
+            "reason": "deterministic_projection_of_committed_state",
+        })
+        if decision is not None:
+            report_only_review = candidate is None
+            report_review = DiagnosticReportReview(
+                decision=decision.decision,
+                evidence_quality=(
+                    "PARTIAL" if report_only_review and evidence_memory.pinned
+                    else "INSUFFICIENT" if report_only_review
+                    else "SUFFICIENT" if decision.decision == "PASS"
+                    else "PARTIAL" if decision.missing_evidence
+                    else "INSUFFICIENT"
+                ),
+                reasoning_quality=("COHERENT" if decision.causal_chain_valid
+                                    and decision.decision == "PASS" else "PARTIAL"
+                                    if decision.causal_chain_valid else "UNSUPPORTED"),
+                confidence_score=decision.confidence_score,
+                confidence_reason=decision.confidence_reason,
+                # A PASS report review confirms delivery quality only.  An
+                # INCONCLUSIVE report is never a complete RCA candidate.
+                report_complete=(decision.decision == "PASS" and not report_only_review),
+                unsupported_claims=decision.unsupported_claims,
+                missing_evidence=decision.missing_evidence,
+                contradictions=decision.blocking_contradictions or decision.contradictions,
+                reason=decision.reason,
+            )
+            trace.record("DIAGNOSTIC_REPORT_REVIEWED", {
+                "decision": report_review.decision,
+                "evidence_quality": report_review.evidence_quality,
+                "reasoning_quality": report_review.reasoning_quality,
+                "report_complete": report_review.report_complete,
+                "reason": report_review.reason,
+            })
         terminal_budget = budget_snapshot("terminal")
         final_dag_metrics = dag_state.metrics() if dag_state is not None else {}
         dag_task_count = int(final_dag_metrics.get("task_count", 0) or 0)
-        dag_satisfied_count = int(final_dag_metrics.get("satisfied_task_count", 0) or 0)
+        dag_completed_count = int(final_dag_metrics.get("completed_task_count", 0) or 0)
         trace.record("INCIDENT_COMPLETED", {
             "status": status, "termination_reason": termination_reason,
+            "terminal_outcome": terminal_outcome.model_dump(mode="json"),
             "steps": state.step, "tool_calls": state.tool_calls,
             "budget": budget_payload(terminal_budget),
             "execution_mode": execution_mode,
@@ -4407,17 +6180,31 @@ class DiagnosisHarness:
         trace.record("INCIDENT_FINISHED", {
             "status": status, "termination_reason": termination_reason,
             "failure_category": self._termination_failure_category(status, termination_reason),
+            "terminal_outcome": terminal_outcome.model_dump(mode="json"),
             "steps": state.step, "tool_calls": state.tool_calls,
         })
         failure_category = self._termination_failure_category(status, termination_reason)
         return IncidentRunResult(
             case_id=case.case_id, status=status, candidate=candidate, review=decision,
-            evidence=incident_evidence(), hypotheses=tuple(hypotheses), actions=tuple(actions),
+            report=report, report_review=report_review,
+            semantic_records=tuple(canonical_rca_state.semantic_records),
+            evidence=incident_evidence(), hypotheses=hypothesis_history(), actions=tuple(actions),
             metrics=IncidentMetrics(
                 steps=state.step, tool_calls=state.tool_calls, prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens, total_tokens=prompt_tokens + completion_tokens,
                 cost=run_cost if cost_measured else None,
                 llm_calls=llm_calls,
+                llm_attempts=provider_gateway.accounting()["provider_attempts"],
+                provider_calls=provider_gateway.accounting()["physical_provider_calls"],
+                provider_accounting=provider_gateway.accounting(),
+                budget_rejected_attempts=budget_rejected_attempts,
+                schema_repair_calls=schema_repair_calls,
+                provider_failures=provider_failures,
+                provider_contract_failures=provider_contract_failures,
+                semantic_adjudication_failures=semantic_adjudication_failures,
+                token_accounting_error_count=token_accounting_error_count,
+                unattributed_prompt_tokens=unattributed_prompt_total,
+                token_telemetry=tuple(token_telemetry),
                 planner_calls=planner_calls,
                 review_calls=review_calls,
                 wall_clock_seconds=time.monotonic() - run_started,
@@ -4441,25 +6228,29 @@ class DiagnosisHarness:
                 obligation_created_count=obligation_created_count,
                 obligation_blocked_count=obligation_blocked_count,
                 blocking_contradiction_count=blocking_contradiction_count,
-                stable_rounds=(hypotheses[-1].stable_rounds if hypotheses else 0),
+                stable_rounds=(
+                    active_hypothesis().stable_rounds
+                    if active_hypothesis() is not None else 0
+                ),
                 execution_mode=execution_mode,
                 context_projection_mode=self.config.context_projection_mode,
                 dag_task_count=dag_task_count,
-                dag_satisfied_task_count=dag_satisfied_count,
+                dag_completed_task_count=dag_completed_count,
                 dag_blocked_task_count=int(final_dag_metrics.get("blocked_task_count", 0) or 0),
-                dag_contradicted_task_count=int(
-                    final_dag_metrics.get("contradicted_task_count", 0) or 0
+                dag_failed_task_count=int(
+                    final_dag_metrics.get("failed_task_count", 0) or 0
                 ),
                 dag_local_replan_count=int(
                     final_dag_metrics.get("local_replan_count", 0) or 0
                 ),
-                dag_task_closure_rate=(
-                    dag_satisfied_count / dag_task_count if dag_task_count else 0.0
+                dag_task_completion_rate=(
+                    dag_completed_count / dag_task_count if dag_task_count else 0.0
                 ),
             ),
             trace_path=str(trace.path),
             error_type=error_type, error_message=error_message,
             failure_category=failure_category,
+            terminal_outcome=terminal_outcome,
         )
 
     @staticmethod
@@ -4510,47 +6301,6 @@ class DiagnosisHarness:
             normalize(hypothesis.mechanism_category or hypothesis.mechanism),
         )
 
-    @classmethod
-    def _has_material_hypothesis_instability(
-        cls,
-        previous: IncidentHypothesis | None,
-        current: IncidentHypothesis | None,
-    ) -> bool:
-        """Detect reasoning instability without penalizing topology traversal.
-
-        A Planner commonly moves through several candidate services while the
-        fault and mechanism are still unknown.  Component-only changes are
-        therefore normal exploration, not a reason to spend Reflection budget.
-        Compare only the fault/mechanism portion of the material fingerprint;
-        a non-empty reasoning identity must be present on at least one side and
-        the reasoning tuple must actually change.
-        """
-        previous_fingerprint = cls._material_hypothesis_fingerprint(previous)
-        current_fingerprint = cls._material_hypothesis_fingerprint(current)
-        if previous_fingerprint is None or current_fingerprint is None:
-            return False
-        previous_reasoning = previous_fingerprint[1:]
-        current_reasoning = current_fingerprint[1:]
-        return bool(
-            previous_reasoning != current_reasoning
-            and (any(previous_reasoning) or any(current_reasoning))
-        )
-
-    @classmethod
-    def _review_progress_made(cls, baseline: RootCauseCandidate,
-                              candidate: RootCauseCandidate,
-                              baseline_evidence_ids: frozenset[str],
-                              current_evidence_ids: set[str],
-                              baseline_hypothesis: IncidentHypothesis | None,
-                              current_hypothesis: IncidentHypothesis) -> bool:
-        if current_evidence_ids - baseline_evidence_ids:
-            return True
-        if cls._candidate_semantic_fingerprint(baseline) != cls._candidate_semantic_fingerprint(candidate):
-            return True
-        if baseline_hypothesis is None:
-            return True
-        return cls._hypothesis_semantic_fingerprint(baseline_hypothesis) != cls._hypothesis_semantic_fingerprint(current_hypothesis)
-
     @staticmethod
     def _bound_prior_context(prior_context, token_budget: int | None, estimator) -> Any | None:
         """Project Prior into the available L3 slice without touching Evidence."""
@@ -4581,6 +6331,11 @@ class DiagnosisHarness:
     @staticmethod
     def _failure_category(exc: Exception) -> str:
         message = str(exc).lower()
+        from debug_assistant.harness.dynamic_budget import RequestEnvelopeExceeded
+        if isinstance(exc, RequestEnvelopeExceeded):
+            return "request_envelope_exceeded"
+        if isinstance(exc, ProviderCallLimitExceeded):
+            return "physical_call_budget_exhausted"
         if isinstance(exc, LLMDeadlineExceeded):
             return "provider_timeout"
         if isinstance(exc, PlannerContractExhausted):
@@ -4625,6 +6380,8 @@ class DiagnosisHarness:
             return "tool_contract_failure"
         if "review_contract" in reason:
             return "review_provider_failure"
+        if reason in {"review_unrecoverable", "review_recovery_unavailable"}:
+            return "convergence_failure"
         if "review_feedback" in reason or "review_unresolved" in reason:
             return "convergence_failure"
         if "provider_timeout_after_review" in reason or (
@@ -4644,7 +6401,90 @@ class DiagnosisHarness:
         return "runtime_failure"
 
     @staticmethod
-    def _planner_control_state(case, hypotheses, actions, review_feedback,
+    def _terminal_outcome(
+        status: str,
+        termination_reason: str,
+        *,
+        convergence_status: str = "",
+        failure_category: str = "",
+    ) -> TerminalOutcome:
+        """Return the one canonical terminal classification.
+
+        ``status`` and ``failure_category`` are serialized output fields. This
+        method is the sole terminal boundary:
+        a bounded semantic stop is never reported as an execution failure,
+        while provider/runtime/contract failures remain failures.
+        """
+        reason = str(termination_reason or "")
+        reason_text = reason.casefold()
+        category = str(failure_category or "").casefold()
+        convergence = str(convergence_status or "").upper()
+        if convergence == "CONVERGED" or (status == "PASS" and not convergence):
+            return TerminalOutcome(
+                outcome_class="SEMANTIC", status="CONVERGED", reason=reason,
+                failure_category="",
+            )
+        if reason == "planner_contract_exhausted" and category in {
+            "planner_contract_exhausted", "planner_contract_failure",
+        }:
+            return TerminalOutcome(
+                outcome_class="SEMANTIC", status="INCONCLUSIVE_CONTRACT",
+                reason=reason, failure_category=failure_category,
+            )
+        if convergence == "INCONCLUSIVE_CAPABILITY" or "capability" in reason_text:
+            return TerminalOutcome(
+                outcome_class="SEMANTIC", status="INCONCLUSIVE_CAPABILITY",
+                reason=reason, failure_category="",
+            )
+        if convergence == "INCONCLUSIVE_BUDGET" or any(token in reason_text for token in (
+            "budget", "review_bound", "max_steps", "max_tool_calls", "token_budget",
+            "deadline_exceeded",
+        )):
+            # A Provider exception/timeout is still an execution failure even
+            # when it happened after Review.  A bounded Runtime budget stop is
+            # semantic and uses the explicit INCONCLUSIVE_BUDGET outcome.
+            if any(token in reason_text or token in category for token in (
+                "provider_failure", "provider_timeout", "review_provider",
+                "runtime_failure", "tool_contract", "planner_contract",
+                "execution_failure", "review_contract", "reflection_contract",
+            )):
+                return TerminalOutcome(
+                    outcome_class="EXECUTION_FAILURE", status="EXECUTION_FAILURE",
+                    reason=reason, failure_category=failure_category,
+                )
+            return TerminalOutcome(
+                outcome_class="SEMANTIC", status="INCONCLUSIVE_BUDGET",
+                reason=reason, failure_category="",
+            )
+        if reason.startswith("context_") and status == "INCONCLUSIVE":
+            return TerminalOutcome(outcome_class="SEMANTIC", status="INCONCLUSIVE_NO_PROGRESS",
+                                   reason=reason, failure_category="")
+        if reason == "semantic_dead_end" or "no_progress" in reason_text or "no-progress" in reason_text or any(
+            token in reason_text for token in (
+                "review_feedback_unresolved", "convergence_failure",
+                "dag_finalization_blocked", "finalization_validation",
+            )
+        ):
+            return TerminalOutcome(
+                outcome_class="SEMANTIC", status="INCONCLUSIVE_NO_PROGRESS",
+                reason=reason, failure_category="",
+            )
+        if status == "FAILED" or any(token in reason_text or token in category for token in (
+            "provider_failure", "provider_timeout", "runtime_failure",
+            "tool_contract", "planner_contract", "review_contract", "reflection_contract",
+            "execution_failure", "schema", "invalid",
+        )):
+            return TerminalOutcome(
+                outcome_class="EXECUTION_FAILURE", status="EXECUTION_FAILURE",
+                reason=reason, failure_category=failure_category,
+            )
+        return TerminalOutcome(
+            outcome_class="SEMANTIC", status="INCONCLUSIVE_NO_PROGRESS",
+            reason=reason, failure_category="",
+        )
+
+    @staticmethod
+    def _planner_control_state(case, semantic_state: RCAState, actions, review_feedback,
                                *, tool_budget_remaining: int,
                                agent_steps_remaining: int, llm_calls_remaining: int | None = None,
                                rejected_actions=(),
@@ -4655,19 +6495,21 @@ class DiagnosisHarness:
                                tool_health: dict[str, Any] | None = None,
                                reflection_trigger: str = "",
                                next_action_constraint: str = "",
-                               entities: Any | None = None,
-                               capabilities: Any | None = None,
+                               finalization_allowed: bool = False,
+                               finalization_blockers=(),
+                               active_action_requirement: dict[str, Any] | None = None,
                                capability_states: dict[str, str] | None = None,
                                visible_tool_names=(),
-                               router_decision: Any | None = None,
-                               prior_context: Any | None = None,
-                               compact: bool = False,
+                               feasible_skill_ids=(),
                                canonical_task_context: bool = False,
-                               dag_state: Any | None = None) -> dict[str, Any]:
-        current = hypotheses[-1] if hypotheses else None
+                               dag_state: Any | None = None,
+                               citable_evidence_ids=(),
+                               evidence_verdicts=(),
+                               domain_skill_id: str = "") -> dict[str, Any]:
+        current = semantic_state.active_hypothesis_projection()
+        rca_state = semantic_state
         canonical_task_claims: set[str] = set()
         if canonical_task_context and dag_state is not None:
-            task_context = project_verification_tasks(dag_state, max_chars=3_500)
             raw_tasks = (
                 dag_state.get("tasks", ())
                 if isinstance(dag_state, dict)
@@ -4677,10 +6519,15 @@ class DiagnosisHarness:
                 status = str(getattr(task, "status", None) or (
                     task.get("status") if isinstance(task, dict) else "PENDING"
                 )).upper()
-                critical = bool(getattr(task, "critical", True) if not isinstance(task, dict) else task.get("critical", True))
-                if status == "SATISFIED" or not (status == "READY" or critical or status in {"CONTRADICTED", "BLOCKED"}):
+                if status == "COMPLETED":
                     continue
-                claim = getattr(task, "claim", None) if not isinstance(task, dict) else task.get("claim")
+                obligation_id = getattr(task, "obligation_id", None) if not isinstance(task, dict) else task.get("obligation_id")
+                claim = ""
+                if obligation_id:
+                    try:
+                        claim = rca_state.obligation(str(obligation_id)).claim if rca_state else ""
+                    except RCAStateError:
+                        claim = ""
                 normalized = " ".join(str(claim or "").split()).casefold()
                 if normalized:
                     canonical_task_claims.add(normalized)
@@ -4701,91 +6548,100 @@ class DiagnosisHarness:
             current_payload.pop("verification_obligations", None)
             current_payload.pop("required_gaps", None)
             current_payload.pop("evidence_gap", None)
-        visible_actions = [
-            {key: value for key, value in action.items() if key != "observation_id"}
-            for action in actions[-8:]
-        ]
-        payload = {
-            "INCIDENT": {"summary": case.summary, "system": case.system, "namespace": case.namespace},
-            "ENTITIES": entities.model_dump(mode="json") if hasattr(entities, "model_dump") else {},
-            "CAPABILITIES": capabilities.model_dump(mode="json") if hasattr(capabilities, "model_dump") else {},
-            "CAPABILITY_STATES": dict(capability_states or {}),
-            "VISIBLE_TOOL_NAMES": list(visible_tool_names),
-            "ROUTER_DECISION": router_decision.model_dump(mode="json") if hasattr(router_decision, "model_dump") else {},
-            "PRIOR_KNOWLEDGE": (
-                prior_context.model_dump(mode="json") if hasattr(prior_context, "model_dump") else None
-            ),
-            "AVAILABLE_EVIDENCE_SOURCES": list(available_evidence_sources),
-            "SOURCE_WORKSPACE": {
-                "available": bool(source_workspace_available),
-                "root": "code" if source_workspace_available else None,
-            },
-            "AVAILABLE_CODE_TOOLS": list(available_code_tools),
-            "CURRENT_HYPOTHESIS": current_payload,
-            "EVIDENCE_GAP": (
-                current.evidence_gap if current and keep_gap(current.evidence_gap)
-                else "See canonical VerificationTask representation."
-                if current and canonical_task_claims
-                else "Identify the affected request path and component."
-            ),
-            "SUPPORTING_EVIDENCE_IDS": list(current.supporting_evidence_ids) if current else [],
-            "CONTRADICTING_EVIDENCE_IDS": list(current.contradicting_evidence_ids) if current else [],
-            "REQUIRED_EVIDENCE_GAPS": list(filtered_gaps),
-            "VERIFICATION_OBLIGATIONS": [item.model_dump() for item in filtered_obligations],
-            "OBLIGATION_SUMMARY": [
-                {
-                    "id": item.id, "claim": item.claim, "critical": item.critical,
-                    "status": item.status, "blocks_finalization": item.blocks_finalization,
-                }
-                for item in filtered_obligations
-            ],
-            "CONTRADICTIONS": [item.model_dump() for item in (current.contradictions if current else ())],
-            "CONTRADICTION_SUMMARY": [
-                {
-                    "evidence_id": item.evidence_id, "severity": item.severity,
-                    "status": item.status, "blocks_finalization": item.blocks_finalization,
-                }
-                for item in (current.contradictions if current else ())
-            ],
-            "STABLE_ROUNDS": current.stable_rounds if current else 0,
-            "EVIDENCE_SUFFICIENCY": "sufficient" if current and current.evidence_sufficient else "insufficient",
-            "PREVIOUS_ACTIONS": visible_actions,
-            "RECENT_ACTIONS": visible_actions,
-            "REJECTED_ACTIONS": rejected_actions[-4:],
-            "TOOL_BUDGET_REMAINING": tool_budget_remaining,
-            "AGENT_STEPS_REMAINING": agent_steps_remaining,
-            "REMAINING_STEPS": agent_steps_remaining,
-            "REMAINING_LLM_CALLS": llm_calls_remaining,
-            "REVIEW_FEEDBACK": review_feedback or None,
-            "REFLECTION_FEEDBACK": reflection_feedback or None,
-            "REFLECTION_TRIGGER": reflection_trigger or None,
-            "NEXT_ACTION_CONSTRAINT": next_action_constraint or None,
-            "TOOL_HEALTH": tool_health or {},
-            "SOURCE_CAPABILITIES": {
-                "source_workspace_available": bool(source_workspace_available),
-                "available_code_tools": list(available_code_tools),
-            },
-            "SOURCE_MECHANISM_COVERAGE": DiagnosisHarness._source_mechanism_coverage(
-                case,
-                current,
-                source_workspace_available=source_workspace_available,
-                available_code_tools=available_code_tools,
-                source_evidence_ids=source_evidence_ids,
-            ),
-            "CANONICAL_TASK_CONTEXT": bool(canonical_task_context),
-        }
-        if canonical_task_context:
-            for key in (
-                "EVIDENCE_GAP", "REQUIRED_EVIDENCE_GAPS",
-                "VERIFICATION_OBLIGATIONS", "OBLIGATION_SUMMARY",
-            ):
-                payload.pop(key, None)
-        if not compact:
-            return payload
-        # The envelope protocol already carries Planner controls once. Keep
-        # one compact state projection here as well: old payloads repeated
-        # PREVIOUS_ACTIONS/RECENT_ACTIONS, full hypothesis plus projections,
-        # and obligations/contradictions plus summaries.
+        canonical_obligations = tuple(
+            item for item in rca_state.obligations
+            if item.blocks_finalization and item.status == "OPEN"
+        )
+        all_open_obligations = tuple(
+            item for item in (rca_state.obligations if rca_state else ())
+            if item.status == "OPEN"
+        )
+        if not all_open_obligations:
+            all_open_obligations = tuple(
+                item for item in (current.verification_obligations if current else ())
+                if item.status == "OPEN"
+            )
+        canonical_contradictions = tuple(
+            item for item in (rca_state.contradictions if rca_state else ())
+            if item.blocks_finalization and item.status == "OPEN"
+        )
+        if not canonical_contradictions:
+            canonical_contradictions = tuple(
+                item for item in (current.contradictions if current else ())
+                if item.blocks_finalization and item.status == "OPEN"
+            )
+        executed_action_items = tuple(
+            item for item in actions if isinstance(item, dict)
+        )
+        executed_action_limit = 8
+        executed_action_summary = []
+        for item in executed_action_items[-executed_action_limit:]:
+            executed_action_summary.append({
+                key: item.get(key)
+                for key in (
+                    "step", "tool", "arguments", "acquisition_key", "observation_id", "outcome",
+                    "target_fact_slot", "requested_for", "snapshot_identity", "acquisition_state",
+                    "new_evidence_count", "new_evidence_ids",
+                    "obligation_progress_count",
+                    "semantic_information_gain", "action_class", "obligation_id",
+                    "semantic_negative", "observation_status", "error_type",
+                )
+                if key in item
+            })
+
+        def compact_feedback(value: str, *, max_chars: int = 2_000) -> str:
+            """Keep Planner control feedback bounded without changing semantics."""
+            text = str(value or "")
+            if len(text) <= max_chars:
+                return text
+            try:
+                payload = json.loads(text)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return text[:max_chars] + "..."
+            if isinstance(payload, dict):
+                compact: dict[str, Any] = {}
+                for key, item in payload.items():
+                    if isinstance(item, list):
+                        compact[key] = [str(entry)[:360] for entry in item[:4]]
+                    elif isinstance(item, str):
+                        compact[key] = item[:720]
+                    else:
+                        compact[key] = item
+                bounded = json.dumps(compact, ensure_ascii=False)
+                return bounded[:max_chars] + ("..." if len(bounded) > max_chars else "")
+            return text[:max_chars] + "..."
+
+        def compact_obligation(item: VerificationObligation) -> dict[str, Any]:
+            return {
+                key: getattr(item, key)
+                for key in (
+                    "id", "claim", "verification_question", "evidence_type",
+                    "evidence_requirement", "target_component", "critical", "status",
+                    "supporting_evidence_ids", "blocked_capabilities",
+                )
+            }
+        active_task = None
+        raw_tasks = (
+            dag_state.get("tasks", ()) if isinstance(dag_state, dict)
+            else getattr(dag_state, "tasks", ())
+        ) if dag_state is not None else ()
+        for task in raw_tasks or ():
+            task_status = str(getattr(task, "status", None) or (
+                task.get("status") if isinstance(task, dict) else "PENDING"
+            )).upper()
+            if task_status in {"COMPLETED", "BLOCKED", "FAILED"}:
+                continue
+            active_task = task.model_dump(mode="json") if hasattr(task, "model_dump") else dict(task)
+            break
+        if active_task is None and all_open_obligations:
+            obligation = all_open_obligations[0]
+            active_task = {
+                "task_id": None,
+                "obligation_id": obligation.id,
+                "claim": obligation.claim,
+                "verification_question": obligation.verification_question,
+                "status": "READY",
+            }
         compact_hypothesis = None
         if current is not None:
             compact_hypothesis = {
@@ -4795,25 +6651,93 @@ class DiagnosisHarness:
                 "fault": current.fault,
                 "fault_code": current.fault_code,
                 "mechanism": current.mechanism,
+                "status": current.status,
                 "supporting_evidence_ids": list(current.supporting_evidence_ids),
                 "contradicting_evidence_ids": list(current.contradicting_evidence_ids),
-                "source_claims": [item.model_dump() for item in current.source_claims],
-                "required_gaps": list(filtered_gaps),
                 "evidence_sufficient": current.evidence_sufficient,
                 "source_mechanism_status": current.source_mechanism_status,
                 "stable_rounds": current.stable_rounds,
             }
-            if canonical_task_context:
-                compact_hypothesis.pop("evidence_gap", None)
-                compact_hypothesis.pop("required_gaps", None)
-        compact_payload = dict(payload)
-        compact_payload["CURRENT_HYPOTHESIS"] = compact_hypothesis
-        for key in (
-            "VERIFICATION_OBLIGATIONS", "CONTRADICTIONS", "PREVIOUS_ACTIONS",
-            "SOURCE_CAPABILITIES",
-        ):
-            compact_payload.pop(key, None)
-        return compact_payload
+        citable_ids = tuple(dict.fromkeys(
+            str(item) for item in (
+                *tuple(citable_evidence_ids),
+                *(current.supporting_evidence_ids if current else ()),
+                *(current.contradicting_evidence_ids if current else ()),
+            ) if str(item).startswith("ev-")
+        ))
+        payload = {
+            "INCIDENT": {"summary": case.summary, "system": case.system, "namespace": case.namespace},
+            "CURRENT_HYPOTHESIS": compact_hypothesis,
+            "ACTIVE_VERIFICATION_TASK": active_task,
+            "OPEN_CRITICAL_OBLIGATIONS": [compact_obligation(item) for item in canonical_obligations[:6]],
+            "BLOCKING_CONTRADICTIONS": [item.model_dump(mode="json") for item in canonical_contradictions],
+            "FINALIZE_ALLOWED": bool(finalization_allowed),
+            "FINALIZE_BLOCKERS": list(finalization_blockers)[:12],
+            "ACTIVE_ACTION_REQUIREMENT": active_action_requirement or {
+                "hypothesis": current.claim if current else "",
+                "obligation_id": "",
+                "open_obligation": "",
+                "verification_question": "",
+                "evidence_need": current.evidence_gap if current else "",
+                "must_acquire_new_canonical_evidence": bool(current),
+                "must_not_repeat_acquired_data": True,
+            },
+            "CITABLE_EVIDENCE": list(citable_ids),
+            "EVIDENCE_SET_VERDICTS": [
+                dict(item) for item in tuple(evidence_verdicts)[-12:]
+                if isinstance(item, dict)
+            ],
+            "ACTIVE_SKILL": domain_skill_id,
+            "FEASIBLE_SKILL_IDS": list(feasible_skill_ids),
+            "AVAILABLE_TOOLS": list(visible_tool_names),
+            "REMAINING_BUDGET": {
+                "tool_calls": tool_budget_remaining,
+                "agent_steps": agent_steps_remaining,
+                "llm_calls": llm_calls_remaining,
+            },
+            # Rejected actions are Runtime facts, not Planner lifecycle
+            # controls. Project a bounded recent slice so the next native
+            # action can select a different evidence-changing Tool instead of
+            # rediscovering the same duplicate acquisition.
+            "RECENT_REJECTED_ACTIONS": [
+                {
+                    key: value for key, value in item.items()
+                    if key in {"step", "tool", "arguments", "reason", "instruction"}
+                }
+                for item in tuple(rejected_actions)[-4:]
+                if isinstance(item, dict)
+            ],
+            "EXECUTED_ACTION_SUMMARY": {
+                "shown": executed_action_summary,
+                "omitted_count": max(0, len(executed_action_items) - executed_action_limit),
+                "acquisition_identity_rule": "tool + canonical executable arguments + Runtime snapshot/freshness; only successful ACQUIRED input is unavailable",
+            },
+            "NEXT_ACTION_CONSTRAINT": next_action_constraint or None,
+            "REVIEW_FEEDBACK": compact_feedback(review_feedback) or None,
+            "REVIEW_RECOVERY_RULES": (
+                {
+                    "baseline_candidate_was_rejected": True,
+                    "must_not_repeat_unsupported_claims": True,
+                    "every_causal_clause_must_be_supported_by_cited_evidence": True,
+                    "if_requested_evidence_is_unavailable_or_not_new": (
+                        "narrow the hypothesis to the strongest observed mechanism, "
+                        "update supporting_evidence_ids, and finalize only after "
+                        "the revised claim is Runtime-allowed"
+                    ),
+                    "do_not_reuse_the_rejected_candidate_verbatim": True,
+                }
+                if review_feedback else None
+            ),
+            "REFLECTION_FEEDBACK": compact_feedback(reflection_feedback) or None,
+            "SOURCE_CAPABILITY_SUMMARY": {
+                "source_workspace_available": bool(source_workspace_available),
+                "available_code_tools": list(available_code_tools),
+                "source_evidence_ids": list(source_evidence_ids),
+                "status": current.source_mechanism_status if current else "unknown",
+            },
+            "CAPABILITY_STATES": dict(sorted((capability_states or {}).items())),
+        }
+        return payload
 
     @staticmethod
     def _source_mechanism_coverage(
@@ -4842,205 +6766,3 @@ class DiagnosisHarness:
                 if item.blocks_finalization
             ],
         }
-
-    @staticmethod
-    def _candidate_from_hypothesis(hypothesis: IncidentHypothesis) -> RootCauseCandidate:
-        return RootCauseCandidate(
-            component=hypothesis.component,
-            fault=hypothesis.fault,
-            fault_code=hypothesis.fault_code,
-            fault_explanation=hypothesis.fault_explanation,
-            mechanism=hypothesis.mechanism,
-            evidence_ids=hypothesis.supporting_evidence_ids,
-            confidence=0.7,
-            claim_evidence_mapping=(
-                {
-                    "claim": f"{hypothesis.component}: {hypothesis.fault}",
-                    "evidence_ids": hypothesis.supporting_evidence_ids,
-                },
-            ),
-            causal_chain_summary=(
-                {
-                    "cause": hypothesis.fault,
-                    "effect": hypothesis.mechanism,
-                    "evidence_ids": hypothesis.supporting_evidence_ids,
-                },
-            ),
-            source_claims=hypothesis.source_claims,
-        )
-
-    @staticmethod
-    def _candidate_from_final_hypothesis(
-        hypothesis: IncidentHypothesis,
-        proposal: dict[str, Any],
-        *,
-        known_evidence_ids: set[str],
-    ) -> RootCauseCandidate:
-        """Freeze Candidate core fields from the already validated Hypothesis.
-
-        ``finalize_diagnosis`` keeps its legacy component/fault/mechanism and
-        evidence fields so older providers still satisfy their argument schema.
-        Those fields are deliberately not copied into the Candidate.  The
-        Planner may still submit the optional claim/evidence mapping and causal
-        chain that explain the frozen diagnosis, but neither metadata block may
-        introduce a new Evidence ID or a second root-cause authority.
-        """
-        submitted_evidence = tuple(proposal.get("evidence_ids") or ())
-        invalid_submitted = [
-            evidence_id for evidence_id in submitted_evidence
-            if not evidence_id.startswith("ev-") or evidence_id not in known_evidence_ids
-        ]
-        if invalid_submitted:
-            raise RuntimeError(
-                "finalize proposal cites unknown ev-* Evidence IDs: "
-                + ", ".join(sorted(set(invalid_submitted)))
-            )
-
-        supporting = tuple(hypothesis.supporting_evidence_ids)
-        return RootCauseCandidate(
-            # These are the only final root-cause fields used by Runtime.
-            component=hypothesis.component,
-            fault=hypothesis.fault,
-            fault_code=hypothesis.fault_code,
-            fault_explanation=hypothesis.fault_explanation,
-            mechanism=hypothesis.mechanism,
-            evidence_ids=supporting,
-            confidence=float(proposal.get("confidence", 0.7)),
-            # These fields remain Planner-authored argumentation metadata.
-            claim_evidence_mapping=tuple(proposal.get("claim_evidence_mapping") or ()),
-            causal_chain_summary=tuple(proposal.get("causal_chain_summary") or ()),
-            # Source claims are copied from the Runtime-normalized hypothesis;
-            # finalize_diagnosis cannot introduce a new source range at the
-            # terminal boundary after coverage has been evaluated.
-            source_claims=hypothesis.source_claims,
-        )
-
-    @classmethod
-    def _candidate_from_sufficient_hypothesis(cls, hypotheses, evidence):
-        if not hypotheses:
-            return None
-        known = {item.evidence_id for item in evidence}
-        hypothesis = hypotheses[-1]
-        return cls._candidate_from_hypothesis(hypothesis) if hypothesis.can_finalize(known) else None
-
-    def _provider_call(self, method, *args, hard_timeout_seconds: float,
-                       state_source, state_attributes: tuple[str, ...], **kwargs):
-        if hard_timeout_seconds <= 0:
-            raise LLMDeadlineExceeded("diagnosis provider call has no remaining deadline")
-        provider = getattr(state_source, "llm", self.llm)
-        if not getattr(provider, "requires_process_timeout", False):
-            return method(*args, **kwargs)
-        return _call_in_terminable_process(
-            method, args, kwargs, hard_timeout_seconds,
-            state_source=state_source, state_attributes=state_attributes,
-        )
-
-
-# Compatibility import for the original Incident vertical-slice API. The
-# CloudOps entry point uses DiagnosisHarness; there is no second lifecycle.
-IncidentHarness = DiagnosisHarness
-
-
-def _provider_process_worker(send_connection, method, args, kwargs,
-                             state_source, state_attributes) -> None:
-    try:
-        result = method(*args, **kwargs)
-        state = {name: getattr(state_source, name) for name in state_attributes}
-        send_connection.send(("ok", result, state))
-    except BaseException as exc:
-        state = {name: getattr(state_source, name) for name in state_attributes}
-        send_connection.send((
-            "error", type(exc).__name__, str(exc), state,
-            getattr(exc, "metadata", None),
-        ))
-    finally:
-        send_connection.close()
-
-
-def _call_in_terminable_process(method, args, kwargs, timeout_seconds: float,
-                                *, state_source, state_attributes):
-    """Bound a provider sync boundary even if async transport cleanup cannot return."""
-    if "fork" not in multiprocessing.get_all_start_methods():
-        return method(*args, **kwargs)
-    context = multiprocessing.get_context("fork")
-    receive_connection, send_connection = context.Pipe(duplex=False)
-    process = context.Process(
-        target=_provider_process_worker,
-        args=(send_connection, method, args, kwargs, state_source, state_attributes),
-        daemon=True,
-    )
-    process.start()
-    send_connection.close()
-    try:
-        if not receive_connection.poll(timeout_seconds):
-            _terminate_process(process)
-            raise LLMDeadlineExceeded(
-                f"provider call exceeded hard wall-clock deadline of {timeout_seconds:.2f}s"
-            )
-        packet = receive_connection.recv()
-    finally:
-        receive_connection.close()
-    process.join(timeout=0.5)
-    if process.is_alive():
-        _terminate_process(process)
-    if packet[0] == "ok":
-        _, result, state = packet
-        for name, value in state.items():
-            setattr(state_source, name, value)
-        return result
-    _, error_type, message, state, metadata = (
-        (*packet, None) if len(packet) == 4 else packet
-    )
-    for name, value in state.items():
-        setattr(state_source, name, value)
-    if error_type == "LLMDeadlineExceeded":
-        raise LLMDeadlineExceeded(message)
-    if error_type in {"LLMError", "LLMTransportTimeout"}:
-        raise LLMError(message)
-    if error_type in {"PlannerContractError", "NativePlannerContractError"}:
-        # The provider runs in a terminable child process.  Reconstruct the
-        # contract exception with its bounded metadata so raw provider-visible
-        # output and normalized arguments survive the process boundary.
-        restored = PlannerContractError(
-            message,
-            validation_errors=(metadata or {}).get("validation_errors", [])
-            if isinstance(metadata, dict) else [],
-            output=(metadata or {}) if isinstance(metadata, dict) else {},
-        )
-        if isinstance(metadata, dict):
-            restored.metadata.update(metadata)
-        raise restored
-    if error_type == "ReflectionContractExhausted":
-        raise ReflectionContractExhausted(message)
-    if error_type == "ReviewSchemaError":
-        raise ReviewSchemaError(message)
-    if error_type in {"PromptBudgetExceeded", "RunBudgetAdmissionExceeded"}:
-        from debug_assistant.harness.dynamic_budget import PromptBudgetDecision
-        metadata = metadata if isinstance(metadata, dict) else {}
-        decision = PromptBudgetDecision(
-            stage=str(metadata.get("stage", "unknown")),
-            estimated_prompt_tokens=int(metadata.get("estimated_prompt_tokens", 0) or 0),
-            input_hard_capacity=metadata.get("input_hard_capacity"),
-            state=BudgetState(str(metadata.get("state", "HARD_PRESSURE"))),
-            remaining_run_tokens=int(metadata.get("remaining_run_tokens", 0) or 0),
-            terminal_reserve_tokens=0,
-            terminal_reserve_llm_calls=0,
-            breakdown=dict(metadata.get("breakdown") or {}),
-            compaction_required=True,
-            reason=str(metadata.get("reason") or "prompt is at the physical input boundary"),
-        )
-        if error_type == "RunBudgetAdmissionExceeded":
-            raise RunBudgetAdmissionExceeded(decision)
-        raise PromptBudgetExceeded(decision)
-    raise RuntimeError(f"provider child failed with {error_type}: {message}")
-
-
-def _terminate_process(process) -> None:
-    if not process.is_alive():
-        process.join(timeout=0.1)
-        return
-    process.terminate()
-    process.join(timeout=0.5)
-    if process.is_alive():
-        process.kill()
-        process.join(timeout=0.5)

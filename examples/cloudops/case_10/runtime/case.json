@@ -1,0 +1,12 @@
+{
+  "case_id": "cloudops-boutique-service-10",
+  "summary": "Partial Service Unreachability.",
+  "system": "online-boutique",
+  "namespace": "boutique",
+  "evidence_sources": [
+    "structured_service_topology",
+    "service_connectivity",
+    "kubernetes_resources",
+    "application_yaml"
+  ]
+}

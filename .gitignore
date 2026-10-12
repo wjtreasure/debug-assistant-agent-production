@@ -5,9 +5,11 @@ __pycache__/
 .coverage
 .env
 .env.*
+!.env.example
 .debug_assistant/
 runs/
 cache/
+.cache/
 tests/
 experiments/
 data/
@@ -19,6 +21,34 @@ docs/evaluation.md
 docs/runtime_unification_task_a_preflight.md
 docs/
 docs/*
+
+
+# Keep the established fixture corpus ignored; track final architecture,
+# smoke, and the shared Obligation-admission contract tests.
+!tests/
+tests/*
+!tests/test_final_*.py
+!tests/test_p2_obligation_contract.py
+!tests/test_public_release_smoke.py
+!tests/fixtures/refactor/
+!tests/fixtures/refactor/**
+
+# Keep historical/generated experiments ignored; track only frozen protocols,
+# the bounded recovery baseline, and offline audit summaries selected by R0.
+!experiments/
+experiments/*
+!experiments/refactor/
+experiments/refactor/*
+!experiments/refactor/final_v1/
+!experiments/refactor/final_v1/**
+!experiments/refactor/final_v1_1/
+!experiments/refactor/final_v1_1/**
+!experiments/refactor/final_v2/
+!experiments/refactor/final_v2/**
+!experiments/refactor/promote_stage2_r24_fix84_recovery_candidate_stable_baseline/
+!experiments/refactor/promote_stage2_r24_fix84_recovery_candidate_stable_baseline/**
+!experiments/refactor/static_audit_20260930/
+!experiments/refactor/static_audit_20260930/**
 *.egg-info/
 build/
 dist/

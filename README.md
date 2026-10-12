@@ -1,285 +1,177 @@
-# Debug Assistant Agent
+# 受证据约束的 CloudOps RCA Agent
 
-一个面向云运维和代码故障排查的只读 Agent Runtime。
+一个面向 Kubernetes 和 Online Boutique 风格故障的根因分析 Agent。它把模型的语义推理与 Runtime 的确定性控制分开：模型决定调查方向、假设和证据含义；Runtime 管理状态、来源、工具、预算、因果准入和最终输出。
 
-项目让大模型通过受控工具调查故障现场，围绕运行状态、配置、日志、依赖和源码建立证据链，最终输出带证据引用的根因候选。模型负责语义判断，确定性 Runtime 负责工具权限、状态转移、预算和安全边界。
+## 这个 Agent 做什么
 
-## Features
+一次诊断从故障现象和只读运行时快照开始，循环完成：
 
-- **Evidence-grounded diagnosis**：区分 `Observation`、`Evidence` 和 `Hypothesis`，避免把模型猜测直接当成事实。
-- **Typed tool calling**：使用结构化契约校验工具名、参数和输出，支持原生 Tool Calling 与有界 JSON fallback。
-- **Deterministic Agent Runtime**：统一处理 Planner、Reflection、Review、重试、预算、超时、循环防护和终止。
-- **Read-only by design**：只读访问仓库、故障快照和受限源码，不执行修复命令，不修改目标代码。
-- **Auditable execution**：保留 `run.json`、`trace.jsonl` 和 Evidence provenance，支持回放与问题定位。
-- **Separated evaluation**：运行时诊断、候选 Review 和运行后 Evaluator 相互隔离，避免诊断过程依赖标准答案。
-- **Failure-aware engineering**：区分 Provider、Contract、Runtime、Budget、Convergence 和 semantic reasoning 等失败类型。
+1. 读取当前诊断状态，选择 Skill 和下一步调查方向。
+2. 通过确定性的只读 Tool 获取 Observation。
+3. 将 Observation 解释为带来源的 Evidence，并关联到假设和验证要求。
+4. 在因果证据充分时发布 `RootCauseCandidate`。
+5. 由独立 Review 评估候选或未完成的诊断报告。
 
-## Architecture
+每次正常终止都会生成 `DiagnosticReport`。报告可以确认根因，也可以保留最可能的解释、证据链、未确认部分和后续调查建议。
 
-```text
-Issue / Incident Snapshot
-            │
-            ▼
-DiagnosisHarness
-  ├─ Budget / Deadline / Loop Guard / Retry
-  ├─ Capability Detection / Routing
-  └─ Context Manager
-            │
-            ▼
-Planner ──► Skill ──► Read-only Tool Registry
-                              │
-                              ▼
-                    Observation Store
-                              │
-                              ▼
-                       Evidence Memory
-                              │
-                              ▼
-                 Hypothesis / Obligations / Contradictions
-                              │
-                 ┌────────────┴────────────┐
-                 ▼                         ▼
-          Finalization Gate            Reflection
-                 │
-                 ▼
-             Final Review
-                 │
-                 ▼
-       Diagnosis Result + Trace + Metrics
+## 整体架构
+
+```mermaid
+flowchart TD
+    A[Incident Case<br/>case.json + tool cache] --> B[Bootstrap]
+    T[Topology] --> B
+    M[Domain Asset Manifest<br/>Skills + Tool registry] --> B
+    B --> B1[Capability detection<br/>Knowledge routing]
+    B --> B2[Budget + deadline]
+    B1 --> C[ContextManager]
+    B2 --> C
+
+    C --> D[Single-Reasoner<br/>strict semantic decision]
+    D -->|CONTEXT_REQUEST| C
+    D -->|SEMANTIC_DELTA| E[Runtime Phase A<br/>validate + EvidencePipeline admission]
+    E --> S[RCAState<br/>canonical semantic state]
+
+    S --> F{FinalizationPolicy}
+    F -->|blocked| G[Runtime Phase B<br/>compile + admit command]
+    G --> H[ActionRuntime<br/>Registry validation]
+    H --> I[Deterministic read-only Tool]
+    I --> J[ObservationStore]
+    J --> C
+
+    F -->|allowed| L[RootCauseCandidate]
+    L --> N[Independent Review]
+    N -->|PASS| O[DiagnosticReport<br/>SUPPORTED_ROOT_CAUSE]
+    N -->|REJECT + recoverable| R[ProgressPolicy<br/>Reflection / bounded recovery]
+    R --> C
+    N -->|REJECT/unavailable| O
+    C -->|budget, capability or no progress| O
+    O --> P[run.json + JSONL trace]
 ```
 
-### Core components
+### 运行时职责
 
-| Component | Responsibility |
-|---|---|
-| `DiagnosisHarness` | 管理一次诊断任务的生命周期、状态、预算、工具和终止条件 |
-| `Planner` | 根据当前上下文和证据缺口选择下一步调查动作 |
-| `Skill` | 表达服务调查、配置调查、日志调查、代码调查等调查意图 |
-| `Tool Registry` | 暴露经过权限和参数校验的只读工具 |
-| `ObservationStore` | 保存工具返回的完整原始观察 |
-| `EvidenceMemory` | 将满足来源、范围和引用约束的观察晋升为可引用证据 |
-| `ContextManager` | 根据假设、证据、矛盾和预算组装下一轮模型上下文 |
-| `Finalization Gate` | 在提交候选前检查字段、证据、验证义务和矛盾 |
-| `Final Review` | 审核候选与所引用证据是否自洽 |
-| `Evaluator` | 在运行结束后独立计算诊断质量和运行指标 |
+| 层 | 主要模块 | 责任 |
+| --- | --- | --- |
+| 入口与装载 | `cli.py`、`config.py`、`datasets/` | 读取配置、case、拓扑和资产 manifest，创建一次诊断运行 |
+| 语义决策 | `agent/planner.py`、`agent/decision_surface.py`、`agent/decision_turn.py` | 用严格类型协议产生假设、Evidence 语义、验证问题和下一步意图 |
+| 上下文 | `context/manager.py`、`context/projection.py` | 从 Incident、RCAState、Observation、Evidence、Tool 历史中构造角色视图；按需恢复原始内容 |
+| 规范状态 | `incidents/rca_state.py`、`incidents/contracts.py`、`semantic_transition.py` | 保存假设修订、Canonical Question/CompletionContract、Evidence 关系和生命周期 |
+| 采集与证据 | `tools/`、`action_runtime.py`、`memory/`、`evidence_pipeline.py` | 校验并执行合法命令，保存 Observation，将带 provenance 的语义证据准入唯一状态 |
+| 控制策略 | `finalization.py`、`progress_policy.py`、`harness/` | 判断因果准入、限制重复和无进展、管理预算、超时、Provider 健康和恢复 |
+| 输出与审查 | `report.py`、`agent/final_review.py` | 从已提交状态生成报告；Review 独立评估证据质量、推理和置信度 |
 
-核心原则是：
+`RCAState` 是诊断语义的唯一权威。Observation 是 Tool 的原始结果，Evidence 是对 Observation 的语义解释；Evidence 必须保留到 Observation、文件或其他来源的 provenance。ContextManager 只负责构造可见视图，不拥有诊断语义。
 
-> **LLM owns semantic reasoning; Runtime owns structure and control.**
+## 一轮决策如何运行
 
-模型可以提出调查动作和诊断解释，但不能绕过工具白名单、路径限制、Evidence 校验、预算或终止条件。
+### 1. ContextManager 构造当前视图
 
-## Supported scenarios
+模型看到故障现象、当前假设、已提交的 Question/CompletionContract、已执行动作、Evidence 关系、工具反馈、可用 Skill、预算和必要的原始 Observation。完整内容按需恢复，常用状态以结构化摘要和来源引用传递。
 
-当前主路径面向 Online Boutique / Cloud-OpsBench 风格的微服务故障，也保留通用代码仓库诊断能力。
+### 2. Single-Reasoner 返回一种决策
 
-典型调查对象包括：
+模型通过严格的 `response_format=json_schema` 返回以下两类之一：
 
-- Service、Endpoint、Pod、Deployment 与容器端口配置；
-- HTTP / gRPC 健康探针与服务协议；
-- 服务依赖、路由、连接性和错误日志；
-- 运行状态、配置和源码行为之间的因果关系；
-- 代码仓库中的问题定位、源码读取和测试发现。
+- `CONTEXT_REQUEST`：请求已保留的 Observation 或源码片段，不改变语义状态，也不执行 Tool。
+- `SEMANTIC_DELTA`：提交假设转换、Evidence 解释、支持/反驳关系、Acknowledgement、新验证要求和一个 `next_action_intent`。
 
-输出是带有组件、故障、机制、证据 ID、置信度和不确定性的诊断候选，不是自动生成或执行的代码补丁。
+已有 Question 只能引用 Canonical requirement；新 Question 在同一决策中只声明一次。模型不生成 Runtime ID，也不决定生命周期是否生效。
 
-## Quick start
+### 3. Runtime Phase A 原子提交
 
-### Requirements
+Runtime 校验引用、假设生命周期、CompletionContract、Evidence 来源和关系，然后把语义增量一次性提交到 `RCAState`。失败时整次语义提交回滚。
 
-- Python 3.11+
-- Git
-- 一个支持 OpenAI-compatible Chat Completions API 的模型服务（真实模型运行时）
+### 4. FinalizationPolicy 判断是否足以发布候选
 
-### 1. Install
+`FinalizationPolicy` 检查候选字段、直接因果支持、必要 CompletionContract、Required fact coverage、矛盾处理、源码覆盖和 fault taxonomy。它只读取 Canonical state，不接受模型自行声明的“已完成”。探索性问题不会单独阻塞终结；必要因果要求仍必须满足。
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
+### 5. Runtime Phase B 执行下一步
 
-python -m pip install --upgrade pip
-pip install -e '.[dev,eval]'
-```
+如果尚不能终结，Runtime 根据已提交状态和实际 Registry 编译并准入 `next_action_intent`，校验工具、参数、目标、来源 profile 和 acquisition history，再由 `ActionRuntime` 执行确定性的只读 Tool。Tool 返回的 Observation 写入 `ObservationStore`，下一轮再由模型解释为 Evidence。
 
-也可以使用 Makefile：
+### 6. Review 与报告
+
+候选发布后，独立 Review 只读取候选、已引用 Evidence、关系、矛盾和未验证部分，返回 `PASS` 或 `REJECT`、0～1 置信度及理由。Review 不能创建 Evidence，也不能放宽 Finalization。若调查因预算、能力或无进展结束而没有候选，在仍有 Review 资源且已有诊断材料时，Review 会审查 `INCONCLUSIVE` 报告；这不会把报告提升为已验证 RCA。
+
+## 安装
+
+需要 Python 3.11 或更高版本，以及一个 OpenAI 兼容 Provider 才能进行真实诊断。
 
 ```bash
-make install
-```
-
-### 2. Configure the provider
-
-复制配置模板：
-
-```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e '.[dev]'
 cp .env.example .env
 ```
 
-编辑 `.env`，至少配置以下字段：
+在 `.env` 中配置 Provider：
 
 ```dotenv
 DEBUG_AGENT_PROVIDER=openai_compatible
-DEBUG_AGENT_API_KEY=your-api-key
 DEBUG_AGENT_BASE_URL=https://api.openai.com/v1
-DEBUG_AGENT_MODEL=your-model-name
-DEBUG_AGENT_CRITIC_MODEL=your-review-model-name
+DEBUG_AGENT_API_KEY=...
+DEBUG_AGENT_MODEL=你的模型名
 ```
 
-项目也支持不需要网络的 Mock Provider：
+`DEBUG_AGENT_REFLECTION_MODEL` 和 `DEBUG_AGENT_CRITIC_MODEL` 可选；未配置时使用主模型。`mock` Provider 仅用于传输和资产 smoke，不执行语义诊断。
 
-```bash
-export DEBUG_AGENT_PROVIDER=mock
-```
+## 运行
 
-不要把 API Key、`.env` 或其他凭证提交到 Git。
-
-### 3. Run a local smoke test
-
-```bash
-DEBUG_AGENT_PROVIDER=mock make smoke
-```
-
-该命令使用仓库内的示例问题和示例代码仓库，运行结果写入 `runs/smoke/`。
-
-### 4. Diagnose a local repository
-
-准备一个问题描述文件和目标仓库目录后执行：
-
-```bash
-debug-assistant diagnose \
-  --issue examples/issues/example_issue.md \
-  --repo examples/fixture_repo \
-  --output runs/local-diagnosis \
-  --task-id local-example
-```
-
-真实 Provider 运行时，先完成 `.env` 配置；使用 Mock Provider 时不需要 API Key。
-
-### 5. Run a CloudOps incident snapshot
-
-项目提供了基于快照的 Incident Diagnosis 入口：
-
-```bash
-DEBUG_AGENT_PROVIDER=mock python -m debug_assistant.incidents \
-  --runtime-case tests/fixtures/cloudops/case_10/runtime \
-  --output runs/cloudops-diagnosis \
-  --topology data/online_boutique/service_topology.json
-```
-
-如果需要在运行结束后加载本地评测数据，可以额外传入：
-
-```bash
-  --evaluator tests/fixtures/cloudops/case_10/evaluator
-```
-
-Evaluator 只在诊断运行产物写入后加载，不会进入 Agent 的运行时上下文。
-
-### 6. Inspect traces and run metrics
-
-```bash
-debug-assistant trace-metrics \
-  --trace runs/cloudops-diagnosis/traces/<trace-file>.jsonl
-```
-
-一次运行通常会产生运行结果、JSONL Trace 和指标文件，可用于检查工具调用、Evidence、状态转移、预算和终止原因。
-
-### 7. Run tests
-
-```bash
-pytest -q
-```
-
-或：
-
-```bash
-make test
-```
-
-## CLI overview
-
-```bash
-debug-assistant --help
-```
-
-主要命令：
-
-| Command | Purpose |
-|---|---|
-| `diagnose` | 对本地问题描述和仓库执行只读诊断 |
-| `diagnose-task` | 运行一个已准备好的任务目录 |
-| `prepare-swe` | 准备代码仓库诊断任务 |
-| `run-swe` | 批量运行已准备的任务 |
-| `trace-metrics` | 汇总 JSONL Trace 指标 |
-| `eval-localization` | 评估代码定位结果 |
-| `eval-retrieval` | 评估检索结果 |
-
-CloudOps 快照路径使用独立入口：
-
-```bash
-python -m debug_assistant.incidents --help
-```
-
-## Configuration
-
-运行时参数通过环境变量配置，常用配置包括：
-
-| Variable | Description | Default |
-|---|---|---:|
-| `DEBUG_AGENT_MAX_STEPS` | 最大决策步数 | `20` |
-| `DEBUG_AGENT_MAX_TOOL_CALLS` | 最大工具调用数 | `45` |
-| `DEBUG_AGENT_MAX_LLM_CALLS` | 最大模型调用数 | `40` |
-| `DEBUG_AGENT_MAX_TOTAL_TOKENS` | 单任务 Token 预算 | `180000` |
-| `DEBUG_AGENT_MAX_WALL_TIME_SECONDS` | 单任务最大运行时间 | `900` |
-| `DEBUG_AGENT_MAX_CONTEXT_CHARS` | 单轮上下文字符预算 | `50000` |
-| `DEBUG_AGENT_NATIVE_TOOL_CALLING` | 是否启用原生工具调用 | `1` |
-| `DEBUG_AGENT_STRUCTURED_REFLECTION` | 是否启用结构化 Reflection | `1` |
-| `DEBUG_AGENT_SEMANTIC_SEARCH` | 是否启用语义检索 | `1` in template |
-
-完整默认配置见 `.env.example`。如果没有 Embedding Provider，关闭 `DEBUG_AGENT_SEMANTIC_SEARCH` 后仍可使用词法检索和基础诊断能力。
-
-## Repository layout
+一个 runtime case 至少包含：
 
 ```text
-src/debug_assistant/
-├── agent/          # Planner、Reflection、Review、Reporter
-├── context/        # Context Manager 与上下文投影
-├── harness/        # Budget、Deadline、Retry、Loop Guard、Trace
-├── incidents/      # CloudOps Incident Runtime
-├── memory/         # Observation、Evidence、Hypothesis 生命周期
-├── tools/          # Repository / Snapshot / Source Tool Registry
-├── evaluation/     # 运行后评测与 Trace 指标
-├── knowledge/      # 可选的领域知识与检索能力
-└── repository/     # 仓库索引、搜索和安全文件访问
-
-tests/              # 单元测试、契约测试和 Runtime 测试
-examples/           # 本地运行示例
-data/               # 本地数据和快照资源
+runtime-case/
+├── case.json
+├── tool_cache.json
+├── raw_data/       # 可选：case 声明的运行时数据
+└── code/           # 可选：源码证据
 ```
 
-## Safety model
-
-- 模型输出先经过结构化解析和 Pydantic contract 校验；
-- 工具必须存在于 Registry 且参数满足对应 Schema；
-- 仓库访问受路径边界约束，默认只读；
-- Tool、LLM、Token、时间和重复动作都有上限；
-- Provider 超时、契约错误和工具失败会进入有界重试或明确失败；
-- 原始 Observation、可引用 Evidence 和最终 Candidate 分层保存；
-- Gold / Evaluator 数据不参与 Agent 运行时决策。
-
-## Development
+使用已配置的 Provider 运行：
 
 ```bash
-# 安装开发依赖
-make install
-
-# 运行测试
-make test
-
-# 运行示例 smoke test
-make smoke
-
-# 清理本地运行产物
-make clean
+debug-assistant run \
+  --runtime-case /path/to/runtime-case \
+  --manifest /path/to/DOMAIN_ASSET_MANIFEST.json \
+  --topology /path/to/service_topology.json \
+  --output /path/to/output
 ```
 
-项目适合用于研究 Agent Runtime、上下文工程、证据链、工具调用契约和可审计故障诊断。
+仓库中的 `examples/cloudops/` 提供可加载的 case、拓扑和 12 个 Skill 的 manifest，可用于检查输入格式：
+
+```bash
+python scripts/verify_public_release.py
+```
+
+运行结果写入：
+
+```text
+output/
+├── run.json          # IncidentRunResult：状态、报告、候选、Review、证据和指标
+└── traces/           # 有界 JSONL 运行 trace
+```
+
+CLI 返回码：`0` 表示 Review 通过的 RCA，`2` 表示已生成但未确认根因的 `INCONCLUSIVE`，`1` 表示运行时或 Provider 失败。
+
+## 测试与开发
+
+```bash
+make smoke
+make test
+python -m compileall -q src scripts
+python scripts/verify_public_release.py
+```
+
+`make smoke` 和默认测试不调用真实 Provider。需要外部 CloudOps 数据的测试通过 `external_dataset` 标记单独选择。`validate-protocol` 依赖完整开发检出版本中的版本化协议资产。
+
+## 输入、输出与证据规则
+
+- **Observation**：Tool 返回的原始、只读结果。
+- **Evidence**：模型基于 Observation 给出的事实摘要、支持/反驳关系和与假设的关联。
+- **CompletionContract**：描述必须验证哪些事实；由 Runtime 维护 Canonical identity。
+- **Finalization**：只有必要事实覆盖、直接因果证据和矛盾处理都满足时才生成 `RootCauseCandidate`。
+- **Review**：独立评估证据质量、因果逻辑、报告完整性和置信度；不会替代 Evidence 或 Finalization。
+
+## 当前范围
+
+当前发布版针对只读 CloudOps 快照和已注册的 Kubernetes/Online Boutique 诊断工具。真实运行需要单独提供 case、拓扑和领域资产。语义搜索、知识检索和 DAG 编排是可选能力，Runtime 的确定性状态和准入路径保持不变。

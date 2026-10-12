@@ -1,6 +1,6 @@
 from .mock import MockLLMClient
 from .openai_compatible import OpenAICompatibleClient
-from .base import ModelCapability
+from .base import ModelCapability, ProviderCapabilities
 
 def build_llm(cfg):
     capability = ModelCapability(
@@ -15,6 +15,13 @@ def build_llm(cfg):
     if cfg.provider == "openai_compatible":
         return OpenAICompatibleClient(
             cfg.base_url, cfg.api_key, cfg.planner_model, cfg.timeout, cfg.temperature,
+            max_attempts=getattr(cfg, "retry_attempts", 3),
+            min_retry_budget=getattr(cfg, "retry_min_budget_seconds", 5.0),
             model_capability=capability,
+            # The incident interface requires explicit strict response schemas.
+            # Unsupported endpoint/model combinations must return a typed failure.
+            capabilities=ProviderCapabilities(json_object=True, json_schema=True,
+                tool_calling=True, parallel_tool_calls=True,
+                provider=cfg.provider, model=cfg.planner_model),
         )
     raise ValueError(f"Unsupported provider: {cfg.provider}. Use openai_compatible or mock.")

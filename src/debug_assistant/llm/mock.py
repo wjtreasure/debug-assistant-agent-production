@@ -1,6 +1,5 @@
 from __future__ import annotations
 from typing import Any, Iterable
-import json
 from .base import LLMClient, LLMResponse, LLMToolCall, ProviderCapabilities, ModelCapability
 
 class MockLLMClient(LLMClient):
@@ -28,24 +27,24 @@ class MockLLMClient(LLMClient):
         if self._responses:
             value=self._responses.pop(0)
             if isinstance(value, dict): return value
-        low=user.lower()
-        if 'final_report_schema' in low:
-            return {"summary":"Smoke-test diagnosis", "root_cause":"Evidence suggests the fixture parser boundary check is the likely defect.",
-                    "likely_files":["src/parser.py"], "likely_symbols":["parse_value"], "impact_scope":["parser callers"],
-                    "recommended_change_points":[{"file":"src/parser.py","symbol":"parse_value","reason":"boundary handling"}],
-                    "uncertainties":["Mock provider does not perform semantic reasoning"], "next_checks":["Review boundary tests"], "confidence":0.62}
-        if 'reflection_schema' in low:
-            return {"decision":"continue","reason":"collect one more targeted source excerpt","current_diagnosis":"fixture parser boundary validation",
-                    "evidence_sufficient":False,"supporting_evidence_ids":[],"contradicting_evidence_ids":[],
-                    "required_missing_evidence":[{"target":"target implementation","location":"src/parser.py","reason":"source is required to ground the mechanism"}],
-                    "optional_validation":[],"recommended_next_goal":"inspect target implementation","confidence":0.6,"hypothesis_changed":None}
-        if self.n == 1:
-            return {"kind":"tool","skill":"repository_exploration","reason":"find issue keywords","confidence":0.8,
-                    "tool":"grep","arguments":{"query":"parse_value|boundary|invalid","glob":"*.py","max_results":20},"expected_evidence":"candidate implementation"}
-        if self.n == 2:
-            return {"kind":"tool","skill":"hypothesis_validation","reason":"read candidate source","confidence":0.9,
-                    "tool":"read_file","arguments":{"path":"src/parser.py","start_line":1,"line_count":120},"expected_evidence":"implementation details"}
-        return {"kind":"finish","skill":"report_synthesis","reason":"enough evidence for smoke test","confidence":0.75,"tool":None,"arguments":{},"expected_evidence":""}
+        # Keep the deterministic adapter aligned with the active CloudOps
+        # contracts.  It is a transport fixture, not a second Planner or a
+        # source of generic/SWE Skill names.  Callers that need a full
+        # lifecycle should provide explicit ``responses``/``tool_calls`` or
+        # use the manifest-backed final smoke provider.
+        return {
+            "decision": "REJECT",
+            "unsupported_claims": [],
+            "missing_evidence": ["A real Provider response is required for semantic diagnosis."],
+            "blocking_contradictions": [],
+            "contradictions": [],
+            "recoverability": {"recoverable": True, "unrecoverable": False},
+            "targeted_followup": "Use an OpenAI-compatible Provider or an explicit deterministic fixture.",
+            "suggested_investigation": "Use an OpenAI-compatible Provider or an explicit deterministic fixture.",
+            "causal_chain_valid": False,
+            "causal_gaps": ["semantic Provider response unavailable"],
+            "reason": "The mock adapter does not perform semantic reasoning.",
+        }
 
     def complete_with_tools(self, system: str, user: str, *, tools: list[dict[str, Any]],
                             model: str | None = None, logical_timeout_seconds: float | None = None,

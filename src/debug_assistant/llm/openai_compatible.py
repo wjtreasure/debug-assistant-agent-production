@@ -21,6 +21,7 @@ from .base import (
     parse_tool_calls,
     ProviderCapabilities,
     ModelCapability,
+    strict_response_format,
 )
 
 
@@ -48,6 +49,61 @@ def _safe_raw_message(message: dict) -> dict:
             })
         safe["tool_calls"] = calls
     return safe
+
+
+def _safe_http_error_detail(response: httpx.Response) -> str:
+    """Extract bounded provider error fields without persisting raw bodies."""
+    try:
+        payload = response.json()
+    except (ValueError, TypeError):
+        return f"HTTP {response.status_code}"
+    if not isinstance(payload, dict):
+        return f"HTTP {response.status_code}"
+    error = payload.get("error", payload)
+    if isinstance(error, dict):
+        parts = [
+            str(error.get(key) or "").strip()
+            for key in ("code", "type", "message")
+            if str(error.get(key) or "").strip()
+        ]
+    else:
+        parts = [str(error).strip()] if str(error).strip() else []
+    detail = ": ".join(parts)
+    return f"HTTP {response.status_code}: {detail[:300]}" if detail else f"HTTP {response.status_code}"
+
+
+def _is_json_mode_unsupported(response: httpx.Response) -> bool:
+    """Return whether a 400/422 explicitly rejects the JSON response mode.
+
+    Compatible endpoints also use 400 for authentication, billing, and other
+    request failures.  Those errors must not be retried as if only
+    ``response_format`` were unsupported.
+    """
+    try:
+        payload = response.json()
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    error = payload.get("error", payload)
+    if isinstance(error, dict):
+        text = " ".join(
+            str(error.get(key) or "")
+            for key in ("code", "type", "message", "param")
+        ).casefold()
+    else:
+        text = str(error).casefold()
+    json_markers = (
+        "response_format",
+        "json_object",
+        "json mode",
+        "structured output",
+        "json schema",
+    )
+    unsupported_markers = ("unsupported", "not support", "invalid", "unknown")
+    return any(marker in text for marker in json_markers) and any(
+        marker in text for marker in unsupported_markers
+    )
 
 
 class OpenAICompatibleClient(LLMClient):
@@ -121,6 +177,7 @@ class OpenAICompatibleClient(LLMClient):
         logical_timeout_seconds: float | None = None,
         on_attempt_started: Callable[[dict[str, Any]], None] | None = None,
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: dict[str, Any] | str = "auto",
         response_format: dict[str, Any] | None = None,
         return_response: bool = False,
         max_output_tokens: int | None = None,
@@ -128,6 +185,13 @@ class OpenAICompatibleClient(LLMClient):
     ) -> dict[str, Any]:
         if not self.api_key:
             raise LLMError("DEBUG_AGENT_API_KEY is empty. Configure it or use DEBUG_AGENT_PROVIDER=mock for smoke tests.")
+
+        # A failed native response must not be mistaken for the previous
+        # Planner call when the caller records its request snapshot.
+        self.last_raw_output = {}
+        self.last_raw_content = None
+        self.last_usage = {}
+        self.last_response = None
 
         logical_budget = float(logical_timeout_seconds) if logical_timeout_seconds is not None else self.timeout * self.max_attempts
         if logical_budget <= 0:
@@ -151,7 +215,11 @@ class OpenAICompatibleClient(LLMClient):
             base_payload["enable_thinking"] = bool(enable_thinking)
         if tools:
             base_payload["tools"] = tools
-            base_payload["tool_choice"] = "auto"
+            base_payload["tool_choice"] = tool_choice
+            # P1 owns one executable action per Planner turn.  Leaving this
+            # provider default enabled lets compatible endpoints emit a batch
+            # even when Runtime is intentionally single-action.
+            base_payload["parallel_tool_calls"] = False
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         self._event(
             "LLM_LOGICAL_CALL_STARTED",
@@ -163,6 +231,7 @@ class OpenAICompatibleClient(LLMClient):
         last: Exception | None = None
         last_provider_failure = False
         attempts_made = 0
+        disable_automatic_json_mode = False
         client_timeout = httpx.Timeout(self.timeout)
         async with httpx.AsyncClient(timeout=client_timeout, transport=self.async_transport) as client:
             for attempt in range(1, self.max_attempts + 1):
@@ -187,7 +256,11 @@ class OpenAICompatibleClient(LLMClient):
                 retry_after_seconds=None
                 if response_format is not None:
                     payload["response_format"] = response_format
-                elif attempt == 1 and not tools and self.capabilities.json_object:
+                elif (
+                    not tools
+                    and self.capabilities.json_object
+                    and not disable_automatic_json_mode
+                ):
                     payload["response_format"] = {"type": "json_object"}
                 attempt_started = time.monotonic()
                 provider_response_success = False
@@ -196,10 +269,14 @@ class OpenAICompatibleClient(LLMClient):
                     "logical_call_id":call_id, "attempt_index":attempt,
                     "attempt_timeout_seconds":attempt_timeout,
                     "logical_remaining_seconds":remaining,
+                    "model": payload["model"],
+                    "response_format": (payload.get("response_format") or {}).get("type", "function_calling_strict" if tools and all(
+                        row.get("function", {}).get("strict") is True for row in tools) else "none"),
+                    "tool_choice": payload.get("tool_choice"),
                 }
-                self._event("LLM_ATTEMPT_STARTED", **attempt_meta)
                 if on_attempt_started is not None:
                     on_attempt_started(dict(attempt_meta))
+                self._event("LLM_ATTEMPT_STARTED", **attempt_meta)
                 try:
                     async with asyncio.timeout(remaining):
                         r = await client.post(
@@ -216,7 +293,9 @@ class OpenAICompatibleClient(LLMClient):
                             retry_after_seconds=max(0.0,float(r.headers.get('Retry-After'))) if r.headers.get('Retry-After') else None
                         except (TypeError,ValueError):
                             retry_after_seconds=None
-                        last = LLMError(f"transient LLM HTTP {r.status_code}: {r.text[:300]}")
+                        last = LLMError(
+                            f"transient LLM {_safe_http_error_detail(r)}"
+                        )
                         self._event(
                             "LLM_ATTEMPT_FAILED",
                             logical_call_id=call_id, attempt_index=attempt,
@@ -224,13 +303,28 @@ class OpenAICompatibleClient(LLMClient):
                             error_type="transient_http", status_code=r.status_code,
                             retryable=True,
                         )
-                    elif attempt == 1 and r.status_code in (400, 422):
+                    elif (
+                        attempt == 1
+                        and r.status_code in (400, 422)
+                        and payload.get("response_format") is not None
+                        and payload["response_format"].get("type") != "json_schema"
+                        and _is_json_mode_unsupported(r)
+                    ):
                         last_provider_failure = False
                         # JSON response mode is optional for compatible providers. One retry
                         # without response_format remains bounded by the same logical deadline.
-                        last = LLMError(f"JSON mode unsupported: HTTP {r.status_code}")
+                        last = LLMError(
+                            f"JSON mode unsupported: {_safe_http_error_detail(r)}"
+                        )
                         if response_format is not None:
-                            response_format = {"type": "json_object"} if self.capabilities.json_object else None
+                            response_format = (
+                                {"type": "json_object"}
+                                if self.capabilities.json_object
+                                and response_format.get("type") != "json_object"
+                                else None
+                            )
+                        else:
+                            disable_automatic_json_mode = True
                         self._event(
                             "LLM_ATTEMPT_FAILED",
                             logical_call_id=call_id, attempt_index=attempt,
@@ -299,6 +393,7 @@ class OpenAICompatibleClient(LLMClient):
                             "LLM_ATTEMPT_FINISHED",
                             logical_call_id=call_id, attempt_index=attempt,
                             attempt_elapsed_ms=attempt_elapsed_ms, success=True,
+                            usage=dict(usage),
                         )
                         self._event(
                             "LLM_LOGICAL_CALL_FINISHED",
@@ -357,14 +452,19 @@ class OpenAICompatibleClient(LLMClient):
                         retryable=False,
                     )
                     elapsed_ms=(time.monotonic()-call_started)*1000
-                    provider_failure=bool(exc.response.status_code==429 or exc.response.status_code>=500)
+                    # Any non-2xx HTTP response is a failed Provider request.
+                    # Retry policy is decided separately above; a permanent
+                    # 400/401/403 must still be recorded as Provider failure.
+                    provider_failure=True
                     self._event(
                         "LLM_LOGICAL_CALL_FINISHED", logical_call_id=call_id,
                         provider_attempts=attempts_made, logical_elapsed_ms=elapsed_ms,
                         success=False, error_type="http_error", provider_success=not provider_failure,
                         provider_failure=provider_failure, logical_timeout_seconds=logical_budget,
                     )
-                    raise LLMError(f"LLM request failed: {exc}") from exc
+                    raise LLMError(
+                        f"LLM request failed: {_safe_http_error_detail(exc.response)}"
+                    ) from exc
                 except LLMInvalidJSON:
                     self._event("LLM_ATTEMPT_FINISHED", logical_call_id=call_id,
                                 attempt_index=attempt,
@@ -481,21 +581,16 @@ class OpenAICompatibleClient(LLMClient):
         on_attempt_started: Callable[[dict[str, Any]], None] | None = None,
         max_output_tokens: int | None = None,
         enable_thinking: bool | None = None,
+        tool_choice: dict[str, Any] | str = "auto",
     ) -> LLMResponse:
         if not self.capabilities.tool_calling:
-            return super().complete_with_tools(
-                system, user, tools=tools, model=model,
-                logical_timeout_seconds=logical_timeout_seconds,
-                on_attempt_started=on_attempt_started,
-                max_output_tokens=max_output_tokens,
-                enable_thinking=enable_thinking,
-            )
+            raise LLMError("function_calling_unsupported: strict commands cannot downgrade")
         try:
             asyncio.get_running_loop()
         except RuntimeError:
             return asyncio.run(self.acomplete_json(
                 system, user, model=model, logical_timeout_seconds=logical_timeout_seconds,
-                on_attempt_started=on_attempt_started, tools=tools, return_response=True,
+                on_attempt_started=on_attempt_started, tools=tools, tool_choice=tool_choice, return_response=True,
                 max_output_tokens=max_output_tokens,
                 enable_thinking=enable_thinking,
             ))
@@ -511,11 +606,10 @@ class OpenAICompatibleClient(LLMClient):
         enable_thinking: bool | None = None,
     ) -> LLMResponse:
         response_format = None
-        if schema is not None and self.capabilities.json_schema:
-            schema_data = schema.model_json_schema() if hasattr(schema, "model_json_schema") else schema
-            response_format = {"type": "json_schema", "json_schema": {
-                "name": getattr(schema, "__name__", "response"), "strict": True, "schema": schema_data,
-            }}
+        if schema is not None and not self.capabilities.json_schema:
+            raise LLMError("json_schema_unsupported: explicit schemas cannot downgrade to json_object")
+        if schema is not None:
+            response_format = strict_response_format(schema)
         try:
             asyncio.get_running_loop()
         except RuntimeError:

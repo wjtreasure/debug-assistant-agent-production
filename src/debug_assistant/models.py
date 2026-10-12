@@ -1,7 +1,6 @@
 from __future__ import annotations
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
 from typing import Any
 import time, json, uuid
 
@@ -10,19 +9,6 @@ class ActionKind(str, Enum):
     REFLECT = "reflect"
     FINISH = "finish"
     PARALLEL = "parallel"
-
-class RuntimeStage(str, Enum):
-    SETUP = "setup"
-    INDEX_BUILD = "index_build"
-    PLANNER = "planner"
-    ACTION_VALIDATION = "action_validation"
-    ROUTE_VALIDATION = "route_validation"
-    TOOL_EXECUTION = "tool_execution"
-    MEMORY_INGESTION = "memory_ingestion"
-    REFLECTION = "reflection"
-    REPORTER = "reporter"
-    SERIALIZATION = "serialization"
-    FINALIZATION = "finalization"
 
 @dataclass(slots=True)
 class TaskSpec:
@@ -71,10 +57,7 @@ class Evidence:
     target: str | None = None
     excerpt: str = ""
     file: str | None = None
-    # Backward-compatible source coverage fields used by reporter/older callers.
-    line_start: int | None = None
-    line_end: int | None = None
-    # V1.2-A.1 truth-preserving provenance/coverage.
+    # Truth-preserving source provenance and coverage.
     raw_observation_id: str | None = None
     source_start_line: int | None = None
     source_end_line: int | None = None
@@ -87,47 +70,6 @@ class Evidence:
     # Incident Review can receive a faithful projection without a second store.
     provenance: dict[str, Any] = field(default_factory=dict)
 
-@dataclass(slots=True)
-class Hypothesis:
-    hypothesis_id: str
-    claim: str
-    supporting_evidence: list[str] = field(default_factory=list)
-    contradicting_evidence: list[str] = field(default_factory=list)
-    confidence: float = 0.5
-    status: str = "open"
-
-@dataclass(slots=True)
-class DiagnosisReport:
-    task_id: str
-    summary: str
-    root_cause: str
-    likely_files: list[str]
-    likely_symbols: list[str]
-    impact_scope: list[str]
-    evidence: list[dict[str, Any]]
-    recommended_change_points: list[dict[str, Any]]
-    uncertainties: list[str]
-    next_checks: list[str]
-    confidence: float
-    policy_note: str = "Read-only diagnosis: no code changes were made."
-    report_source: str = "llm"
-    evidence_ids: list[str] = field(default_factory=list)
-    likely_file_source: str = "llm"
-    claims: list[dict[str,Any]] = field(default_factory=list)
-    acquired_unreviewed: list[dict[str,Any]] = field(default_factory=list)
-
-@dataclass(slots=True)
-class RuntimeFailure:
-    stage: str
-    error_type: str
-    exception_type: str
-    message: str
-    retryable: bool | None = None
-    step: int = 0
-    tool_calls: int = 0
-    evidence_count: int = 0
-    last_action: dict[str, Any] | None = None
-
 @dataclass
 class AgentState:
     task: TaskSpec
@@ -137,8 +79,6 @@ class AgentState:
     actions: list[ActionProposal] = field(default_factory=list)
     observations: list[ToolObservation] = field(default_factory=list)
     evidence: list[Evidence] = field(default_factory=list)
-    hypotheses: list[Hypothesis] = field(default_factory=list)
-    report: DiagnosisReport | None = None
     errors: list[str] = field(default_factory=list)
     invalid_routes: int = 0
     recovered_routes: int = 0
@@ -147,9 +87,6 @@ class AgentState:
     reflection_failure_count: int = 0
     max_consecutive_reflection_failures_observed: int = 0
     started_at: float = field(default_factory=time.time)
-    failure: RuntimeFailure | None = None
-    report_source: str = ""
-    current_hypothesis: dict[str, Any] = field(default_factory=dict)
     termination_advisory: str = ""
     observation_reuse_count: int = 0
     no_progress_count: int = 0
@@ -171,15 +108,14 @@ class AgentState:
         return {
             "task_id": self.task.task_id,
             "step": self.step, "tool_calls": self.tool_calls, "status": self.status,
-            "evidence": len(self.evidence), "hypotheses": max(len(self.hypotheses), int(bool(self.current_hypothesis and self.current_hypothesis.get("status") not in (None,"","none")))),
+            "evidence": len(self.evidence),
             "invalid_routes": self.invalid_routes, "recovered_routes": self.recovered_routes,
             "repeated_actions": self.repeated_actions, "reflection_count": self.reflection_count,
             "reflection_failure_count": self.reflection_failure_count,
             "max_consecutive_reflection_failures_observed": self.max_consecutive_reflection_failures_observed,
             "errors": self.errors[-5:],
-            "failure": asdict(self.failure) if self.failure else None,
-            "report_source": self.report_source, "observation_reuse_count": self.observation_reuse_count,
-            "no_progress_count": self.no_progress_count, "current_hypothesis": self.current_hypothesis,
+            "observation_reuse_count": self.observation_reuse_count,
+            "no_progress_count": self.no_progress_count,
             "redundant_request_count": self.redundant_request_count, "rehydration_count": self.rehydration_count,
             "rehydration_saved_tool_calls": self.rehydration_saved_tool_calls, "rehydration_saved_chars": self.rehydration_saved_chars,
             "convergence_mode": self.convergence_mode, "forced_finalization": self.forced_finalization,

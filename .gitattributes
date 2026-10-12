@@ -1,0 +1,2 @@
+# Preserve byte-identical upstream source, including upstream whitespace.
+src/debug_assistant/_vendor/cloudops_snapshot.py whitespace=-blank-at-eol,-blank-at-eof

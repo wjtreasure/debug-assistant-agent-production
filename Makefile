@@ -1,9 +1,12 @@
 .PHONY: install test smoke clean
+
+PYTHON ?= python3
+
 install:
-	pip install -e '.[dev,eval]'
+	$(PYTHON) -m pip install -e '.[dev]'
 test:
-	pytest
+	$(PYTHON) -m pytest -q
 smoke:
-	DEBUG_AGENT_PROVIDER=mock debug-assistant diagnose --issue examples/issues/example_issue.md --repo examples/fixture_repo --output runs/smoke
+	$(PYTHON) -m pytest -q tests/test_public_release_smoke.py
 clean:
-	rm -rf .debug_assistant runs .pytest_cache .coverage
+	rm -rf .debug_assistant runs .pytest_cache .coverage *.egg-info build dist

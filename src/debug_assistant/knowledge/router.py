@@ -21,8 +21,11 @@ _TOOL_CAPABILITY_REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "get_resources": ("kubernetes_resources",),
     "get_app_yaml": ("application_yaml",),
     "describe_resource": ("resource_descriptions",),
-    "get_alerts": ("telemetry",),
-    "get_error_logs": ("telemetry",),
+    # Logs and metrics are separate runtime capabilities.  An empty log
+    # snapshot must not hide captured alert measurements, and vice versa.
+    "get_alerts": ("metrics",),
+    "get_error_logs": ("logs",),
+    "get_recent_logs": ("recent_logs",),
     "get_service_dependencies": ("structured_service_topology",),
     "check_node_service_status": ("resource_descriptions",),
     "get_cluster_configuration": ("resource_descriptions",),
@@ -30,6 +33,7 @@ _TOOL_CAPABILITY_REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "repo_tree": ("application_code",),
     "grep": ("application_code",),
     "read_file": ("application_code",),
+    "get_source_code": ("application_code",),
     "symbol_search": ("application_code",),
     "code_search": ("application_code",),
     "inspect_symbol_context": ("application_code",),
@@ -61,9 +65,8 @@ class CapabilitySnapshot(BaseModel):
     static_kg_available: bool = False
     available_code_tools: tuple[str, ...] = ()
     available_knowledge_sources: tuple[KnowledgeSource, ...] = ()
-    # Runtime-visible lifecycle state.  The legacy booleans above remain as a
-    # compatibility projection for callers that only need capability presence.
-    # ``states`` is the authoritative planner/evaluation surface.
+    # Runtime-visible lifecycle state. ``states`` is the authoritative
+    # planner/evaluation surface; booleans are a compact display projection.
     states: dict[str, CapabilityState] = Field(default_factory=dict)
 
     def capability_state(self, capability: str) -> CapabilityState:
@@ -71,18 +74,31 @@ class CapabilitySnapshot(BaseModel):
         explicit = self.states.get(str(capability))
         if explicit is not None:
             return explicit
-        # Compatibility instances created by older callers do not have the
-        # state map.  Presence is still represented truthfully; no implicit
-        # EMPTY/AVAILABLE claim is made for an unknown capability.
-        legacy = {
+        # A compact capability snapshot may omit the detailed state map. Keep
+        # the fallback fail-closed and do not infer unknown capabilities.
+        fallback_states = {
+            "logs": self.logs_available,
+            "metrics": self.metrics_available,
+            "trace": self.trace_available,
+            "telemetry": (
+                self.logs_available or self.metrics_available or self.trace_available
+            ),
             "domain_rag": self.domain_rag_available,
             "incident_memory": self.incident_memory_available,
             "static_kg": self.static_kg_available,
             "application_code": bool(self.available_code_tools),
         }
-        if capability in legacy:
-            return "AVAILABLE" if legacy[capability] else "UNAVAILABLE"
+        if capability in fallback_states:
+            return "AVAILABLE" if fallback_states[capability] else "UNAVAILABLE"
         return "UNAVAILABLE"
+
+    def planner_projection(self) -> dict[str, Any]:
+        """Expose the same authoritative source states used by Tool/admission gates."""
+        names = set(self.states) | {name for required in _TOOL_CAPABILITY_REQUIREMENTS.values()
+                                   for name in required}
+        return {"states": {name: self.capability_state(name) for name in sorted(names)},
+                "available_code_tools": list(self.available_code_tools)
+                    if self.capability_state("application_code") == "AVAILABLE" else []}
 
     def planner_tool_names(self, tools: Any) -> tuple[str, ...]:
         """Return only tools backed by currently AVAILABLE capabilities.
@@ -119,9 +135,10 @@ class CapabilitySnapshot(BaseModel):
     def observe_tool(self, tool_name: str, observation: Any) -> "CapabilitySnapshot":
         """Update one capability from a real tool Observation.
 
-        A successful empty result is ``EMPTY``.  A missing snapshot record is
-        ``UNAVAILABLE``; other execution/provider failures are ``FAILED``.
-        Neither state is converted into a causal negative claim.
+        A successful query (including an empty/negative result) proves the
+        executable source responded, not that the entire source is empty.
+        Explicit source unavailability and failures remain fail-closed.
+        Query content never creates Evidence or causal coverage.
         """
         metadata = dict(getattr(observation, "metadata", {}) or {})
         if str(tool_name) == "knowledge_retrieval":
@@ -146,17 +163,47 @@ class CapabilitySnapshot(BaseModel):
         required = _TOOL_CAPABILITY_REQUIREMENTS.get(str(tool_name))
         if not required:
             return self
-        if metadata.get("status") == "UNAVAILABLE" or getattr(observation, "error_type", None) == "snapshot_unavailable":
-            state: CapabilityState = "UNAVAILABLE"
-        elif metadata.get("semantic_negative") is True:
-            state = "EMPTY"
+        states = dict(self.states)
+        snapshot_query_missing = (
+            getattr(observation, "error_type", None) == "snapshot_unavailable"
+            or str(metadata.get("reason") or "") == "observation_not_present_in_snapshot"
+        )
+        if snapshot_query_missing:
+            # A local snapshot can omit one requested object while the
+            # underlying evidence source remains usable for other queries.
+            # Preserve the source-level capability state; Runtime still keeps
+            # the failed Observation as provenance and the action fingerprint
+            # prevents replaying the same missing query.
+            for capability in required:
+                states[capability] = states.get(
+                    capability, self.capability_state(capability)
+                )
+            return self.model_copy(update={"states": states})
+        elif metadata.get("status") == "UNAVAILABLE":
+            state = "UNAVAILABLE"
         elif bool(getattr(observation, "ok", False)):
             state = "AVAILABLE"
         else:
             state = "FAILED"
-        states = dict(self.states)
         for capability in required:
             states[capability] = state
+        # ``telemetry`` is an aggregate capability.  Preserve independent
+        # sources: an empty log snapshot must not hide available metrics, but
+        # an empty metrics snapshot must be visible when it is the only
+        # telemetry source represented by the compact snapshot.
+        telemetry_sources = [
+            states[name] for name in ("logs", "metrics", "trace")
+            if name in states
+        ]
+        if telemetry_sources:
+            if "AVAILABLE" in telemetry_sources:
+                states["telemetry"] = "AVAILABLE"
+            elif "EMPTY" in telemetry_sources:
+                states["telemetry"] = "EMPTY"
+            elif "FAILED" in telemetry_sources:
+                states["telemetry"] = "FAILED"
+            else:
+                states["telemetry"] = "UNAVAILABLE"
         return self.model_copy(update={"states": states})
 
     @classmethod
@@ -175,6 +222,8 @@ class CapabilitySnapshot(BaseModel):
             return "AVAILABLE" if any(get(name) for name in tool_names) else "FAILED"
 
         states: dict[str, CapabilityState] = {
+            "recent_logs": ("AVAILABLE" if getattr(tools.get("get_recent_logs"), "available", False)
+                            else "UNAVAILABLE"),
             "structured_service_topology": source_state({"structured_service_topology"}, ("get_service_topology",)),
             "service_connectivity": source_state({"service_connectivity"}, ("check_service_connectivity",)),
             "kubernetes_resources": source_state({"kubernetes_resources"}, ("get_resources",)),

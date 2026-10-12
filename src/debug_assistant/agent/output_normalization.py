@@ -1,8 +1,8 @@
 """Provider-output normalization for incident tool calls.
 
 OpenAI-compatible providers are not equally strict about native tool schemas.
-This module is the single compatibility boundary between provider JSON and the
-typed Runtime.  It may repair transport-level drift, but it must not invent
+This module is the single provider-schema boundary between provider JSON and
+the typed Runtime. It normalizes transport shape only; it must not invent
 facts, Evidence IDs, permissions, or required tool arguments.
 """
 
@@ -50,16 +50,9 @@ _OPTIONAL_FINALIZATION_METADATA_FIELDS = {
     "source_claims": frozenset({"file", "symbol", "start_line", "end_line", "claim", "evidence_ids"}),
 }
 
-# Keep this registry deliberately explicit.  A new alias must be justified by
-# a captured provider trace and added here, rather than hidden in a tool branch.
-INCIDENT_COMPATIBILITY_ALIASES: Mapping[str, str] = {
-    "candidate_mechanism_status": "source_mechanism_status",
-}
-
-
 @dataclass(frozen=True, slots=True)
 class NormalizationResult:
-    """Normalized arguments plus an audit trail of compatibility actions."""
+    """Normalized arguments plus an audit trail of shape transformations."""
 
     arguments: dict[str, Any]
     actions: tuple[str, ...] = ()
@@ -97,7 +90,7 @@ class IncidentLLMOutputNormalizer:
         actions: list[str] = []
         dropped_fields: list[str] = []
 
-        self._normalize_aliases(args, actions, dropped_fields)
+        self._normalize_resource_projection(args, tool_name, actions, dropped_fields)
         self._normalize_finalize_projection(tool_name, args, actions)
         self._drop_malformed_optional_finalization_metadata(
             tool_name, args, actions, dropped_fields,
@@ -112,46 +105,29 @@ class IncidentLLMOutputNormalizer:
         )
 
     @staticmethod
-    def normalize_envelope(raw_arguments: Mapping[str, Any]) -> NormalizationResult:
-        """Normalize only transport aliases around ``diagnosis_action``.
-
-        A few OpenAI-compatible adapters use ``tool``/``tool_args`` for the
-        nested executable selection.  These aliases carry no diagnosis; the
-        Runtime still validates the selected name and arguments against the
-        live registry.  Missing values remain missing and therefore fail
-        closed in the Planner contract.
-        """
-        args = dict(raw_arguments)
-        actions: list[str] = []
-        dropped: list[str] = []
-        for alias, canonical in (("tool", "tool_name"), ("tool_args", "arguments")):
-            if alias not in args:
-                continue
-            value = args.pop(alias)
-            if canonical not in args or args[canonical] is None:
-                args[canonical] = value
-                actions.append(f"{alias}->{canonical}")
-            else:
-                dropped.append(alias)
-                actions.append(f"{alias}:dropped_canonical_present")
-        return NormalizationResult(args, tuple(actions), tuple(dropped))
-
-    def _normalize_aliases(
-        self,
+    def _normalize_resource_projection(
         args: dict[str, Any],
+        tool_name: str,
         actions: list[str],
         dropped_fields: list[str],
     ) -> None:
-        for alias, canonical in INCIDENT_COMPATIBILITY_ALIASES.items():
-            if alias not in args:
-                continue
-            alias_value = args.pop(alias)
-            if canonical not in args or args[canonical] is None:
-                args[canonical] = alias_value
-                actions.append(f"{alias}->{canonical}")
-            else:
-                dropped_fields.append(alias)
-                actions.append(f"{alias}:dropped_canonical_present")
+        """Resolve a provider request for two mutually exclusive views.
+
+        ``GetResources`` exposes either label columns or wide placement
+        columns.  Providers occasionally set both optional flags while
+        asking for a broad inventory.  Keep the broad ``output_wide`` view
+        and drop the conflicting optional projection; a later targeted
+        action may request labels explicitly.  This is transport
+        normalization only and never fabricates an observation.
+        """
+        if (
+            tool_name == "get_resources"
+            and args.get("show_labels") is True
+            and args.get("output_wide") is True
+        ):
+            args.pop("show_labels", None)
+            actions.append("get_resources:show_labels_dropped_conflicting_with_output_wide")
+            dropped_fields.append("show_labels")
 
     @staticmethod
     def _normalize_finalize_projection(
@@ -160,8 +136,9 @@ class IncidentLLMOutputNormalizer:
         actions: list[str],
     ) -> None:
         # ``evidence_ids`` is an executable-tool projection.  Copying the
-        # already-present support list is transport compatibility, not a new
-        # diagnosis; the downstream min-length and known-ID checks still apply.
+        # The provider sometimes repeats the same support list under the
+        # executable field. Copying it is a transport projection, not a new
+        # diagnosis; downstream known-ID checks still apply.
         support_ids = args.get("supporting_evidence_ids")
         if (
             tool_name == "finalize_diagnosis"

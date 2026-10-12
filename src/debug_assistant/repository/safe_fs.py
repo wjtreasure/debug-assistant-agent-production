@@ -40,27 +40,25 @@ class SafeRepositoryFS:
             raise ValueError(f'file exceeds max_bytes={max_bytes}')
         return p.read_text(encoding='utf-8',errors='ignore')
 
-    def iter_files(self, *, suffixes: set[str] | None=None, max_file_bytes: int | None=None) -> Iterator[SafeFile]:
+    def iter_files(self, *, path: str | Path='.', suffixes: set[str] | None=None, max_file_bytes: int | None=None) -> Iterator[SafeFile]:
         suffixes=suffixes or TEXT_SUFFIXES
         # os.walk does not follow directory symlinks by default. Individual file
         # symlinks are resolved and boundary-checked before yielding.
         import os
-        for cur, dirs, files in os.walk(self.root, followlinks=False):
+        for cur, dirs, files in os.walk(self.resolve(path), followlinks=False):
             dirs[:]=[d for d in dirs if d not in IGNORED]
             for name in files:
                 raw=Path(cur)/name
                 if any(x in IGNORED for x in raw.parts) or raw.suffix.lower() not in suffixes:
                     continue
                 try:
-                    resolved=raw.resolve()
-                    if resolved != self.root and self.root not in resolved.parents:
-                        continue
+                    resolved=self.resolve(raw)
                     if not resolved.is_file():
                         continue
                     if max_file_bytes is not None and resolved.stat().st_size > max_file_bytes:
                         continue
                     yield SafeFile(resolved, str(raw.relative_to(self.root)).replace('\\','/'))
-                except (OSError,ValueError):
+                except (OSError,ValueError,RuntimeError):
                     continue
     def iter_directories(self) -> Iterator[str]:
         """Yield safe repository-relative directory paths from the same boundary.
@@ -83,4 +81,3 @@ class SafeRepositoryFS:
                     yield str(raw.relative_to(self.root)).replace('\\','/')
                 except (OSError,ValueError):
                     continue
-

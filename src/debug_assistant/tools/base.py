@@ -19,6 +19,7 @@ class ToolSpec:
     side_effect: str = "none"
     output_limit: int | None = None
     parallel_safe: bool = False
+    companion_tools: tuple[str, ...] = ()
 
     def json_schema(self) -> dict[str, Any]:
         return self.args_model.model_json_schema()
@@ -34,5 +35,9 @@ class ToolSpec:
 
 class Tool:
     spec: ToolSpec
+    def provenance_categories(self) -> dict[str, tuple[str, ...]]:
+        """Declared output vocabulary; never Evidence or qualification."""
+        return {}
+
     def execute(self, **kwargs: Any) -> ToolObservation:
         raise NotImplementedError

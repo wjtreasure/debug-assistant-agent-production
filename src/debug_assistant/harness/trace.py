@@ -5,6 +5,7 @@ import json, time, uuid
 
 from debug_assistant.security.redaction import redact_sensitive
 
+TRACE_SCHEMA_VERSION = "2.6"
 
 class TraceRecorder:
     def __init__(self, trace_dir: str, task_id: str):
@@ -16,7 +17,7 @@ class TraceRecorder:
         if is_dataclass(payload): payload=asdict(payload)
         payload=redact_sensitive(payload)
         self.seq+=1
-        row={"schema_version":"2.6","seq":self.seq,"ts":time.time(),"run_id":self.run_id,"type":event_type,"payload":payload}
+        row={"schema_version":TRACE_SCHEMA_VERSION,"seq":self.seq,"ts":time.time(),"run_id":self.run_id,"type":event_type,"payload":payload}
         with self.path.open('a',encoding='utf-8') as f:
             f.write(json.dumps(row,ensure_ascii=False,default=str)+'\n')
 

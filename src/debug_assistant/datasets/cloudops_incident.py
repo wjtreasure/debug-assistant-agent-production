@@ -35,5 +35,13 @@ class CloudOpsRuntimeCaseLoader:
         cache = json.loads((root / "tool_cache.json").read_text(encoding="utf-8"))
         _assert_runtime_safe(raw)
         _assert_runtime_safe(cache)
+        # The source workspace is an immutable runtime capability, not Gold.
+        # Older locally materialized case.json files predate the capability
+        # field; derive it from the bound workspace so code tools are not
+        # incorrectly marked unavailable.
+        evidence_sources = list(raw.get("evidence_sources") or ())
+        code_root = root / "code"
+        if code_root.is_dir() and any(code_root.rglob("*")) and "application_code" not in evidence_sources:
+            evidence_sources.append("application_code")
+            raw = {**raw, "evidence_sources": evidence_sources}
         return IncidentCase.model_validate({**raw, "runtime_data_dir": str(root)})
-

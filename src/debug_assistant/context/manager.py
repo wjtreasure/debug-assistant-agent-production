@@ -1,7 +1,13 @@
 from __future__ import annotations
 import re
-from debug_assistant.context.models import ContextItem, ContextBuildResult, ContextProjection
-from debug_assistant.context.indexes import DisplayCoverageIndex, KnownContextIndex, merge_ranges
+import json
+import hashlib
+from debug_assistant.context.models import (
+    ContextItem, ContextBuildResult, ContextProjection, PromptSnapshot, ContextView,
+)
+from debug_assistant.context.indexes import (DisplayCoverageIndex, KnownContextIndex, merge_ranges,
+                                            retained_source_lines)
+from debug_assistant.context.requests import ContextRequest, ContextRequestBatch, ContextResolutionError, LineRange, LocalResolutionFeedback
 from debug_assistant.context.packing import line_safe_truncate
 from debug_assistant.context.projection import CodeProjectionPolicy
 from debug_assistant.context.task_projection import project_verification_tasks
@@ -57,7 +63,17 @@ class ContextManager:
         self._projection_total=0
 
     def rehydrate(self, observation_id: str, *, path: str|None=None, start_line:int|None=None,
-                  end_line:int|None=None, information_need:str="") -> None:
+                  end_line:int|None=None, information_need:str="", observation_store=None) -> str:
+        """Queue an immutable Observation projection and report the request state.
+
+        ``REQUESTED`` means the next build may re-project the Observation;
+        ``NOT_FOUND`` and ``DENIED`` are explicit fail-closed outcomes. The
+        active Runtime passes the immutable ObservationStore when available.
+        """
+        if not str(observation_id or "").strip() or not self.enable_projection:
+            return "DENIED"
+        if observation_store is not None and observation_store.get(observation_id) is None:
+            return "NOT_FOUND"
         if path and isinstance(start_line,int) and isinstance(end_line,int):
             reqs=self._rehydrate_requests.setdefault(observation_id,[])
             reqs.append((start_line,end_line,information_need))
@@ -66,12 +82,182 @@ class ContextManager:
             self._rehydrate_requests[observation_id]=[(a,b,information_need) for a,b in merged]
         else:
             self._rehydrate_requests.setdefault(observation_id,[])
+        return "REQUESTED"
 
     def is_visible(self, context_id: str) -> bool:
         return context_id in self._last_selected_ids
 
+    def rehydrate_evidence(self, evidence_id: str, *, evidence_memory, observation_store,
+                           start_line: int | None = None, end_line: int | None = None) -> str:
+        """Resolve exact canonical provenance into the existing bounded projector."""
+        evidence = evidence_memory.get(evidence_id)
+        if evidence is None:
+            return "NOT_FOUND"
+        return self.rehydrate(evidence.raw_observation_id, path=evidence.file,
+                              start_line=start_line, end_line=end_line,
+                              observation_store=observation_store)
+
     def is_visible_range(self, path:str,start_line:int,end_line:int) -> bool:
         return self.display_coverage.covers(path,start_line,end_line)
+
+    def _local_target(self, request, memory, observation_store):
+        observation_id = request.observation_id
+        if request.evidence_ref is not None:
+            evidence = memory.get(request.evidence_ref)
+            if evidence is None:
+                raise ContextResolutionError('context_unknown_evidence_ref')
+            observation_id = evidence.raw_observation_id
+            observation = observation_store.get(observation_id) if observation_id else None
+            provenance = evidence.provenance or {}
+            if (observation is None or evidence.source != observation.tool
+                    or provenance.get('observation_id', observation_id) != observation_id
+                    or any(provenance[key] != (observation.metadata or {}).get(key)
+                           for key in ('path', 'start_line', 'end_line', 'context_kind', 'information_source')
+                           if key in provenance)
+                    or evidence.file is not None and evidence.file != (observation.metadata or {}).get('path')):
+                raise ContextResolutionError('context_provenance_invalid')
+        else:
+            observation = observation_store.get(observation_id)
+            if observation is None:
+                raise ContextResolutionError('context_unknown_observation_id')
+        return observation
+
+    @staticmethod
+    def _local_content(observation, selector):
+        if selector.kind == 'FIELD_PATH':
+            # ToolObservation has canonical text + metadata, no structured body
+            # field. Do not parse display JSON/YAML into a second payload model.
+            raise ContextResolutionError('context_selector_unsupported')
+        if not observation.content:
+            raise ContextResolutionError('context_content_not_retained')
+        source = observation.tool in {'read_file', 'get_source_code'}
+        lines = retained_source_lines(observation) if source else list(enumerate(observation.content.splitlines(), 1))
+        if source and not lines:
+            raise ContextResolutionError('context_content_not_retained')
+        if selector.kind == 'FULL_STORED_BODY':
+            return ('\n'.join(text for _, text in lines) if source else observation.content), [(lines[0][0], lines[-1][0])]
+        chosen = [(number, text) for number, text in lines if selector.start_line <= number <= selector.end_line]
+        if len(chosen) != selector.end_line - selector.start_line + 1:
+            raise ContextResolutionError('context_content_not_retained')
+        return '\n'.join(text for _, text in chosen), [(selector.start_line, selector.end_line)]
+
+    @staticmethod
+    def _request_visible(view, observation_id, selector, ranges):
+        coverage = json.loads(view.body_coverage_json).get(observation_id, {})
+        if selector.kind == 'FULL_STORED_BODY':
+            return bool(coverage.get('full'))
+        return all(any(a <= start and b >= end for a, b in coverage.get('ranges', ()))
+                   for start, end in ranges)
+
+    def retained_local_requests(self, view, memory, observation_store):
+        """Carry bounded visible selections, never bodies or visibility claims."""
+        requests = {}
+        for receipt in view.reference_metadata.get('resolved_local_requests', ()):
+            request = ContextRequest.model_validate(receipt)
+            observation = self._local_target(request, memory, observation_store)
+            _, ranges = self._local_content(observation, request.selector)
+            if self._request_visible(view, observation.observation_id, request.selector, ranges):
+                requests.setdefault(observation.observation_id, []).append(request.selector)
+        # The existing per-batch reference bound also bounds carried selections.
+        return {key: requests[key] for key in list(requests)[-8:]}
+
+    @staticmethod
+    def _body_wrapper(item, body, projection_id):
+        if item.source_kind == 'evidence':
+            return (f"EVIDENCE {item.context_id} projection={projection_id}\n"
+                    f"observation_ref={item.raw_observation_id}\n{item.compact_content}\n{body}\nEND EVIDENCE {item.context_id}")
+        return ("TOOL_RESULT (not Evidence; do not cite)\n"
+                f"observation_ref={item.raw_observation_id}\n{item.compact_content}\n{body}\nEND TOOL_RESULT")
+
+    def resolve_context_requests(self, batch: ContextRequestBatch, *, view, state, memory,
+                                 observation_store, build_kwargs):
+        """Validate/extract locally, use the sole packer, then prove display.
+
+        Requests are transient build inputs, never a body cache or store write.
+        Any partial packing failure is an insufficiency, not recovery success.
+        """
+        # Detached selector receipts belong to this role view only. Preserve
+        # successful recovery in the same logical turn; a fresh build expires
+        # them. Immutable stores remain the only body sources.
+        requests = {}
+        targets = []
+        for receipt in view.reference_metadata.get('resolved_local_requests', ()):
+            previous = ContextRequest.model_validate(receipt)
+            observation = self._local_target(previous, memory, observation_store)
+            _, ranges = self._local_content(observation, previous.selector)
+            requests.setdefault(observation.observation_id, []).append(previous.selector)
+            targets.append((observation.observation_id, previous.selector, ranges))
+        all_visible = True
+        for request in batch.requests:
+            observation = self._local_target(request, memory, observation_store)
+            _, ranges = self._local_content(observation, request.selector)
+            targets.append((observation.observation_id, request.selector, ranges))
+            all_visible &= self._request_visible(view, observation.observation_id, request.selector, ranges)
+            requests.setdefault(observation.observation_id, []).append(request.selector)
+        if all_visible:
+            raise ContextResolutionError('context_already_visible')
+        result = self.build(state, memory, observation_store, local_requests=requests,
+                            **{key: value for key, value in build_kwargs.items() if key != 'local_requests'})
+        if not all(self._request_visible(result.context_view, oid, selector, ranges)
+                   for oid, selector, ranges in targets):
+            catalog = {row['observation_id']: row for row in result.context_view.reference_metadata['local_context_references']}
+            feedback_rows = []
+            for oid, selector, _ in targets:
+                observation = observation_store.get(oid)
+                row = catalog.get(oid)
+                if row is None:
+                    lines = (retained_source_lines(observation) if observation.tool in {'read_file', 'get_source_code'}
+                             else list(enumerate(observation.content.splitlines(), 1)))
+                    # A bounded catalog may omit the target. Still report canonical
+                    # size/ranges; zero is a safe lower capacity bound, not a fit claim.
+                    row = {'content_sha256': hashlib.sha256(observation.content.encode()).hexdigest(),
+                           'tool': observation.tool, 'path': (observation.metadata or {}).get('path'),
+                           'content_kind': (observation.metadata or {}).get('context_kind', 'TEXT'),
+                           'retained_lines': [lines[0][0], lines[-1][0]],
+                           'retrievable_capacity_chars': 0, 'capacity_basis': 'catalog_omitted_conservative_bound',
+                           'chunks': [{'start_line': lines[0][0], 'end_line': lines[0][0],
+                                       'normalized_chars': len(lines[0][1]), 'fits': False}]}
+                feedback_rows.append({'observation_id': oid, **row, 'selector': selector.model_dump(mode='json'),
+                    'requested_normalized_chars': len(self._local_content(observation, selector)[0])})
+            feedback = LocalResolutionFeedback(reason='context_packing_insufficient', requests=tuple(feedback_rows))
+            raise ContextResolutionError('context_packing_insufficient', feedback=feedback.model_dump(mode='json'))
+        return result
+
+    @staticmethod
+    def legal_recovery_choices(view):
+        """Detached, owner-derived selectors; never infer retention from a ref."""
+        coverage = json.loads(view.body_coverage_json)
+        result = {}
+        for row in view.reference_metadata.get('local_context_references', ()):
+            oid = row['observation_id']
+            displayed = coverage.get(oid, {})
+            if displayed.get('full'):
+                continue
+            selectors = []
+            # A partial body requests only missing lines, never the full body.
+            if not displayed.get('ranges') and row.get('full_body_fits'):
+                selectors.append({'kind': 'FULL_STORED_BODY'})
+            for chunk in row.get('chunks', ()):
+                if not chunk.get('fits'):
+                    continue
+                missing = [(chunk['start_line'], chunk['end_line'])]
+                for a, b in displayed.get('ranges', ()):
+                    missing = [(x, y) for start, end in missing for x, y in
+                               ((start, min(end, a-1)), (max(start, b+1), end)) if x <= y]
+                selectors.extend({'kind': 'LINE_RANGE', 'start_line': a, 'end_line': b}
+                                 for a, b in missing)
+            if selectors:
+                result[oid] = selectors
+        return result
+
+    def has_local_recovery(self, view, observation_store):
+        """Availability only; Runtime never selects a target or selector."""
+        coverage = json.loads(view.body_coverage_json)
+        return any(observation.content
+                   and not coverage.get(observation.observation_id, {}).get('full')
+                   and (observation.tool not in {'read_file', 'get_source_code'}
+                        or retained_source_lines(observation))
+                   for observation in observation_store.all())
 
     def _recent_observation_ids(self, observation_store) -> set[str]:
         """Apply the one shared recency window before relevance/lifecycle ranking."""
@@ -124,12 +310,13 @@ class ContextManager:
                            ev.raw_observation_id,{"selection_reason":reason},lifecycle,pinned,
                            step if lifecycle=='active' else 0, level)
 
-    def catalog(self, state, memory, observation_store) -> list[ContextItem]:
+    def catalog(self, state, memory, observation_store, *, semantic_projection=None, local_ids=()) -> list[ContextItem]:
         # Rebuild before item rendering so search observations can be superseded at hit/range level.
         self.known_index.rebuild(observation_store)
         items=[]
         latest=state.observations[-1].observation_id if state.observations else None
-        hyp=state.current_hypothesis or {}
+        hyp=(semantic_projection or {}).get("active_hypothesis") or {}
+        hyp=hyp or {}
         support=set(hyp.get('supporting_evidence_ids') or [])
         contradict=set(hyp.get('contradicting_evidence_ids') or [])
         recent_ids=self._recent_observation_ids(observation_store)
@@ -142,7 +329,7 @@ class ContextManager:
         relevance_terms=_terms(hyp)
         represented_evidence_ids=set()
 
-        for obs in observation_store.all():
+        for obs in sorted(observation_store.all(), key=lambda item: item.observation_id not in local_ids):
             ev=memory.evidence_for_observation(obs.observation_id)
             evidence_id=ev.evidence_id if ev is not None else None
             if evidence_id is not None and evidence_id in represented_evidence_ids:
@@ -260,23 +447,25 @@ class ContextManager:
               max_context_tokens: int | None = None, token_estimator=None,
               max_steps=None, max_tool_calls=None, requested_ids=None,
               include_agent_control_state: bool=True,
-              external_context_chars: int=0, pressure_state: str = "NORMAL",
-              verification_dag_state=None) -> ContextBuildResult:
-        if external_context_chars < 0:
-            raise ValueError("external_context_chars must be non-negative")
+              pressure_state: str = "NORMAL",
+              verification_dag_state=None, rca_state=None, role="interpretation",
+              evidence_references=(), request_renderer=None, max_request_chars=None,
+              local_requests=None, reference_ids=()) -> ContextBuildResult:
         if max_context_chars is None and max_context_tokens is None:
             raise ValueError("one of max_context_chars or max_context_tokens is required")
         estimator = token_estimator or estimate_tokens_char4
         total_token_budget = max(1, int(max_context_tokens)) if max_context_tokens is not None else None
-        external_tokens = max(0, int(estimator("x" * external_context_chars)))
-        if total_token_budget is not None:
-            diagnostic_token_budget = max(0, total_token_budget - external_tokens)
-            diagnostic_budget = diagnostic_token_budget * 4
-            budget_chars = diagnostic_budget + external_context_chars
-        else:
-            budget_chars = int(max_context_chars)
-            diagnostic_budget=max(0,budget_chars-external_context_chars)
-            diagnostic_token_budget = None
+        diagnostic_token_budget = total_token_budget
+        budget_chars = (total_token_budget * 4 if total_token_budget is not None else int(max_context_chars))
+        diagnostic_budget = budget_chars
+        semantic_projection = None
+        if rca_state is not None:
+            projector = getattr(rca_state, "context_projection", None)
+            if not callable(projector):
+                raise TypeError("rca_state must expose context_projection()")
+            semantic_projection = projector()
+            if verification_dag_state is None:
+                verification_dag_state = semantic_projection
         task_context = project_verification_tasks(
             verification_dag_state,
             max_chars=getattr(self.cfg, 'known_index_max_chars', 3_500),
@@ -289,7 +478,8 @@ class ContextManager:
         # hypothesis support, re-project its immutable raw source range instead of letting the
         # model infer that unseen tail lines were never read. This is still bounded by the
         # normal context packer and never performs repository I/O.
-        hyp0=state.current_hypothesis or {}
+        hyp0=(semantic_projection or {}).get("active_hypothesis") or {}
+        hyp0=hyp0 or {}
         support0=set(hyp0.get('supporting_evidence_ids') or [])
         source_projection_ids = support0 | set(task_context.linked_evidence_ids)
         if (self.enable_projection and source_projection_ids
@@ -305,7 +495,14 @@ class ContextManager:
                                        if ev.evidence_id in task_context.linked_evidence_ids
                                        else 'hypothesis_support_projection'
                                    ))
-        items=self.catalog(state,memory,observation_store)
+        local_requests = local_requests or {}
+        items=self.catalog(
+            state, memory, observation_store,
+            semantic_projection=semantic_projection, local_ids=local_requests,
+        )
+        for item in items:
+            if item.raw_observation_id in local_requests:
+                item.priority, item.lifecycle, item.pinned = 0, 'active', True
         by_id={x.context_id:x for x in items}
         invalid=[x for x in requested_ids if x not in by_id]
         requested={x for x in requested_ids if x in by_id}
@@ -317,14 +514,17 @@ class ContextManager:
             budget += [f"step={state.step}/{max_steps}",f"remaining_steps={max(0,max_steps-state.step)}"]
         if include_agent_control_state and max_tool_calls is not None:
             budget += [f"tool_calls={state.tool_calls}/{max_tool_calls}",f"remaining_tool_calls={max(0,max_tool_calls-state.tool_calls)}"]
-        hyp=state.current_hypothesis or {}
+        hyp=(semantic_projection or {}).get("active_hypothesis") or {}
+        hyp=hyp or {}
         if verification_dag_state is not None:
             # DAG task state owns the active verification question. Do not
-            # spend planner context on the legacy gap/obligation projections.
+            # spend planner context on duplicate gap projections.
             hyp = dict(hyp)
             for key in ("evidence_gap", "required_gaps", "verification_obligations"):
                 hyp.pop(key, None)
         state_summary = state.to_summary()
+        if semantic_projection is not None:
+            state_summary["current_hypothesis"] = semantic_projection.get("active_hypothesis") or {}
         if verification_dag_state is not None:
             summary_hypothesis = dict(state_summary.get("current_hypothesis") or {})
             for key in ("evidence_gap", "required_gaps", "verification_obligations"):
@@ -351,7 +551,7 @@ class ContextManager:
                 f"{read_ledger or '(none)'}"
             )
             known_section=("KNOWN_CONTEXT_INDEX (diagnostic pointers; content may be cold):\n"
-                           f"{known}\nOnly ev-* identifiers are citable. Raw observations remain internal and can be rehydrated by the Harness.\n")
+                           f"{known}\nOnly ev-* identifiers are citable. Use CONTEXT_REQUEST to recover retained local bodies; raw references are citable only after display.\n")
             known_section += read_ledger_section
         else:
             known=self.known_context_text(observation_store)
@@ -368,10 +568,8 @@ class ContextManager:
             known_section=("KNOWN_CONTEXT_INDEX (compact pointers; content may be cold):\n"
                            f"{known}\nEVIDENCE_CATALOG (only ev-* identifiers are citable):\n{evidence_catalog}"
                            f"{read_ledger_section}"
-                           "If details are needed from a known range, request read_file for the exact range; the Harness can rehydrate it without repository I/O.\n")
-        # Keep confirmed Evidence/index context ahead of routing metadata. The
-        # external control prefix already carries the stable hypothesis; task
-        # metadata is the compact active-question layer, not a replacement.
+                           "Request CONTEXT_REQUEST for retained local details; this is not read_file or external acquisition.\n")
+        # Keep Evidence/index context ahead of task scheduling metadata.
         verification_section=(task_context.text + "\n\n") if task_context.text else ""
         known_section=known_section + verification_section
         available=max(0,diagnostic_budget-len(fixed)-len(known_section)-self.cfg.safety_margin_chars)
@@ -423,13 +621,23 @@ class ContextManager:
             if x.raw_observation_id:
                 obs=obs_by_id.get(x.raw_observation_id)
                 projection=self._projection_for(obs,x,state.step) if obs is not None else None
+                if obs is not None and obs.observation_id in local_requests:
+                    selectors = local_requests[obs.observation_id]
+                    full = next((selector for selector in selectors if selector.kind == 'FULL_STORED_BODY'), None)
+                    parts = [self._local_content(obs, selector)[0] for selector in ([full] if full else selectors)]
+                    # Range batches coalesce without rendering the same line twice.
+                    if full is None:
+                        ranges = merge_ranges([(selector.start_line, selector.end_line) for selector in selectors])
+                        parts = [self._local_content(obs, LineRange(kind='LINE_RANGE', start_line=a, end_line=b))[0]
+                                 for a, b in ranges]
+                    projection = ContextProjection('local-' + obs.observation_id, obs.observation_id,
+                        (obs.metadata or {}).get('path') if obs.tool in {'read_file', 'get_source_code'} else None,
+                        None, None, None, None, '\n'.join(parts), 0, 'active', True,
+                        state.step, 'rehydrated_local_context')
+                    if full is not None and obs.tool in {'read_file', 'get_source_code'}:
+                        projection.content = '\n'.join(text for _, text in retained_source_lines(obs))
                 body=projection.content if projection is not None else x.full_content
-                if x.source_kind == 'evidence':
-                    content=(f"EVIDENCE {x.context_id} projection={projection.projection_id if projection else 'none'}\n"
-                             f"{x.compact_content}\n{body}\nEND EVIDENCE {x.context_id}")
-                else:
-                    content=("TOOL_RESULT (not Evidence; do not cite)\n"
-                             f"{x.compact_content}\n{body}\nEND TOOL_RESULT")
+                content = self._body_wrapper(x, body, projection.projection_id if projection else "none")
             else:
                 content=x.compact_content + (f"\n{x.full_content}" if x.full_content else '')
             size=len(content)+2
@@ -445,7 +653,8 @@ class ContextManager:
             rendered.append(content)
             meta={'id':x.context_id,'reason':('model_requested' if x.context_id in requested else x.metadata.get('selection_reason','priority')),
                   'chars':len(content),'kind':x.source_kind,'lifecycle':'active','pinned':x.pinned,
-                  'citable':x.source_kind == 'evidence','context_level':x.context_level}
+                  'citable':x.source_kind == 'evidence','context_level':x.context_level,
+                  'body_chars':len(projection.content if projection else x.full_content)}
             if x.raw_observation_id:
                 meta['provenance_observation_id']=x.raw_observation_id
             if projection:
@@ -465,12 +674,12 @@ class ContextManager:
                 fixed=fixed.replace(issue,issue2,1)
                 text=f"{fixed}{known_section}\nWORKING_CONTEXT:\n{working}"
         scaffolding=f"\nWORKING_CONTEXT:\n{working}"
-        # Character packing is the compatibility fast path.  A physical model
+        # Character packing is the deterministic budget path. A physical model
         # capability is authoritative, so apply the token bound after the full
         # diagnostic text has been rendered as well.
         if diagnostic_token_budget is not None:
             def total_tokens(value: str) -> int:
-                return max(0, int(estimator(value))) + external_tokens
+                return max(0, int(estimator(value)))
             while selected_meta and total_tokens(text) > total_token_budget:
                 removable = next(
                     (index for index in range(len(selected_meta) - 1, -1, -1)
@@ -521,43 +730,246 @@ class ContextManager:
         )
         if verification_task_context_fail_closed:
             # A critical graph-state omission must be visible to the caller;
-            # never let a budget cut look like a valid context projection.
+            # never let a budget cut look like a valid context projection.  Do
+            # not erase selected Evidence: canonical scheduling metadata is
+            # supplied separately in the role envelope.
             marker = (
                 "VERIFICATION_TASK_CONTEXT_UNAVAILABLE: graph task state exceeded the "
                 "context budget; do not finalize until Runtime reprojections succeed."
             )
-            text = marker[:diagnostic_budget] if diagnostic_budget else ""
+            known_section = f"{marker}\n\n{known_section}"
+            text = f"{fixed}{known_section}{scaffolding}"
             control_state_truncated = True
         if len(text)>diagnostic_budget:
-            # This can occur only when external/control state consumes almost the
-            # entire global budget. Source projections were already dropped whole;
+            # This can occur when manager scaffolding consumes the budget.
+            # Source projections were already dropped whole;
             # compact the manager-owned control scaffold without slicing Evidence.
             fixed_allow=max(0,diagnostic_budget-len(scaffolding))
             fixed,control_state_truncated=line_safe_truncate(fixed,fixed_allow)
             text=f"{fixed}{scaffolding}"
         if len(text)>diagnostic_budget:
-            text="(diagnostic context omitted: global budget reserved for agent control)"[:diagnostic_budget]
+            text="(diagnostic context omitted: packing budget exhausted)"[:diagnostic_budget]
             control_state_truncated=True
+            selected_meta.clear()
+            rendered.clear()
 
-        # HARD REQUIREMENT: update display coverage only after final render/drop decisions.
+        retained_ranges = []
+        local_references = []
+        for obs in sorted(observation_store.all(), key=lambda item: item.observation_id not in reference_ids):
+            source_lines = retained_source_lines(obs)
+            path = (obs.metadata or {}).get('path')
+            if source_lines and path:
+                retained_ranges.append((path, source_lines[0][0], source_lines[-1][0]))
+            lines = source_lines or (list(enumerate(obs.content.splitlines(), 1))
+                                     if obs.tool not in {'read_file', 'get_source_code'} else [])
+            normalized = '\n'.join(text for _, text in lines) if source_lines else obs.content
+            row = {'observation_id': obs.observation_id, 'tool': obs.tool,
+                   'path': path, 'content_kind': (obs.metadata or {}).get('context_kind', 'TEXT'),
+                   'content_sha256': hashlib.sha256(obs.content.encode()).hexdigest(),
+                   'retained_lines': [lines[0][0], lines[-1][0]] if lines else None,
+                   'retained_normalized_chars': len(normalized),
+                   'selector_applicability': ['FULL_STORED_BODY', 'LINE_RANGE'] if lines else [],
+                   'retrievable_capacity_chars': 999999999999999999,
+                   'capacity_basis': 'conservative_real_wrapper_renderer_with_pinned_bodies',
+                   'full_body_fits': False, 'chunks': []}
+            # Navigation only: consecutive retained lines, at most eight choices.
+            # Size each candidate conservatively before the exact renderer check.
+            chunk_limit = max(1, min(100, len(lines)))
+            start = 0
+            while start < len(lines) and len(row['chunks']) < 8:
+                end = start
+                size = 0
+                while end < len(lines) and end-start < chunk_limit:
+                    addition = len(lines[end][1]) + bool(end-start)
+                    if size + addition > max(1, available // 3):
+                        break
+                    size += addition
+                    end += 1
+                if end == start:
+                    end += 1
+                    size = len(lines[start][1])
+                row['chunks'].append({'start_line': lines[start][0], 'end_line': lines[end-1][0],
+                                      'normalized_chars': size, 'fits': False})
+                start = end
+            evidence = memory.evidence_for_observation(obs.observation_id)
+            if evidence is not None:
+                row['evidence_ref'] = evidence.evidence_id
+            if len(json.dumps(local_references + [row])) <= self.cfg.known_index_max_chars:
+                local_references.append(row)
+        body_coverage = {}
+
+        # The role renderer serializes this same view in the real request envelope.
+        # Account for JSON escaping and reference metadata, not a retired control prefix.
+        def observation_references():
+            rows = []
+            for meta in selected_meta:
+                observation = obs_by_id.get(meta.get('provenance_observation_id'))
+                if observation is not None and meta.get('body_chars'):
+                    metadata = _model_metadata(dict(observation.metadata or {}))
+                    rows.append({'observation_id': observation.observation_id,
+                                 'tool': observation.tool, 'ok': observation.ok, 'metadata': metadata,
+                                 'hypothesis_scopes': metadata.get('acquisition_hypothesis_scopes', ())})
+            return rows
+
+        def role_view(body, *, ranges=(), acquired=(), display=None):
+            observations = observation_references()
+            bodies = tuple(meta['id'] for meta in selected_meta if meta.get('citable') and meta.get('body_chars'))
+            references = list(evidence_references)
+            known = {row['evidence_ref'] for row in references}
+            for evidence_id in bodies:
+                if evidence_id not in known:
+                    evidence = memory.get(evidence_id)
+                    if evidence is not None:
+                        references.append({'evidence_ref': evidence_id, 'claim': evidence.summary[:500],
+                            'source': evidence.source, 'kind': evidence.kind,
+                            'observation_refs': [evidence.raw_observation_id] if evidence.raw_observation_id else [],
+                            'relations': []})
+            refs = tuple(row['evidence_ref'] for row in references)
+            return ContextView(role, body, tuple(row['observation_id'] for row in observations),
+                refs, bodies, acquired, ranges,
+                json.dumps({'visible_observations': observations,
+                            'existing_evidence': references,
+                            'local_context_references': local_references,
+                            'resolved_local_requests': [
+                                {'observation_id': oid, 'selector': selector.model_dump(mode='json')}
+                                for oid, selectors in local_requests.items() for selector in selectors
+                                if display is None or (
+                                    body_coverage.get(oid, {}).get('full') if selector.kind == 'FULL_STORED_BODY'
+                                    else any(a <= selector.start_line and b >= selector.end_line
+                                             for a, b in body_coverage.get(oid, {}).get('ranges', ())))]}, ensure_ascii=False, sort_keys=True),
+                json.dumps(display or {}, sort_keys=True),
+                tuple(retained_ranges), json.dumps(body_coverage if display is not None else {}, sort_keys=True))
+
+        # Dry rendering never changes stores, canonical state or published coverage.
+        # Preserve pinned bodies, discard optional bodies; six-character escaping
+        # is the worst JSON serialization cost for one text character.
+        original_meta = selected_meta
+        feasibility_checks = []
+        for row in local_references:
+            obs = obs_by_id[row['observation_id']]
+            item = next((item for item in items if item.raw_observation_id == obs.observation_id), None)
+            if item is None:
+                row['retrievable_capacity_chars'] = 0
+                continue
+            pinned = [(meta, body) for meta, body in zip(original_meta, rendered)
+                      if (meta.get('pinned') or meta['id'] in requested)
+                      and meta.get('provenance_observation_id') != obs.observation_id]
+            overhead = self._body_wrapper(item, '', 'local-' + obs.observation_id)
+            upper = max(0, available - sum(len(body)+2 for _, body in pinned) - len(overhead)-2)
+            def fits_body(body, item=item, obs=obs, pinned=pinned, upper=upper):
+                nonlocal selected_meta
+                content = self._body_wrapper(item, body, 'local-' + obs.observation_id)
+                candidate = '\n\n'.join([part for _, part in pinned] + [content])
+                candidate_text = f"{fixed}{known_section}\nWORKING_CONTEXT:\n{candidate}"
+                if len(candidate_text) > diagnostic_budget or len(body) > upper:
+                    return False
+                selected_meta = [meta for meta, _ in pinned] + [{
+                    'id': item.context_id, 'citable': item.source_kind == 'evidence',
+                    'body_chars': len(body), 'provenance_observation_id': obs.observation_id}]
+                try:
+                    system, user = request_renderer(role_view(candidate_text)) if request_renderer else ('', candidate_text)
+                    return (int(estimator(system + "\n\n" + user)) <= total_token_budget
+                            if total_token_budget is not None else max_request_chars is None
+                            or len(system + "\n\n" + user) <= max_request_chars)
+                finally:
+                    selected_meta = original_meta
+            low, high = 0, upper
+            while low < high:
+                middle = (low+high+1)//2
+                if fits_body('\x00'*middle):
+                    low = middle
+                else:
+                    high = middle-1
+            row['retrievable_capacity_chars'] = low
+            # Actual selector feasibility uses actual content, including escaping.
+            lines = retained_source_lines(obs) if obs.tool in {'read_file', 'get_source_code'} else list(enumerate(obs.content.splitlines(), 1))
+            row['full_body_fits'] = bool(lines) and fits_body(
+                '\n'.join(value for _, value in lines) if obs.tool in {'read_file', 'get_source_code'} else obs.content)
+            chunk_bodies = ['\n'.join(value for number, value in lines
+                if chunk['start_line'] <= number <= chunk['end_line']) for chunk in row['chunks']]
+            for chunk, body in zip(row['chunks'], chunk_bodies):
+                chunk['fits'] = fits_body(body)
+            feasibility_checks.append((row, fits_body,
+                '\n'.join(value for _, value in lines) if obs.tool in {'read_file', 'get_source_code'} else obs.content,
+                chunk_bodies))
+
+        # Fit flags themselves change the dynamic decision schema. Publish only
+        # a stable, conservative catalog, never a fit measured against an earlier
+        # smaller surface. Clearing choices is monotone and finitely bounded.
+        changed = True
+        while changed:
+            changed = False
+            for row, fits_body, full_body, chunk_bodies in feasibility_checks:
+                if row['full_body_fits'] and not fits_body(full_body):
+                    row['full_body_fits'] = False
+                    changed = True
+                for chunk, body in zip(row['chunks'], chunk_bodies):
+                    if chunk['fits'] and not fits_body(body):
+                        chunk['fits'] = False
+                        changed = True
+        for row, fits_body, _, _ in feasibility_checks:
+            low, high = 0, row['retrievable_capacity_chars']
+            while low < high:
+                middle = (low + high + 1) // 2
+                if fits_body('\x00' * middle):
+                    low = middle
+                else:
+                    high = middle - 1
+            row['retrievable_capacity_chars'] = low
+
+        if request_renderer is not None:
+            while True:
+                system, user = request_renderer(role_view(text))
+                fits = (int(estimator(system + "\n\n" + user)) <= total_token_budget
+                        if total_token_budget is not None else (max_request_chars is None
+                        or len(system + "\n\n" + user) <= max_request_chars))
+                if fits or not selected_meta:
+                    break
+                index = next((i for i in range(len(selected_meta)-1, -1, -1)
+                              if not selected_meta[i].get('pinned')
+                              and selected_meta[i]['id'] not in requested), len(selected_meta)-1)
+                removed = selected_meta.pop(index)
+                rendered.pop(index)
+                dropped.append({'id': removed['id'], 'reason': 'role_request_budget', 'chars': removed['chars']})
+                working = '\n\n'.join(rendered) or '(no active working context yet)'
+                # Metadata can be omitted without implying that its body was displayed.
+                text = f"{fixed}{known_section}\nWORKING_CONTEXT:\n{working}"
+            if not fits:
+                text = ""
+                selected_meta.clear()
+                rendered.clear()
+
+        # HARD REQUIREMENT: coverage is rebuilt after every final packing drop.
         self.display_coverage.clear()
         kept_projection_ids={m.get('projection_id') for m in selected_meta if m.get('projection_id')}
-        for p in projections:
-            if p.projection_id not in kept_projection_ids or not p.path: continue
-            # Parse exact numbered content; min/max metadata alone can hide gaps.
-            ranges=[]; current=[]; prev=None
-            for line in p.content.splitlines():
-                if '|' not in line: continue
-                head=line.split('|',1)[0].strip()
-                if not head.isdigit(): continue
-                n=int(head)
-                if prev is None or n==prev+1: current.append(n)
-                else:
-                    if current: ranges.append((current[0],current[-1]))
-                    current=[n]
-                prev=n
-            if current: ranges.append((current[0],current[-1]))
-            for a,b in ranges: self.display_coverage.add(p.path,a,b,p.projection_id)
+        body_coverage = {}
+        for meta in selected_meta:
+            obs = obs_by_id.get(meta.get('provenance_observation_id'))
+            if obs is None or not meta.get('body_chars'):
+                continue
+            projection = next((p for p in projections if p.projection_id == meta.get('projection_id')), None)
+            item = by_id[meta['id']]
+            body = projection.content if projection is not None else item.full_content
+            source_lines = retained_source_lines(obs)
+            full = body == obs.content or bool(source_lines and body == '\n'.join(text for _, text in source_lines))
+            if obs.tool in {'read_file', 'get_source_code'}:
+                retained = {number: text for number, text in source_lines}
+                # Match actual canonical line records, not incidental numbers in prose.
+                displayed = [number for number, record in retained.items() if record in body.splitlines()]
+                ranges = merge_ranges([(n, n) for n in displayed])
+                path = (obs.metadata or {}).get('path')
+                if path:
+                    for start, end in ranges:
+                        self.display_coverage.add(path, start, end, meta.get('projection_id', obs.observation_id))
+            elif full:
+                ranges = [(1, len(obs.content.splitlines()))]
+            elif obs.observation_id in local_requests:
+                ranges = merge_ranges([(selector.start_line, selector.end_line)
+                                       for selector in local_requests[obs.observation_id]
+                                       if selector.kind == 'LINE_RANGE'])
+            else:
+                ranges = []
+            body_coverage[obs.observation_id] = {'full': full, 'ranges': ranges}
 
         current_ids={m['id'] for m in selected_meta}
         evicted=len(self._last_active_ids-current_ids) if self._last_active_ids else len([d for d in dropped if d.get('reason')=='soft_eviction'])
@@ -567,12 +979,13 @@ class ContextManager:
         self._last_selected_ids=current_ids
         self._last_lifecycle={x.context_id:('active' if x.context_id in current_ids else 'cold') for x in items}
 
-        # Quality telemetry is intentionally separate from token reduction. A
-        # shorter context is not an improvement if critical Evidence or an
-        # open verification obligation disappears. The Runtime control prefix
-        # is counted as the authoritative external state when the manager is
-        # called in its split-control mode.
-        current_hypothesis = state.current_hypothesis or {}
+        # Role-envelope telemetry measures the same serialized request as packing.
+        provider_visible_text = text
+        if request_renderer is not None:
+            system, user = request_renderer(role_view(text))
+            provider_visible_text = system + "\n\n" + user
+        current_hypothesis=(semantic_projection or {}).get("active_hypothesis") or {}
+        current_hypothesis=current_hypothesis or {}
         critical_evidence_ids = set(current_hypothesis.get('supporting_evidence_ids') or [])
         critical_evidence_ids.update(current_hypothesis.get('contradicting_evidence_ids') or [])
         task_linked_evidence_ids = set(task_context.linked_evidence_ids)
@@ -583,8 +996,11 @@ class ContextManager:
         selected_evidence_ids = {
             str(item.get('id')) for item in selected_meta if item.get('citable')
         }
+        final_visible_evidence_ids = set(
+            re.findall(r"\bev-[0-9a-f]+\b", provider_visible_text)
+        )
         critical_retained = (
-            len(critical_evidence_ids.intersection(selected_evidence_ids))
+            len(critical_evidence_ids.intersection(final_visible_evidence_ids))
             / len(critical_evidence_ids)
             if critical_evidence_ids else 1.0
         )
@@ -598,16 +1014,12 @@ class ContextManager:
             if isinstance(item, dict) and item.get('status') == 'OPEN'
             and item.get('blocks_finalization')
         }
-        # In split-control mode these IDs are rendered by the external
-        # AGENT_CONTROL_STATE/PLANNER_STATE prefix, so retention is evaluated
-        # against the complete planner input rather than manager text alone.
-        planner_input_has_external_state = external_context_chars > 0 and not include_agent_control_state
         obligation_retention = (
-            sum(1 for oid in open_obligation_ids if oid in text or planner_input_has_external_state)
+            sum(1 for oid in open_obligation_ids if oid in provider_visible_text)
             / len(open_obligation_ids) if open_obligation_ids else 1.0
         )
         contradiction_retention = (
-            sum(1 for cid in blocking_contradiction_ids if cid in text or planner_input_has_external_state)
+            sum(1 for cid in blocking_contradiction_ids if cid in provider_visible_text)
             / len(blocking_contradiction_ids) if blocking_contradiction_ids else 1.0
         )
         task_linked_retention = (
@@ -638,8 +1050,8 @@ class ContextManager:
             'tool_result_chars':sum(m['chars'] for m in selected_meta if m.get('kind')=='tool_result'),
             'evidence_chars':sum(m['chars'] for m in selected_meta if m.get('kind')=='evidence'),
             'diagnostic_context_chars':len(text),
-            'external_context_chars':external_context_chars,
-            'total_context_chars':len(text)+external_context_chars,
+            'role_envelope_chars':max(0, len(provider_visible_text)-len(text)),
+            'total_context_chars':len(provider_visible_text),
             'selected_evidence_count':sum(1 for m in selected_meta if m.get('citable')),
             'dropped_evidence_count':sum(1 for d in dropped if d.get('kind')=='evidence'),
             'rehydrated_item_count':sum(
@@ -650,6 +1062,7 @@ class ContextManager:
             ),
             'manager_control_state_truncated':int(control_state_truncated),
             'critical_evidence_retention': critical_retained,
+            'final_prompt_visible_evidence_count': len(final_visible_evidence_ids),
             'open_obligation_retention': obligation_retention,
             'blocking_contradiction_retention': contradiction_retention,
             'verification_task_count': task_context.task_count,
@@ -674,18 +1087,45 @@ class ContextManager:
         diagnostic_tokens = max(0, int(estimator(text)))
         breakdown.update({
             'diagnostic_context_tokens': diagnostic_tokens,
-            'external_context_tokens': external_tokens,
-            'total_context_tokens': diagnostic_tokens + external_tokens,
+            'role_request_tokens': max(0, int(estimator(provider_visible_text))),
+            'total_context_tokens': max(0, int(estimator(provider_visible_text))),
             'budget_tokens': total_token_budget if total_token_budget is not None else 0,
         })
         display=self.display_coverage.export()
         projection_count=sum(1 for m in selected_meta if m.get('projection_id'))
+        acquired_ranges = set()
+        for observation in observation_store.all():
+            if observation.tool not in {'read_file', 'get_source_code'} or not observation.ok:
+                continue
+            metadata = observation.metadata or {}
+            path = str(metadata.get('path') or '').strip()
+            start = metadata.get('acquired_start_line', metadata.get('start_line'))
+            end = metadata.get('acquired_end_line', metadata.get('end_line'))
+            if path and isinstance(start, int) and isinstance(end, int):
+                acquired_ranges.add((path, start, end))
+        visible_ranges = tuple(
+            (path, int(start), int(end))
+            for path, ranges in sorted(display.items())
+            for start, end in ranges
+        )
+        context_view = role_view(text, ranges=visible_ranges, acquired=tuple(sorted(acquired_ranges)), display=display)
+        if request_renderer is not None:
+            system, user = request_renderer(context_view)
+            provider_visible_text = system + "\n\n" + user
+        prompt_snapshot = PromptSnapshot.from_render(
+            provider_visible_text,
+            token_count=estimator(provider_visible_text),
+            acquired_source_ranges=tuple(sorted(acquired_ranges)),
+            visible_source_ranges=visible_ranges,
+            context_view=context_view,
+        )
         self._rehydrate_requests.clear()
         return ContextBuildResult(
-            text, budget_chars, len(text) + external_context_chars, len(items),
+            text, budget_chars, len(text), len(items),
             len(selected_meta), selected_meta, dropped, invalid, breakdown,
             len(known_section), active_count, cold_count, evicted, projection_count,
-            display, total_token_budget, diagnostic_tokens + external_tokens,
+            display, total_token_budget, int(estimator(provider_visible_text)),
             getattr(getattr(self.cfg, "tokenizer", None), "name", "char4")
             if not callable(token_estimator) else "custom",
+            prompt_snapshot, context_view,
         )

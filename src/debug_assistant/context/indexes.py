@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from collections import defaultdict
 import re
 
-_LINE_RE = re.compile(r"^\s*(\d+)\s*\|")
+_LINE_RE = re.compile(r"^\s*(\d+)\s*(?:\||:)\s?")
 _GREP_RE = re.compile(r"(?P<path>[^\s:]+):(?P<line>\d+):")
 
 
@@ -60,9 +60,9 @@ class KnownContextIndex:
         self._ranges.clear(); self._grep_points.clear()
         for obs in observations.all():
             m=obs.metadata or {}
-            if obs.tool=='read_file':
-                p=m.get('path'); a=m.get('start_line'); b=m.get('end_line')
-                if p and isinstance(a,int) and isinstance(b,int): self._ranges[p].append((a,b))
+            if obs.tool in {'read_file', 'get_source_code'}:
+                p=m.get('path'); lines=retained_source_lines(obs)
+                if p and lines: self._ranges[p].append((lines[0][0], lines[-1][0]))
             elif obs.tool in {'grep','code_search','symbol_search'}:
                 for match in _GREP_RE.finditer(obs.content or ''):
                     try: self._grep_points[match.group('path')].add(int(match.group('line')))
@@ -129,3 +129,45 @@ def extract_numbered_range(content:str,start_line:int,end_line:int) -> tuple[str
             kept.append(line); nums.append(n)
     if not kept: return '',None,None
     return '\n'.join(kept),nums[0],nums[-1]
+
+
+def retained_source_lines(obs) -> list[tuple[int, str]]:
+    """Exact stored coverage, independent of remotely acquired coverage.
+
+    Explicit adapter format/base metadata wins. Historical pipe/colon inputs
+    are accepted only as complete, consecutive numbered records, never fuzzy hits.
+    Plain source requires a matching canonical stored span and newline count.
+    """
+    if obs.tool not in {'read_file', 'get_source_code'} or not obs.content:
+        return []
+    meta = obs.metadata or {}
+    rows = obs.content.splitlines()
+    start = meta.get('retained_start_line', meta.get('start_line'))
+    end = meta.get('retained_end_line', meta.get('end_line'))
+    fmt = meta.get('source_body_format')
+    if fmt not in {None, 'plain', 'numbered_pipe', 'numbered_colon'}:
+        return []
+    matches = [_LINE_RE.match(line) for line in rows] if fmt != 'plain' else []
+    if matches and all(matches):
+        numbers = [int(match.group(1)) for match in matches]
+        if numbers != list(range(numbers[0], numbers[0] + len(rows))):
+            return []
+        if fmt == 'numbered_pipe' and any('|' not in line[:match.end()] for line, match in zip(rows, matches)):
+            return []
+        if fmt == 'numbered_colon' and any(':' not in line[:match.end()] for line, match in zip(rows, matches)):
+            return []
+        if start is not None and start != numbers[0] or end is not None and end != numbers[-1]:
+            return []
+        return list(zip(numbers, rows))
+    if fmt in {'numbered_pipe', 'numbered_colon'}:
+        return []
+    if (type(start) is int and type(end) is int and start >= 1
+            and end - start + 1 == len(rows)):
+        return [(start + i, f'{start + i} | {line}') for i, line in enumerate(rows)]
+    return []
+
+
+def rendered_line_ranges(content: str) -> list[tuple[int, int]]:
+    """Only actual deterministic numbered records become display coverage."""
+    return merge_ranges([(int(match.group(1)), int(match.group(1)))
+                         for line in content.splitlines() if (match := _LINE_RE.match(line))])

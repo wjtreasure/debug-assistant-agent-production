@@ -1,51 +1,98 @@
+"""唯一 CloudOps 命令入口。
+
+SWE/Repository 诊断已经移到 ``debug-assistant-swe``，本包不再暴露旧的
+``AgentHarness``、generic Skill 或 SWE evaluator 命令。
+"""
+
 from __future__ import annotations
-import argparse, json
+
+import argparse
+import json
+from dataclasses import replace
 from pathlib import Path
-from debug_assistant.config import AppConfig
-from debug_assistant.models import TaskSpec
-from debug_assistant.harness.runtime import AgentHarness
 
-def load_env(path='.env'):
-    p=Path(path)
-    if not p.exists(): return
-    import os
-    for line in p.read_text(encoding='utf-8').splitlines():
-        line=line.strip()
-        if not line or line.startswith('#') or '=' not in line: continue
-        k,v=line.split('=',1); os.environ.setdefault(k.strip(),v.strip())
+from debug_assistant.config import AppConfig, load_effective_config
+from debug_assistant.datasets.cloudops_incident import CloudOpsRuntimeCaseLoader
+from debug_assistant.incidents.runtime import DiagnosisHarness
+from debug_assistant.llm.factory import build_llm
 
-def main(argv=None):
-    load_env(); ap=argparse.ArgumentParser(prog='debug-assistant'); sub=ap.add_subparsers(dest='cmd',required=True)
-    p=sub.add_parser('diagnose'); p.add_argument('--issue',required=True); p.add_argument('--repo',required=True); p.add_argument('--output',required=True); p.add_argument('--task-id',default='local-issue')
-    p=sub.add_parser('diagnose-task'); p.add_argument('--task',required=True); p.add_argument('--output',required=True)
-    p=sub.add_parser('prepare-swe'); p.add_argument('--parquet',required=True); p.add_argument('--output',required=True); p.add_argument('--limit',type=int,default=0); p.add_argument('--no-clone',action='store_true')
-    p=sub.add_parser('run-swe'); p.add_argument('--tasks',required=True); p.add_argument('--output',required=True); p.add_argument('--limit',type=int,default=0); p.add_argument('--sample',type=int,default=0); p.add_argument('--seed',type=int,default=42); p.add_argument('--no-resume',action='store_true'); p.add_argument('--config',default='')
-    p=sub.add_parser('eval-localization'); p.add_argument('--gold',required=True); p.add_argument('--predictions',required=True); p.add_argument('--output',required=True)
-    p=sub.add_parser('trace-metrics'); p.add_argument('--trace',required=True)
-    p=sub.add_parser('eval-retrieval'); p.add_argument('--tasks',required=True); p.add_argument('--output',required=True); p.add_argument('--top-k',type=int,default=10); p.add_argument('--config',default='')
-    a=ap.parse_args(argv)
-    if a.cmd=='prepare-swe':
-        from debug_assistant.datasets.swe_prepare import prepare_parquet
-        n=prepare_parquet(a.parquet,a.output,a.limit,clone=not a.no_clone); print(json.dumps({'prepared':n,'output':a.output})); return
-    if a.cmd=='run-swe':
-        from debug_assistant.evaluation.batch import run_prepared
-        cfg=AppConfig.from_env().apply_experiment_file(a.config or None); r=run_prepared(a.tasks,a.output,AgentHarness(cfg),a.limit,resume=not a.no_resume,sample=a.sample,seed=a.seed); print(json.dumps(r,indent=2)); return
-    if a.cmd=='eval-localization':
-        from debug_assistant.evaluation.localization import evaluate_dataset
-        r=evaluate_dataset(a.gold,a.predictions); Path(a.output).parent.mkdir(parents=True,exist_ok=True); Path(a.output).write_text(json.dumps(r,indent=2),encoding='utf-8'); print(json.dumps({'fix_localization':r['fix_localization'],'exploration':r['exploration'],'execution':r['execution'],'coverage':r['coverage']},indent=2)); return
-    if a.cmd=='trace-metrics':
-        from debug_assistant.evaluation.trace_metrics import summarize_trace
-        print(json.dumps(summarize_trace(a.trace),indent=2)); return
-    if a.cmd=='eval-retrieval':
-        from debug_assistant.evaluation.retrieval import evaluate_retrieval
-        cfg=AppConfig.from_env().apply_experiment_file(a.config or None); r=evaluate_retrieval(a.tasks,cfg,top_k=a.top_k); Path(a.output).parent.mkdir(parents=True,exist_ok=True); Path(a.output).write_text(json.dumps(r,ensure_ascii=False,indent=2),encoding='utf-8'); print(json.dumps(r['aggregate'],indent=2)); return
-    cfg=AppConfig.from_env(); harness=AgentHarness(cfg)
-    if a.cmd=='diagnose':
-        issue=Path(a.issue).read_text(encoding='utf-8'); task=TaskSpec(a.task_id,issue,str(Path(a.repo).resolve()))
-    else:
-        d=Path(a.task); meta=json.loads((d/'task.json').read_text()); issue=(d/'issue.md').read_text(); repo=meta.get('workspace')
-        if not repo: raise SystemExit('task has no workspace; prepare without --no-clone or set task.json workspace')
-        task=TaskSpec(meta['task_id'],issue,repo,meta.get('repo',''),meta.get('base_commit',''),meta)
-    r=harness.run(task,a.output); print(json.dumps({"status":r['state']['status'],"output":a.output,"trace":r['trace']},indent=2))
 
-if __name__=='__main__': main()
+def _run_cloudops(args: argparse.Namespace) -> int:
+    base = AppConfig.from_env()
+    app = load_effective_config(
+        args.protocol or None,
+        arm_id=args.arm,
+        base=base,
+    )
+    output = Path(args.output).resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    case = CloudOpsRuntimeCaseLoader().load(args.runtime_case)
+    llm = build_llm(app.model)
+    try:
+        config = replace(
+            app.runtime,
+            trace_dir=str(output / "traces"),
+            domain_asset_manifest_path=args.manifest,
+        )
+        harness = DiagnosisHarness(
+            llm,
+            model=app.model.planner_model,
+            transport_profile=app.transport_profile,
+            reflection_model=app.model.reflection_model,
+            review_model=app.model.critic_model,
+            config=config,
+            topology_path=args.topology or None,
+        )
+        run = harness.run(case, mode=config.execution_mode)
+        run_path = output / "run.json"
+        run_path.write_text(run.model_dump_json(indent=2), encoding="utf-8")
+        result = {"status": run.status, "run": str(run_path), "trace": run.trace_path}
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if run.status == "PASS" else (2 if run.status == "INCONCLUSIVE" else 1)
+    finally:
+        close = getattr(llm, "close", None)
+        if callable(close):
+            close()
+
+
+def _validate_protocol() -> int:
+    try:
+        from scripts.run_final_eval import validate_protocol
+    except ModuleNotFoundError as exc:
+        if exc.name != "scripts":
+            raise
+        print(
+            "validate-protocol requires the full source checkout and its "
+            "versioned protocol assets; use `debug-assistant run` for a "
+            "public package checkout.",
+        )
+        return 2
+
+    result = validate_protocol()
+    print(json.dumps({
+        "status": "PROTOCOL_VALID",
+        "manifest_sha256": result["manifest_sha256"],
+        "semantic_runtime_fingerprint": result["semantic_runtime_fingerprint"],
+    }, indent=2))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="debug-assistant")
+    sub = parser.add_subparsers(dest="command", required=True)
+    run = sub.add_parser("run", help="run one CloudOps incident")
+    run.add_argument("--runtime-case", required=True)
+    run.add_argument("--output", required=True)
+    run.add_argument("--manifest", required=True)
+    run.add_argument("--topology", default="")
+    run.add_argument("--protocol", default="", help="Optional versioned ExperimentProtocol")
+    run.add_argument("--arm", choices=("A0", "A1", "A2"), default="A2")
+    run.set_defaults(handler=_run_cloudops)
+    validate = sub.add_parser("validate-protocol", help="validate the frozen final protocol")
+    validate.set_defaults(handler=lambda _args: _validate_protocol())
+    args = parser.parse_args(argv)
+    return int(args.handler(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

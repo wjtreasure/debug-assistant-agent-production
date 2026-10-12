@@ -10,33 +10,22 @@ class FeatureFlags:
     context_manager: bool = True
     no_progress_detection: bool = True
     finalization_gate: bool = True
-    observation_reuse: bool = True
-    context_catalog: bool = True
-    context_budget_packing: bool = True
-    model_context_selection: bool = False
-    hypothesis_state: bool = True
-    termination_advisory: bool = True
-    fallback_reporter: bool = True
-    convergence_control: bool = True
-    context_lifecycle_v2: bool = True
     context_projection_v2: bool = True
-    compact_prompt_rendering: bool = True
-    semantic_code_search: bool = True
     lightweight_skills: bool = True
-    information_need_tracking: bool = True
-    evidence_obligations: bool = True
-    cost_aware_convergence: bool = True
-    trace_v2: bool = True
     native_tool_calling: bool = True
     structured_reflection: bool = True
-    # Compress repeated Incident Planner control fields into one native
-    # diagnosis_action envelope. Kept opt-in for old provider compatibility.
-    planner_state_envelope: bool = False
+    # Canonical split semantic/action contract with one immutable turn input.
+    planner_contract_version: str = "planner_turn_v1"
+    # Phase 2 typed Observation-to-Obligation gate.  Kept opt-in for the
+    # historical DAG fixture until its scripted tool outputs carry semantic
+    # qualification metadata; A1/A2 bundles enable it explicitly.
+    evidence_qualification: bool = False
+    # Shared public Cloud-OpsBench 57-type output contract. Disabled for old
+    # generic incident fixtures; all refactor experiment arms enable it.
+    public_fault_taxonomy: bool = False
+    evidence_rehydration: bool = True
+    semantic_convergence_v2: bool = True
 
     def validate(self) -> None:
-        if self.model_context_selection and not self.context_catalog:
-            raise ValueError("model_context_selection requires context_catalog")
-        if self.fallback_reporter and not self.hypothesis_state:
-            raise ValueError("fallback_reporter requires hypothesis_state")
-        if self.context_projection_v2 and not self.context_lifecycle_v2:
-            raise ValueError("context_projection_v2 requires context_lifecycle_v2")
+        if self.context_projection_v2 and not self.context_manager:
+            raise ValueError("context_projection_v2 requires context_manager")

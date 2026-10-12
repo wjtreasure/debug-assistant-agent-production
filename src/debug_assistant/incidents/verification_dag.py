@@ -14,39 +14,37 @@ from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .contracts import EvidenceId, VerificationObligation
-
-
 VerificationTaskStatus = Literal[
-    "PENDING", "READY", "SATISFIED", "CONTRADICTED", "BLOCKED"
+    "PENDING", "READY", "RUNNING", "COMPLETED", "FAILED", "BLOCKED",
 ]
-TaskExecutionStatus = Literal["SATISFIED", "CONTRADICTED", "BLOCKED"]
+TaskExecutionStatus = Literal["COMPLETED", "FAILED", "BLOCKED"]
 
 
 class VerificationDAGError(ValueError):
     """Raised when a graph proposal or transition violates the MVP contract."""
 
+    def __init__(self, message: str, *, reason_code: str = "dag_contract_invalid"):
+        super().__init__(message)
+        self.reason_code = reason_code
+
 
 class VerificationTask(BaseModel):
     """Execution state for one canonical VerificationObligation.
 
-    ``claim``/``evidence_requirement``/``critical`` are accepted only as a
-    compatibility input for old callers. They are excluded from serialized
-    task state; the canonical semantic fields live in ``VerificationDAGState
-    .obligations``.
+    Semantic claim, evidence requirement, criticality and Evidence links live
+    exclusively in RCAState/EvidenceSet. A task carries only the Obligation
+    reference and scheduling/execution metadata.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     task_id: str = Field(min_length=1)
-    obligation_id: str = ""
-    claim: str = Field(default="", exclude=True)
-    evidence_requirement: str = Field(default="", exclude=True)
+    obligation_id: str = Field(min_length=1)
     dependencies: tuple[str, ...] = ()
-    critical: bool = Field(default=True, exclude=True)
     status: VerificationTaskStatus = "PENDING"
-    supporting_evidence_ids: tuple[EvidenceId, ...] = ()
-    contradicting_evidence_ids: tuple[EvidenceId, ...] = ()
+    result_ref: str = ""
+    retry_count: int = Field(default=0, ge=0)
+    replan_count: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def validate_task_shape(self) -> "VerificationTask":
@@ -54,24 +52,11 @@ class VerificationTask(BaseModel):
             raise ValueError("verification task cannot depend on itself")
         if len(set(self.dependencies)) != len(self.dependencies):
             raise ValueError("verification task dependencies must be unique")
-        overlap = set(self.supporting_evidence_ids) & set(
-            self.contradicting_evidence_ids
-        )
-        if overlap:
-            raise ValueError(
-                "verification task evidence cannot support and contradict the same task: "
-                + ",".join(sorted(overlap))
-            )
         return self
 
     @property
     def terminal(self) -> bool:
-        return self.status in {"SATISFIED", "CONTRADICTED", "BLOCKED"}
-
-    @property
-    def blocks_finalization(self) -> bool:
-        return self.critical and self.status != "SATISFIED"
-
+        return self.status in {"COMPLETED", "FAILED", "BLOCKED"}
 
 class VerificationTransition(BaseModel):
     """Small append-only process event for deterministic trace metrics."""
@@ -84,7 +69,6 @@ class VerificationTransition(BaseModel):
     task_id: str = ""
     from_status: VerificationTaskStatus | None = None
     to_status: VerificationTaskStatus | None = None
-    evidence_ids: tuple[EvidenceId, ...] = ()
     reason: str = ""
 
 
@@ -94,8 +78,7 @@ class VerificationDAGState(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     tasks: tuple[VerificationTask, ...] = ()
-    obligations: tuple[VerificationObligation, ...] = ()
-    known_evidence_ids: tuple[EvidenceId, ...] = ()
+    obligation_ids: tuple[str, ...] = ()
     selected_task_id: str | None = None
     local_replan_count: int = Field(default=0, ge=0)
     transitions: tuple[VerificationTransition, ...] = ()
@@ -105,14 +88,10 @@ class VerificationDAGState(BaseModel):
         task_ids = [task.task_id for task in self.tasks]
         if len(set(task_ids)) != len(task_ids):
             raise ValueError("verification task IDs must be unique")
-        evidence_ids = list(self.known_evidence_ids)
-        if len(set(evidence_ids)) != len(evidence_ids):
-            raise ValueError("known evidence IDs must be unique")
-        obligation_ids = [obligation.id for obligation in self.obligations]
-        if len(set(obligation_ids)) != len(obligation_ids):
+        if len(set(self.obligation_ids)) != len(self.obligation_ids):
             raise ValueError("verification obligation IDs must be unique")
         missing_obligations = sorted(
-            {task.obligation_id for task in self.tasks} - set(obligation_ids)
+            {task.obligation_id for task in self.tasks} - set(self.obligation_ids)
         )
         if missing_obligations:
             raise ValueError(
@@ -134,27 +113,14 @@ class VerificationDAGState(BaseModel):
                 return task
         raise VerificationDAGError(f"unknown verification task: {task_id}")
 
-    def obligation(self, obligation_id: str) -> VerificationObligation:
-        for obligation in self.obligations:
-            if obligation.id == obligation_id:
-                return obligation
-        raise VerificationDAGError(f"unknown verification obligation: {obligation_id}")
-
-    def task_obligation(self, task_id: str) -> VerificationObligation:
-        return self.obligation(self.task(task_id).obligation_id)
-
     @property
     def ready_task_ids(self) -> tuple[str, ...]:
         return tuple(task.task_id for task in self.tasks if task.status == "READY")
 
     @property
-    def critical_open_task_ids(self) -> tuple[str, ...]:
-        return tuple(
-            task.task_id
-            for task in self.tasks
-            if self.obligation(task.obligation_id).critical
-            and task.status != "SATISFIED"
-        )
+    def active_task_ids(self) -> tuple[str, ...]:
+        """Return non-terminal execution work without semantic meaning."""
+        return tuple(task.task_id for task in self.tasks if not task.terminal)
 
     @property
     def terminal(self) -> bool:
@@ -167,24 +133,25 @@ class VerificationDAGState(BaseModel):
             "task_count": len(self.tasks),
             "pending_task_count": 0,
             "ready_task_count": 0,
-            "satisfied_task_count": 0,
-            "contradicted_task_count": 0,
+            "running_task_count": 0,
+            "completed_task_count": 0,
+            "failed_task_count": 0,
             "blocked_task_count": 0,
+            "local_replan_count": self.local_replan_count,
         }
         for task in self.tasks:
             counts[f"{task.status.lower()}_task_count"] += 1
-        counts["local_replan_count"] = self.local_replan_count
         return counts
 
-
 class VerificationTaskExecution(BaseModel):
-    """The only result the orchestration adapter accepts from the Harness."""
+    """Execution-only result accepted by the orchestration adapter."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     task_id: str = Field(min_length=1)
     status: TaskExecutionStatus
-    evidence_ids: tuple[EvidenceId, ...] = ()
+    result_ref: str = ""
+    reason: str = ""
 
 
 class VerificationGraphState(TypedDict, total=False):
@@ -232,55 +199,27 @@ def _validate_dependency_graph(tasks: Sequence[VerificationTask]) -> None:
 
 
 def _runtime_owned_task(task: VerificationTask) -> VerificationTask:
-    """Strip provider-supplied lifecycle and Evidence fields."""
+    """Reset provider-supplied lifecycle state before scheduling."""
 
     return task.model_copy(
         update={
             "status": "PENDING",
-            "supporting_evidence_ids": (),
-            "contradicting_evidence_ids": (),
         }
     )
 
 
 def _canonicalize_tasks(
     tasks: tuple[VerificationTask, ...],
-    existing_obligations: tuple[VerificationObligation, ...] = (),
-) -> tuple[tuple[VerificationTask, ...], tuple[VerificationObligation, ...]]:
-    """Move semantic task fields into the canonical obligation registry."""
-    by_id = {item.id: item for item in existing_obligations}
-    additions: list[VerificationObligation] = []
+) -> tuple[VerificationTask, ...]:
+    """Validate task references without creating semantic state."""
     canonical_tasks: list[VerificationTask] = []
     for task in tasks:
-        obligation_id = task.obligation_id or f"obl-{task.task_id}"
-        obligation = by_id.get(obligation_id)
-        if obligation is None:
-            claim = " ".join(task.claim.split()).strip()
-            if not claim:
-                raise VerificationDAGError(
-                    f"task {task.task_id} requires an obligation_id or claim"
-                )
-            obligation = VerificationObligation(
-                id=obligation_id,
-                claim=claim,
-                evidence_requirement=" ".join(task.evidence_requirement.split()).strip(),
-                critical=task.critical,
+        if not task.obligation_id:
+            raise VerificationDAGError(
+                f"task {task.task_id} must reference an admitted canonical obligation"
             )
-            by_id[obligation_id] = obligation
-            additions.append(obligation)
-        canonical_tasks.append(
-            _runtime_owned_task(task).model_copy(
-                update={
-                    "obligation_id": obligation.id,
-                    # These compatibility attributes are not serialized; keep
-                    # them available to old trace adapters during this turn.
-                    "claim": obligation.claim,
-                    "evidence_requirement": obligation.evidence_requirement,
-                    "critical": obligation.critical,
-                }
-            )
-        )
-    return tuple(canonical_tasks), tuple(additions)
+        canonical_tasks.append(_runtime_owned_task(task))
+    return tuple(canonical_tasks)
 
 
 class VerificationDAGHarnessAdapter:
@@ -288,7 +227,7 @@ class VerificationDAGHarnessAdapter:
 
     This adapter does not call a Tool.  The caller must execute the selected
     task through the existing Registry/Runtime and feed back a
-    ``VerificationTaskExecution`` containing only canonical Evidence IDs.
+    ``VerificationTaskExecution`` containing an immutable Observation reference.
     """
 
     def __init__(self, *, max_local_replans: int = 1):
@@ -300,23 +239,39 @@ class VerificationDAGHarnessAdapter:
         self,
         tasks: Iterable[VerificationTask],
         *,
-        obligations: Iterable[VerificationObligation] = (),
-        known_evidence_ids: Iterable[str] = (),
+        obligation_ids: Iterable[str] = (),
     ) -> VerificationDAGState:
-        canonical_tasks, canonical_obligations = _canonicalize_tasks(
-            tuple(tasks), tuple(obligations)
+        canonical_tasks = _canonicalize_tasks(tuple(tasks))
+        ids = tuple(dict.fromkeys(str(item) for item in obligation_ids if str(item)))
+        state = VerificationDAGState(
+            tasks=canonical_tasks,
+            obligation_ids=ids,
         )
-        evidence_ids = tuple(dict.fromkeys(str(item) for item in known_evidence_ids))
-        try:
-            state = VerificationDAGState(
-                tasks=canonical_tasks,
-                obligations=canonical_obligations,
-                known_evidence_ids=evidence_ids,
-            )
-        except Exception as exc:
-            raise VerificationDAGError(str(exc)) from exc
         _validate_dependency_graph(state.tasks)
         return self._refresh(state, reason="initialization")
+
+    def register_obligation_ids(
+        self,
+        state: VerificationDAGState,
+        obligation_ids: Iterable[str],
+    ) -> VerificationDAGState:
+        """Extend the execution projection with canonical Obligation IDs.
+
+        RCAState remains the semantic authority.  The DAG stores only the
+        IDs needed to validate future Task references; it never copies
+        Obligation claims, evidence requirements, or lifecycle status.
+        Existing task history is preserved.
+        """
+
+        additions = tuple(
+            dict.fromkeys(str(item) for item in obligation_ids if str(item))
+        )
+        if not additions:
+            return state
+        registered = tuple(dict.fromkeys((*state.obligation_ids, *additions)))
+        if registered == state.obligation_ids:
+            return state
+        return state.model_copy(update={"obligation_ids": registered})
 
     def add_tasks(
         self,
@@ -331,9 +286,17 @@ class VerificationDAGHarnessAdapter:
         replan.
         """
         raw_additions = tuple(tasks)
-        additions, new_obligations = _canonicalize_tasks(raw_additions, state.obligations)
+        additions = _canonicalize_tasks(raw_additions)
         if not additions:
             raise VerificationDAGError("task registration requires at least one task")
+        unknown_obligation_ids = sorted(
+            {task.obligation_id for task in additions} - set(state.obligation_ids)
+        )
+        if unknown_obligation_ids:
+            raise VerificationDAGError(
+                "task registration references unregistered obligation IDs: "
+                + ",".join(unknown_obligation_ids)
+            )
         existing_ids = {task.task_id for task in state.tasks}
         duplicate_ids = sorted(existing_ids & {task.task_id for task in additions})
         if duplicate_ids:
@@ -345,7 +308,7 @@ class VerificationDAGHarnessAdapter:
         next_state = state.model_copy(
             update={
                 "tasks": candidate_tasks,
-                "obligations": (*state.obligations, *new_obligations),
+                "obligation_ids": state.obligation_ids,
                 "selected_task_id": None,
             }
         )
@@ -362,6 +325,11 @@ class VerificationDAGHarnessAdapter:
                 raise VerificationDAGError(f"task is not READY: {task_id}")
             selected_id = task_id
         else:
+            if len(ready_ids) > 1:
+                raise VerificationDAGError(
+                    "multiple READY tasks require an explicit planning selection",
+                    reason_code="dag_ready_ambiguous",
+                )
             selected_id = ready_ids[0] if ready_ids else None
         if selected_id is None:
             return state.model_copy(update={"selected_task_id": None}), None
@@ -391,43 +359,21 @@ class VerificationDAGHarnessAdapter:
             raise VerificationDAGError(
                 f"execution does not match selected task: {state.selected_task_id}"
             )
-        evidence_ids = tuple(dict.fromkeys(execution.evidence_ids))
-        unknown = sorted(set(evidence_ids) - set(state.known_evidence_ids))
-        if unknown:
-            raise VerificationDAGError(
-                f"task execution referenced unknown Evidence IDs: {unknown}"
-            )
-        if execution.status in {"SATISFIED", "CONTRADICTED"} and not evidence_ids:
-            raise VerificationDAGError(
-                f"{execution.status} task execution requires Evidence IDs"
-            )
-        if execution.status == "BLOCKED" and evidence_ids:
-            raise VerificationDAGError("BLOCKED task execution cannot link Evidence")
-
-        update: dict[str, Any] = {
-            "status": execution.status,
-            "supporting_evidence_ids": (
-                evidence_ids if execution.status == "SATISFIED" else ()
-            ),
-            "contradicting_evidence_ids": (
-                evidence_ids if execution.status == "CONTRADICTED" else ()
-            ),
-        }
-        updated_task = task.model_copy(update=update)
-        tasks = tuple(
-            updated_task if candidate.task_id == task.task_id else candidate
-            for candidate in state.tasks
-        )
+        updates = {"status": execution.status, "result_ref": execution.result_ref}
         transition = VerificationTransition(
             event="TASK_EXECUTED",
             task_id=task.task_id,
             from_status=task.status,
             to_status=execution.status,
-            evidence_ids=evidence_ids,
+            reason=execution.reason,
+        )
+        projected_tasks = tuple(
+            item.model_copy(update=updates) if item.task_id == task.task_id else item
+            for item in state.tasks
         )
         next_state = state.model_copy(
             update={
-                "tasks": tasks,
+                "tasks": projected_tasks,
                 "selected_task_id": None,
                 "transitions": (*state.transitions, transition),
             }
@@ -442,9 +388,17 @@ class VerificationDAGHarnessAdapter:
         if state.local_replan_count >= self.max_local_replans:
             raise VerificationDAGError("local replan limit exceeded")
         raw_additions = tuple(tasks)
-        additions, new_obligations = _canonicalize_tasks(raw_additions, state.obligations)
+        additions = _canonicalize_tasks(raw_additions)
         if not additions:
             raise VerificationDAGError("local replan requires at least one task")
+        unknown_obligation_ids = sorted(
+            {task.obligation_id for task in additions} - set(state.obligation_ids)
+        )
+        if unknown_obligation_ids:
+            raise VerificationDAGError(
+                "local replan references unregistered obligation IDs: "
+                + ",".join(unknown_obligation_ids)
+            )
         existing_ids = {task.task_id for task in state.tasks}
         duplicate_ids = sorted(existing_ids & {task.task_id for task in additions})
         if duplicate_ids:
@@ -460,7 +414,7 @@ class VerificationDAGHarnessAdapter:
         next_state = state.model_copy(
             update={
                 "tasks": candidate_tasks,
-                "obligations": (*state.obligations, *new_obligations),
+                "obligation_ids": state.obligation_ids,
                 "local_replan_count": state.local_replan_count + 1,
                 "selected_task_id": None,
                 "transitions": (*state.transitions, transition),
@@ -479,7 +433,7 @@ class VerificationDAGHarnessAdapter:
                 if current.terminal:
                     continue
                 dependencies = [by_id[item] for item in current.dependencies]
-                if any(item.status in {"CONTRADICTED", "BLOCKED"} for item in dependencies):
+                if any(item.status in {"FAILED", "BLOCKED"} for item in dependencies):
                     updated = current.model_copy(update={"status": "BLOCKED"})
                     transitions.append(
                         VerificationTransition(
@@ -490,7 +444,7 @@ class VerificationDAGHarnessAdapter:
                             reason=reason,
                         )
                     )
-                elif all(item.status == "SATISFIED" for item in dependencies):
+                elif all(item.status == "COMPLETED" for item in dependencies):
                     updated = current.model_copy(update={"status": "READY"})
                     if current.status != "READY":
                         transitions.append(
@@ -586,15 +540,7 @@ class LangGraphVerificationAdapter:
         compiled = self.compile()
         serialized_replans = []
         for task in replan_tasks:
-            item = task.model_dump(mode="json")
-            # Replan input is a transient compatibility boundary. The
-            # persisted DAG state still stores prose only in obligations.
-            item.update({
-                "claim": task.claim,
-                "evidence_requirement": task.evidence_requirement,
-                "critical": task.critical,
-            })
-            serialized_replans.append(item)
+            serialized_replans.append(task.model_dump(mode="json"))
         initial: VerificationGraphState = {
             "dag_state": state.model_dump(mode="json"),
             "replan_tasks": serialized_replans,
@@ -666,18 +612,13 @@ class LangGraphVerificationAdapter:
     def _update_task_state(self, state: VerificationGraphState) -> dict[str, Any]:
         dag = VerificationDAGState.model_validate(state["dag_state"])
         execution = VerificationTaskExecution.model_validate(state["execution"])
-        # Evidence is admitted by the Harness callback during the graph's
-        # execute node. Register those canonical IDs before the state machine
-        # validates the transition; the adapter never creates Evidence itself.
-        known_evidence_ids = tuple(dict.fromkeys(
-            (*dag.known_evidence_ids, *execution.evidence_ids)
-        ))
-        dag = dag.model_copy(update={"known_evidence_ids": known_evidence_ids})
+        # Evidence is admitted by the Harness callback. The DAG only receives
+        # the resulting execution status; Evidence IDs never become DAG state.
         dag = self.harness.apply_execution(dag, execution)
         return {
             "dag_state": dag.model_dump(mode="json"),
             "selected_task_id": None,
-            "replan_requested": execution.status in {"CONTRADICTED", "BLOCKED"},
+            "replan_requested": execution.status in {"FAILED", "BLOCKED"},
             "execution": None,
         }
 
@@ -701,7 +642,9 @@ class LangGraphVerificationAdapter:
     def _synthesize(state: VerificationGraphState) -> dict[str, Any]:
         dag = VerificationDAGState.model_validate(state["dag_state"])
         return {
-            "terminal_status": "READY_FOR_REVIEW" if not dag.critical_open_task_ids else "INCONCLUSIVE"
+            "terminal_status": (
+                "EXECUTION_COMPLETE" if dag.terminal else "EXECUTION_PENDING"
+            )
         }
 
     @staticmethod

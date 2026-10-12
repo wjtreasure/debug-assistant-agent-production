@@ -18,6 +18,36 @@ from typing import Any, Callable, Iterable
 from debug_assistant.llm.base import ModelCapability, estimate_tokens_char4
 
 
+class RequestEnvelopeExceeded(RuntimeError):
+    """Typed rejection of the complete rendered request before Provider I/O."""
+    def __init__(self, *, actual: int, limit: int, unit: str):
+        self.metadata = {"error_type": "request_envelope_exceeded", "failure_category": "request_envelope_exceeded",
+                         "actual": actual, "limit": limit, "unit": unit, "provider_calls": 0}
+        super().__init__(f"request_envelope_exceeded: {actual} > {limit} {unit}")
+
+
+def validate_request_envelope(system: str, user: str, *, tools: Iterable[dict[str, Any]] = (),
+                              response_format: dict[str, Any] | None = None,
+                              capability: ModelCapability | None = None,
+                              max_input_tokens: int | None = None,
+                              max_context_chars: int = 50_000) -> None:
+    capability = capability or ModelCapability()
+    envelope = system + "\n\n" + user
+    if tools:
+        envelope += "\n\n" + json.dumps(list(tools), ensure_ascii=False)
+    if response_format:
+        envelope += "\n\n" + json.dumps(response_format, ensure_ascii=False)
+    capacity = capability.input_hard_capacity
+    if max_input_tokens is not None and capacity is None:
+        raise ValueError("physical_capacity_required_for_token_ceiling")
+    actual = len(envelope) if capacity is None else capability.estimate_tokens(envelope)
+    limit = max_context_chars if capacity is None else capacity
+    if actual > limit:
+        raise RequestEnvelopeExceeded(actual=actual, limit=limit, unit="chars" if capacity is None else "tokens")
+    if max_input_tokens is not None and actual > max_input_tokens:
+        raise RequestEnvelopeExceeded(actual=actual, limit=max_input_tokens, unit="tokens")
+
+
 class BudgetState(str, Enum):
     NORMAL = "NORMAL"
     PRESSURE = "PRESSURE"
@@ -126,10 +156,16 @@ class PromptBudgetExceeded(RuntimeError):
             "estimated_prompt_tokens": decision.estimated_prompt_tokens,
             "input_hard_capacity": decision.input_hard_capacity,
             "state": decision.state.value,
-            "over_budget_tokens": max(
-                0,
-                decision.estimated_prompt_tokens
-                - int(decision.input_hard_capacity or 0),
+            "reason": decision.reason,
+            "failure_category": "prompt_capacity_exceeded",
+            "over_budget_tokens": (
+                None
+                if decision.input_hard_capacity is None
+                else max(
+                    0,
+                    decision.estimated_prompt_tokens
+                    - int(decision.input_hard_capacity),
+                )
             ),
             "breakdown": dict(decision.breakdown),
         }
@@ -146,9 +182,19 @@ class RunBudgetAdmissionExceeded(PromptBudgetExceeded):
     def __init__(self, decision: PromptBudgetDecision):
         super().__init__(decision)
         self.metadata["kind"] = "run_budget_admission"
+        self.metadata["failure_category"] = "run_budget_admission_exceeded"
         self.metadata["remaining_run_tokens"] = decision.remaining_run_tokens
         self.metadata["required_run_tokens"] = decision.breakdown.get(
             "required_run_tokens", 0
+        )
+        phase = decision.breakdown.get("budget_lifecycle_phase", "unknown")
+        phase_remaining = decision.breakdown.get("phase_remaining_tokens", 0)
+        required_phase = decision.breakdown.get("required_phase_tokens", 0)
+        self.args = (
+            f"{decision.stage} pre-call {phase} budget admission rejected: "
+            f"required_phase_tokens={required_phase}, "
+            f"phase_remaining_tokens={phase_remaining}, "
+            f"remaining_run_tokens={decision.remaining_run_tokens}",
         )
 
 
@@ -161,6 +207,7 @@ class ProgressMarker:
     open_obligations: frozenset[str] = frozenset()
     blocking_contradictions: frozenset[str] = frozenset()
     components: frozenset[str] = frozenset()
+    qualified_requirements: frozenset[tuple[str, str]] = frozenset()
 
 
 def progress_made(before: ProgressMarker | None, after: ProgressMarker) -> bool:
@@ -169,6 +216,7 @@ def progress_made(before: ProgressMarker | None, after: ProgressMarker) -> bool:
         return True
     return bool(
         after.evidence_ids - before.evidence_ids
+        or after.qualified_requirements - before.qualified_requirements
         or after.open_obligations < before.open_obligations
         or after.blocking_contradictions < before.blocking_contradictions
         or after.components - before.components
@@ -181,7 +229,7 @@ class DynamicBudgetController:
 
     If a provider does not expose a context window, ``input_hard_capacity`` is
     ``None`` and the existing ``max_context_chars`` policy remains the
-    compatibility fallback.  It is never presented as a physical model limit.
+    deterministic fallback. It is never presented as a physical model limit.
     """
 
     def __init__(
@@ -189,6 +237,7 @@ class DynamicBudgetController:
         capability: ModelCapability | None = None,
         *,
         max_context_chars: int = 50_000,
+        max_request_input_tokens: int | None = None,
         max_total_tokens: int = 180_000,
         max_llm_calls: int = 40,
         max_wall_time_seconds: float = 900.0,
@@ -202,6 +251,12 @@ class DynamicBudgetController:
         started_at: float | None = None,
     ) -> None:
         self.capability = capability or ModelCapability()
+        if max_request_input_tokens is not None:
+            if max_request_input_tokens <= 0:
+                raise ValueError("max_request_input_tokens must be positive")
+            if self.capability.input_hard_capacity is None:
+                raise ValueError("physical_capacity_required_for_token_ceiling")
+        self.max_request_input_tokens = max_request_input_tokens
         self.max_context_chars = max(1, int(max_context_chars))
         self.max_total_tokens = max(1, int(max_total_tokens))
         self.max_llm_calls = max(1, int(max_llm_calls))
@@ -231,7 +286,29 @@ class DynamicBudgetController:
         self.lifecycle_phase = "investigation"
         self.review_started_tokens: int | None = None
         self.review_started_llm_calls: int | None = None
+        # Recovery after a Review rejection is investigation work.  Keep the
+        # Review allocation protected, but subtract the Review usage from the
+        # cumulative totals while reporting/admitting the recovery phase so it
+        # is not charged to both allocations.
+        self.investigation_tokens_at_review: int | None = None
+        self.investigation_llm_calls_at_review: int | None = None
+        self.recovery_token_offset: int | None = None
+        self.recovery_llm_call_offset: int | None = None
         self.review_calls_used = 0
+        self.consolidation_started_calls: int | None = None
+        self.consolidation_review_seconds = 0.0
+        # A Runtime-permitted terminal semantic projection (usually filling
+        # only a public fault code after all Evidence obligations are closed)
+        # is neither ordinary exploration nor Final Review.  It may consume a
+        # bounded slice of the protected Review reserve, but never expands the
+        # total run budget and must leave room for one Review call.
+        self.terminal_projection_budget_tokens = min(
+            12_000, max(4_000, self.budget_allocation.review_tokens // 2)
+        )
+        self.terminal_projection_review_floor = min(
+            6_000, max(2_000, self.budget_allocation.review_tokens // 4)
+        )
+        self.terminal_projection_used = False
         self.pressure_ratio = min(0.99, max(0.50, float(pressure_ratio)))
         self.hard_pressure_ratio = min(
             1.0, max(self.pressure_ratio, float(hard_pressure_ratio))
@@ -244,6 +321,52 @@ class DynamicBudgetController:
         self.cost_used = 0.0
         self.context_state_override = BudgetState.NORMAL
 
+    def begin_consolidation(self, *, llm_calls_used: int, review_seconds: float) -> None:
+        """Spend only existing terminal calls on tool-less semantic consolidation."""
+        if self.lifecycle_phase == "consolidation":
+            return
+        if self.lifecycle_phase not in {"investigation", "investigation_recovery"}:
+            raise ValueError("consolidation requires investigation ownership")
+        # This allocation is never renewed after Review or recovery.
+        if self.consolidation_started_calls is None:
+            self.consolidation_started_calls = int(llm_calls_used)
+        self.consolidation_review_seconds = max(0.0, float(review_seconds))
+        self.lifecycle_phase = "consolidation"
+
+    def api_attempt_rejection(self, role: str, total_calls: int, review_calls: int) -> str:
+        """Prospective physical-call admission, including transport retries."""
+        allocation = self.budget_allocation
+        if total_calls >= allocation.total_llm_calls:
+            return "max_llm_calls"
+        if role == "review":
+            return "review_call_reserve_exhausted" if review_calls >= allocation.review_llm_calls else ""
+        nonreview_calls = total_calls - review_calls
+        if self.lifecycle_phase == "consolidation":
+            if role != "planner":
+                return "consolidation_role_restricted"
+            closing_calls = total_calls - int(self.consolidation_started_calls or 0)
+            if closing_calls >= allocation.terminal_llm_calls:
+                return "consolidation_call_reserve_exhausted"
+            if nonreview_calls >= allocation.investigation_llm_calls + allocation.terminal_llm_calls:
+                return "review_call_reserve_protected"
+            return ""
+        return "investigation_call_allocation_exhausted" if nonreview_calls >= allocation.investigation_llm_calls else ""
+
+    def model_status(self, *, llm_calls_used: int | None = None) -> dict[str, Any]:
+        used = self.llm_calls_used if llm_calls_used is None else int(llm_calls_used)
+        lifecycle = self.lifecycle_payload(tokens_used=self.tokens_used, llm_calls_used=used)
+        return {
+            "phase": lifecycle["phase"],
+            "remaining_api_calls": max(0, self.max_llm_calls - used),
+            "remaining_phase_calls": lifecycle["phase_remaining"]["llm_calls"],
+            "remaining_total_tokens": max(0, self.max_total_tokens - self.tokens_used),
+            "remaining_seconds": max(0, int(self.max_wall_time_seconds - (time.time() - self.started_at))),
+            "reserved_review_calls": max(0, self.budget_allocation.review_llm_calls - self.review_calls_used),
+            "reserved_consolidation_calls": max(0, self.budget_allocation.terminal_llm_calls
+                - (max(0, used - self.consolidation_started_calls)
+                   if self.consolidation_started_calls is not None else 0)),
+        }
+
     def begin_review(self, *, tokens_used: int, llm_calls_used: int) -> None:
         """Move ownership to the protected Review allocation.
 
@@ -253,23 +376,92 @@ class DynamicBudgetController:
         """
         if self.lifecycle_phase == "review":
             return
+        if self.lifecycle_phase == "investigation_recovery":
+            phase_tokens_used = max(
+                0,
+                int(tokens_used) - int(self.recovery_token_offset or 0),
+            )
+            phase_llm_calls_used = max(
+                0,
+                int(llm_calls_used) - int(self.recovery_llm_call_offset or 0),
+            )
+        else:
+            phase_tokens_used = int(tokens_used)
+            phase_llm_calls_used = int(llm_calls_used)
+        token_overrun = max(
+            0, phase_tokens_used - self.budget_allocation.investigation_tokens
+        )
         if (
-            int(tokens_used) > self.budget_allocation.investigation_tokens
-            or int(llm_calls_used) > self.budget_allocation.investigation_llm_calls
+            (
+                token_overrun > self.terminal_projection_budget_tokens
+                or not self.terminal_projection_used
+            )
+            and phase_tokens_used > self.budget_allocation.investigation_tokens
+        ) or phase_llm_calls_used > (
+            self.budget_allocation.investigation_llm_calls
+            + (self.budget_allocation.terminal_llm_calls
+               if self.lifecycle_phase == "consolidation" else 0)
         ):
             raise ValueError("investigation exceeded its resolved budget allocation")
+        self.investigation_tokens_at_review = phase_tokens_used
+        self.investigation_llm_calls_at_review = phase_llm_calls_used
+        self.recovery_token_offset = None
+        self.recovery_llm_call_offset = None
         self.lifecycle_phase = "review"
         self.review_started_tokens = int(tokens_used)
         self.review_started_llm_calls = int(llm_calls_used)
+        # A terminal projection may borrow only once. Review now owns its
+        # protected allocation; a later recovery must earn a fresh bounded
+        # projection rather than reuse this handoff exception.
+        self.terminal_projection_used = False
+
+    def begin_investigation_recovery(
+        self, *, tokens_used: int, llm_calls_used: int,
+    ) -> None:
+        """Return ownership to bounded investigation after Review rejects.
+
+        Review's reserved capacity remains available for the next bounded
+        Review call.  Recovery is charged against the investigation
+        allocation, excluding tokens/calls already consumed by Review.
+        """
+        if self.lifecycle_phase != "review":
+            return
+        investigation_tokens = self.investigation_tokens_at_review
+        investigation_calls = self.investigation_llm_calls_at_review
+        if investigation_tokens is None:
+            investigation_tokens = int(self.review_started_tokens or 0)
+        if investigation_calls is None:
+            investigation_calls = int(self.review_started_llm_calls or 0)
+        self.recovery_token_offset = max(0, int(tokens_used) - investigation_tokens)
+        self.recovery_llm_call_offset = max(0, int(llm_calls_used) - investigation_calls)
+        self.lifecycle_phase = "investigation_recovery"
 
     def lifecycle_payload(self, *, tokens_used: int, llm_calls_used: int) -> dict[str, Any]:
         allocation = self.budget_allocation
-        if self.lifecycle_phase == "review" and self.review_started_tokens is not None:
+        if self.lifecycle_phase == "consolidation":
+            phase_tokens_used = max(0, int(tokens_used))
+            phase_llm_calls_used = max(0, int(llm_calls_used) - int(self.consolidation_started_calls or 0))
+            phase = "consolidation"
+            phase_total_tokens = allocation.investigation_tokens + allocation.terminal_tokens
+            phase_total_calls = min(allocation.terminal_llm_calls, max(0,
+                allocation.total_llm_calls - allocation.review_llm_calls
+                - int(self.consolidation_started_calls or 0)))
+        elif self.lifecycle_phase == "review" and self.review_started_tokens is not None:
             phase_tokens_used = max(0, int(tokens_used) - self.review_started_tokens)
             phase_llm_calls_used = self.review_calls_used
             phase = "review"
             phase_total_tokens = allocation.review_tokens
             phase_total_calls = allocation.review_llm_calls
+        elif self.lifecycle_phase == "investigation_recovery":
+            phase_tokens_used = max(
+                0, int(tokens_used) - int(self.recovery_token_offset or 0),
+            )
+            phase_llm_calls_used = max(
+                0, int(llm_calls_used) - int(self.recovery_llm_call_offset or 0),
+            )
+            phase = "investigation_recovery"
+            phase_total_tokens = allocation.investigation_tokens
+            phase_total_calls = allocation.investigation_llm_calls
         else:
             phase_tokens_used = max(0, int(tokens_used))
             phase_llm_calls_used = max(0, int(llm_calls_used))
@@ -294,9 +486,19 @@ class DynamicBudgetController:
     def set_review_calls_used(self, value: int) -> None:
         self.review_calls_used = max(0, int(value))
 
+    def mark_terminal_projection_used(self) -> None:
+        """Record a successfully applied terminal semantic projection."""
+        self.terminal_projection_used = True
+
     @property
     def input_hard_capacity(self) -> int | None:
         return self.capability.input_hard_capacity
+
+    @property
+    def request_input_capacity(self) -> int | None:
+        if self.max_request_input_tokens is None:
+            return self.input_hard_capacity
+        return min(self.input_hard_capacity, self.max_request_input_tokens)
 
     @property
     def fallback_context_tokens(self) -> int:
@@ -314,19 +516,21 @@ class DynamicBudgetController:
         user: str,
         *,
         tools: Iterable[dict[str, Any]] | None = None,
+        response_format: dict[str, Any] | None = None,
         breakdown: dict[str, str] | None = None,
     ) -> tuple[int, dict[str, int]]:
         parts = {
             "system": self.estimate_tokens(system),
             "tools": self.estimate_json_tokens(list(tools or [])) if tools is not None else 0,
             "user": self.estimate_tokens(user),
+            "response_schema": self.estimate_json_tokens(response_format) if response_format else 0,
         }
         if breakdown:
             for key, value in breakdown.items():
                 parts[key] = self.estimate_tokens(value)
         # The textual prompt is the physical payload. Breakdown fields are
         # diagnostics only and must not be summed on top of system/user.
-        return parts["system"] + parts["tools"] + parts["user"], parts
+        return parts["system"] + parts["tools"] + parts["user"] + parts["response_schema"], parts
 
     def _run_pressure(
         self,
@@ -424,20 +628,27 @@ class DynamicBudgetController:
         user: str,
         *,
         tools: Iterable[dict[str, Any]] | None = None,
+        response_format: dict[str, Any] | None = None,
         breakdown: dict[str, str] | None = None,
         tokens_used: int | None = None,
         llm_calls_used: int | None = None,
         cost_used: float | None = None,
         completion_reserve_tokens: int | None = None,
         allow_terminal_reserve: bool = False,
+        allow_terminal_projection: bool = False,
     ) -> PromptBudgetDecision:
+        tools = tuple(tools or ())
+        validate_request_envelope(system, user, tools=tools, capability=self.capability,
+                                  response_format=response_format,
+                                  max_input_tokens=self.max_request_input_tokens,
+                                  max_context_chars=self.max_context_chars)
         if tokens_used is None:
             tokens_used = self.tokens_used
         if llm_calls_used is None:
             llm_calls_used = self.llm_calls_used
         if cost_used is None:
             cost_used = self.cost_used
-        estimate, parts = self.estimate_prompt(system, user, tools=tools, breakdown=breakdown)
+        estimate, parts = self.estimate_prompt(system, user, tools=tools, response_format=response_format, breakdown=breakdown)
         result = self.decision(
             stage,
             estimated_prompt_tokens=estimate,
@@ -463,7 +674,14 @@ class DynamicBudgetController:
         terminal_reserve = 0 if allow_terminal_reserve else self.terminal_reserve_tokens
         required_run_tokens = estimate + completion_reserve + terminal_reserve
         allocation = self.budget_allocation
-        if self.lifecycle_phase == "review" and self.review_started_tokens is not None:
+        if self.lifecycle_phase == "consolidation":
+            lifecycle = self.lifecycle_payload(tokens_used=tokens_used, llm_calls_used=llm_calls_used)
+            phase = lifecycle["phase"]
+            phase_used_tokens = lifecycle["phase_usage"]["tokens"]
+            phase_used_calls = lifecycle["phase_usage"]["llm_calls"]
+            phase_budget_tokens = allocation.investigation_tokens + allocation.terminal_tokens
+            phase_budget_calls = phase_used_calls + lifecycle["phase_remaining"]["llm_calls"]
+        elif self.lifecycle_phase == "review" and self.review_started_tokens is not None:
             phase = "review"
             phase_used_tokens = max(0, int(tokens_used) - self.review_started_tokens)
             # Recovery planner/tool calls are bounded by the global runtime
@@ -472,6 +690,16 @@ class DynamicBudgetController:
             phase_used_calls = self.review_calls_used if stage == "review" else 0
             phase_budget_tokens = allocation.review_tokens
             phase_budget_calls = allocation.review_llm_calls
+        elif self.lifecycle_phase == "investigation_recovery":
+            phase = "investigation_recovery"
+            phase_used_tokens = max(
+                0, int(tokens_used) - int(self.recovery_token_offset or 0),
+            )
+            phase_used_calls = max(
+                0, int(llm_calls_used) - int(self.recovery_llm_call_offset or 0),
+            )
+            phase_budget_tokens = allocation.investigation_tokens
+            phase_budget_calls = allocation.investigation_llm_calls
         else:
             phase = "investigation"
             phase_used_tokens = max(0, int(tokens_used))
@@ -481,26 +709,36 @@ class DynamicBudgetController:
         phase_remaining_tokens = max(0, phase_budget_tokens - phase_used_tokens)
         phase_remaining_calls = max(0, phase_budget_calls - phase_used_calls)
         required_phase_tokens = estimate + completion_reserve
-        phase_exhausted = (
-            required_phase_tokens > phase_remaining_tokens
-            or phase_used_calls > phase_budget_calls
+        terminal_projection = bool(
+            allow_terminal_projection
+            and stage == "planner"
+            and phase in {"investigation", "investigation_recovery"}
         )
-        if (
-            phase_exhausted
-            or required_run_tokens > result.remaining_run_tokens
-            or (
-                self.terminal_reserve_seconds > 0
-                and self.max_wall_time_seconds - (time.time() - self.started_at)
-                <= self.terminal_reserve_seconds
+        terminal_projection_overrun = max(
+            0, required_phase_tokens - phase_remaining_tokens
+        )
+        terminal_projection_can_borrow = bool(
+            terminal_projection
+            and terminal_projection_overrun <= self.terminal_projection_budget_tokens
+            and result.remaining_run_tokens >= (
+                required_run_tokens + self.terminal_projection_review_floor
             )
+        )
+        phase_tokens_exhausted = required_phase_tokens > phase_remaining_tokens
+        phase_calls_exhausted = phase_used_calls >= phase_budget_calls
+        remaining_seconds = self.max_wall_time_seconds - (time.time() - self.started_at)
+        time_reserve = (0.0 if phase == "review" else self.consolidation_review_seconds
+                        if phase == "consolidation" else self.terminal_reserve_seconds)
+        time_exhausted = remaining_seconds <= time_reserve
+        if (
+            (phase_tokens_exhausted and not terminal_projection_can_borrow)
+            or phase_calls_exhausted or remaining_calls <= 0
+            or required_run_tokens > result.remaining_run_tokens
+            or time_exhausted
         ):
             reason = f"pre-call {phase} budget admission would exceed its protected allocation"
-            if (
-                self.terminal_reserve_seconds > 0
-                and self.max_wall_time_seconds - (time.time() - self.started_at)
-                <= self.terminal_reserve_seconds
-            ):
-                reason = "pre-call wall-clock admission would consume terminal reserve"
+            if time_exhausted:
+                reason = "pre-call wall-clock admission would consume protected time"
             admission = replace(
                 result,
                 state=BudgetState.HARD_PRESSURE,
@@ -522,11 +760,17 @@ class DynamicBudgetController:
                     "phase_budget_llm_calls": phase_budget_calls,
                     "phase_used_llm_calls": phase_used_calls,
                     "phase_remaining_llm_calls": phase_remaining_calls,
+                    "allow_terminal_projection": terminal_projection,
+                    "terminal_projection_overrun_tokens": terminal_projection_overrun,
+                    "terminal_projection_budget_tokens": self.terminal_projection_budget_tokens,
+                    "terminal_projection_review_floor_tokens": self.terminal_projection_review_floor,
                 },
                 compaction_required=True,
             )
             self.last_decision = admission
             raise RunBudgetAdmissionExceeded(admission)
+        if terminal_projection_can_borrow:
+            self.terminal_projection_used = True
         return result
 
     def force_context_state(self, state: BudgetState) -> None:
@@ -544,7 +788,7 @@ class DynamicBudgetController:
             self.cost_used = max(0.0, float(cost_used))
 
     def context_token_budget(self, *, state: BudgetState = BudgetState.NORMAL) -> int | None:
-        capacity = self.input_hard_capacity
+        capacity = self.request_input_capacity
         if capacity is None:
             return None
         # Content selection is intentionally below the physical ceiling. The
@@ -565,7 +809,7 @@ class DynamicBudgetController:
         required_control_tokens: int = 0,
         output_protocol_reserve: int = 0,
     ) -> int | None:
-        capacity = self.input_hard_capacity if active_input_capacity is None else active_input_capacity
+        capacity = self.request_input_capacity if active_input_capacity is None else active_input_capacity
         if capacity is None:
             return None
         return max(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from hashlib import sha1
 
-from debug_assistant.context.indexes import extract_numbered_range
+from debug_assistant.context.indexes import extract_numbered_range, retained_source_lines, rendered_line_ranges
 from debug_assistant.context.models import ContextItem, ContextProjection
 
 
@@ -25,8 +25,12 @@ def _bounded_code_display(content: str, max_chars: int) -> str:
     strong = []
     for index, line in enumerate(lines):
         lowered = line.lower()
-        score = sum(2 if term in lowered and term in {"append(", "make(", "new(", "malloc", "calloc", "realloc", "alloc", "capacity"} else 1
-                    for term in signal_terms)
+        score = sum(
+            2 if term in {"append(", "make(", "new(", "malloc", "calloc", "realloc", "alloc", "capacity"}
+            else 1
+            for term in signal_terms
+            if term in lowered
+        )
         if score:
             strong.append((score, index))
     # Prefer resource-shaped lines, then keep only a bounded number of windows.
@@ -91,10 +95,12 @@ class CodeProjectionPolicy:
         path = (obs.metadata or {}).get("path")
         source_start = (obs.metadata or {}).get("start_line")
         source_end = (obs.metadata or {}).get("end_line")
-        if obs.tool == "read_file" and requests and path:
+        stored_lines = retained_source_lines(obs)
+        source_body = "\n".join(text for _, text in stored_lines)
+        if obs.tool in {"read_file", "get_source_code"} and requests and path:
             parts, visible = [], []
             for start, end, _ in requests:
-                text, visible_start, visible_end = extract_numbered_range(obs.content, start, end)
+                text, visible_start, visible_end = extract_numbered_range(source_body, start, end)
                 if text:
                     parts.append(text)
                     visible.append((visible_start, visible_end))
@@ -112,21 +118,15 @@ class CodeProjectionPolicy:
                 )
 
         display = item.full_content
-        if (obs.tool == "read_file" and path
+        if (obs.tool in {"read_file", "get_source_code"} and path
                 and str((obs.metadata or {}).get("context_kind") or "").upper() == "CODE"):
             # Use the immutable Observation when the ContextItem was line-cut;
             # the projection remains bounded but can retain middle signals.
-            display = _bounded_code_display(obs.content or display, 12000)
-        if obs.tool == "read_file" and path:
-            numbers = []
-            for line in display.splitlines():
-                if "|" not in line:
-                    continue
-                head = line.split("|", 1)[0].strip()
-                if head.isdigit():
-                    numbers.append(int(head))
-            display_start = numbers[0] if numbers else None
-            display_end = numbers[-1] if numbers else None
+            display = _bounded_code_display(source_body or obs.content or display, 12000)
+        if obs.tool in {"read_file", "get_source_code"} and path:
+            ranges = rendered_line_ranges(display) if stored_lines else []
+            display_start = ranges[0][0] if ranges else None
+            display_end = ranges[-1][1] if ranges else None
         else:
             display_start = display_end = None
         projection_id = "proj-" + sha1(
@@ -208,7 +208,7 @@ class IncidentProjectionPolicy:
     def project(self, obs, item: ContextItem, step: int, *, requests=(), rehydrate_requested=False):
         kind = str((obs.metadata or {}).get("context_kind") or "OBSERVATION").upper()
         metadata = obs.metadata or {}
-        if kind == "CODE" and metadata.get("information_source") == "source_read" and obs.tool == "read_file":
+        if obs.tool in {"read_file", "get_source_code"}:
             # Reuse the tested source-range projection instead of maintaining a
             # second code-file context lifecycle for incidents.
             return CodeProjectionPolicy().project(
@@ -237,6 +237,17 @@ class IncidentProjectionPolicy:
         # Small observations are already bounded semantic units; preserve them exactly.
         if len(content) <= 1600:
             return content
+
+        # Source reads are line-numbered code, not ordinary incident text.  The
+        # generic keyword projection below can select many harmless ``return``
+        # and ``error`` lines and then cut the only causal loop/configuration in
+        # the middle of the file.  Reuse the source-agnostic bounded code
+        # projection so control-flow/resource signals retain their local
+        # neighbourhood for the Planner's Evidence interpretation.
+        if kind == "CODE":
+            return f"[incident projection kind={kind}]\n" + _bounded_code_display(
+                content, self._MAX_PROJECTED_CHARS["CODE"]
+            )
 
         terms = list(self._COMMON_TERMS)
         if kind in {"SERVICE", "ENDPOINT"}:
